@@ -289,6 +289,11 @@ impl LcuClient {
             .await
     }
 
+    pub async fn end_of_game_details(&self, game_id: u64) -> AppResult<serde_json::Value> {
+        self.get_json(&format!("/lol-end-of-game/v1/eog-details/{game_id}"))
+            .await
+    }
+
     pub async fn champion_summary(&self) -> AppResult<Vec<ChampionSummaryItem>> {
         let mut champions: Vec<ChampionSummaryItem> = self
             .get_json("/lol-game-data/assets/v1/champion-summary.json")

@@ -548,6 +548,7 @@ pub struct RecentGame {
 pub struct MatchDetailResponse {
     pub game_id: u64,
     pub queue_id: u32,
+    pub game_type: String,
     pub game_mode: String,
     pub game_creation: i64,
     pub game_duration: i64,
@@ -576,6 +577,13 @@ pub struct MatchDetailPlayer {
     pub player_subteam_id: u32,
     #[serde(flatten)]
     pub record: RecentGame,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodayCustomGamesResponse {
+    pub games: Vec<MatchDetailResponse>,
+    pub game_count: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

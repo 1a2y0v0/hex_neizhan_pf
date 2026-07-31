@@ -13,6 +13,7 @@ import {
   Search,
   Settings,
   Swords,
+  Trophy,
   UserRound,
   Wrench,
   X,
@@ -41,6 +42,7 @@ import MatchOverviewPanel from "./components/MatchOverviewPanel.vue"
 import PlayerRecordTab from "./components/PlayerRecordTab.vue"
 import RecordView from "./components/RecordView.vue"
 import ToastStack from "./components/ToastStack.vue"
+import CustomGameRatingPanel from "./components/CustomGameRatingPanel.vue"
 import ToolsPanel from "./components/ToolsPanel.vue"
 import { notifyKey, type AppToast, type ToastPayload } from "./notifications"
 import { AUTO_ACCEPT_ENABLED_KEY, readBooleanSetting } from "./toolSettings"
@@ -63,7 +65,7 @@ import type {
   SummonerSearchCandidate,
 } from "./types"
 
-type PageKey = "current" | "live" | "search" | "details" | "tools"
+type PageKey = "current" | "live" | "search" | "details" | "tools" | "custom"
 type SearchServerOption = { id: string; label: string }
 type SearchHistoryItem = { query: string; sgpServerId: string }
 type OverviewDrillTab = {
@@ -297,6 +299,7 @@ const pageScrollTop: Record<PageKey, number> = {
   search: 0,
   details: 0,
   tools: 0,
+  custom: 0,
 }
 
 const championMap = computed(() => {
@@ -345,6 +348,7 @@ const navItems: Array<{ key: PageKey; label: string; icon: typeof UserRound }> =
   { key: "live", label: "实时战绩", icon: Swords },
   { key: "search", label: "查战绩", icon: Search },
   { key: "details", label: "详细战绩", icon: FileText },
+  { key: "custom", label: "内战评分", icon: Trophy },
   { key: "tools", label: "工具", icon: Wrench },
 ]
 
@@ -1947,6 +1951,10 @@ onUnmounted(() => {
           :live-champion-id="liveAramkitChampionId"
           @open-friend="openFriendDrillTab"
         />
+      </section>
+
+      <section class="custom-page" v-show="activePage === 'custom'">
+        <CustomGameRatingPanel :champions="championMap" :items="gameAssets.items" />
       </section>
 
       <section class="search-page" v-show="activePage === 'search'">

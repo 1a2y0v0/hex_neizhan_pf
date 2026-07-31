@@ -13,11 +13,12 @@ use crate::services::models::{
     GameAssetBundle, GameflowPlayer, GameflowSession, LiveGameResponse, LivePlayer,
     LivePremadeMarker, LiveTeam, MatchDetailResponse, PlayerStatsResponse, PlayerSummary,
     RankedQueueEntry, RankedStatsResponse, RecentGame, SafeClientInfo, SummonerInfo,
-    SummonerSearchCandidate,
+    SummonerSearchCandidate, TodayCustomGamesResponse,
 };
 use crate::services::stats::{
     load_match_detail as load_match_detail_service, load_player_stats,
-    load_player_stats_with_progress, normalize_depth,
+    load_player_stats_with_progress, load_today_custom_games as load_today_custom_games_service,
+    normalize_depth,
 };
 use crate::services::tools::{
     game_settings_locked, set_game_settings_locked as set_settings_locked,
@@ -843,6 +844,20 @@ pub async fn load_match_detail(
 }
 
 #[tauri::command]
+pub async fn load_today_custom_games(day_start_ms: Option<i64>, day_end_ms: Option<i64>) -> Result<TodayCustomGamesResponse, String> {
+    let clients = create_clients().map_err(app_error)?;
+    load_today_custom_games_service(
+        &clients.lcu,
+        Some(&clients.auth),
+        None,
+        day_start_ms,
+        day_end_ms,
+    )
+    .await
+    .map_err(app_error)
+}
+
+#[tauri::command]
 pub async fn load_live_game(depth: usize) -> Result<LiveGameResponse, String> {
     let clients = create_clients().map_err(app_error)?;
     let display_depth = normalize_depth(depth).min(LIVE_MATCH_LIMIT);
@@ -1520,7 +1535,7 @@ fn is_hex_aram_game(queue_id: u32, game_mode: &str) -> bool {
     queue_id == 2400
         || matches!(
             game_mode.to_ascii_uppercase().as_str(),
-            "STRAWBERRY" | "KIWI"
+            "CHERRY" | "STRAWBERRY" | "KIWI"
         )
 }
 

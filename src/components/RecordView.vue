@@ -96,7 +96,9 @@ const queueOptions: QueueOption[] = [
   {
     key: "arena",
     label: "海克斯大乱斗",
-    matches: (game) => hexAramQueueIds.has(game.queueId),
+    matches: (game) =>
+      hexAramQueueIds.has(game.queueId) ||
+      ["CHERRY", "STRAWBERRY", "KIWI"].includes(game.gameMode?.toUpperCase() || ""),
   },
   {
     key: "aram",

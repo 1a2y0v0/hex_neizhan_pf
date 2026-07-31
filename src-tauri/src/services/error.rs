@@ -33,6 +33,9 @@ pub enum AppError {
     #[error("已取消加载")]
     Cancelled,
 
+    #[error("没有找到对局详情：{0}")]
+    GameDetailNotFound(u64),
+
     #[error("网络请求失败：{0}")]
     Http(#[from] reqwest::Error),
 

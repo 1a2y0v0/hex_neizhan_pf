@@ -6,12 +6,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::error::AppResult;
+use super::error::{AppError, AppResult};
 use super::lcu::LcuClient;
 use super::models::{
-    ChampionStat, ClientAuth, Game, IdentityPlayer, MatchDetailPlayer, MatchDetailResponse,
-    MatchDetailTeam, Participant, PlayerStatsResponse, PlayerSummary, RatingCompositionEntry,
-    RecentGame, SummonerInfo,
+    ChampionStat, ClientAuth, Game, GameTeam, IdentityPlayer, MatchDetailPlayer,
+    MatchDetailResponse, MatchDetailTeam, Participant, ParticipantIdentity, ParticipantStats,
+    ParticipantTimeline, PlayerStatsResponse, PlayerSummary, RatingCompositionEntry, RecentGame,
+    SummonerInfo, TodayCustomGamesResponse,
 };
 use super::sgp::{resolve_sgp_server_id, SgpClient};
 
@@ -29,6 +30,9 @@ const CACHE_SCHEMA_VERSION: i64 = 12;
 const DATABASE_FILE_NAME: &str = "lol-stats.sqlite3";
 
 static STATS_CACHE: LazyLock<Mutex<HashMap<StatsCacheKey, StatsCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static GAME_CACHE: LazyLock<Mutex<HashMap<u64, Game>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -124,6 +128,19 @@ pub async fn load_match_detail(
     sgp_server_id: Option<&str>,
     game_id: u64,
 ) -> AppResult<MatchDetailResponse> {
+    if let Ok(cache) = GAME_CACHE.lock() {
+        if let Some(game) = cache.get(&game_id) {
+            return Ok(match_detail_from_game(game.clone()));
+        }
+    }
+
+    if let Some(game) = read_db_cached_game_by_id(game_id) {
+        if let Ok(mut cache) = GAME_CACHE.lock() {
+            cache.insert(game_id, game.clone());
+        }
+        return Ok(match_detail_from_game(game));
+    }
+
     if let Some(auth) = auth {
         if let Ok(sgp) = SgpClient::new(lcu, auth, sgp_server_id).await {
             if let Ok(game) = sgp.game_summary(game_id).await {
@@ -132,8 +149,97 @@ pub async fn load_match_detail(
         }
     }
 
-    let game = lcu.match_history_game(game_id).await?;
-    Ok(match_detail_from_game(game))
+    if let Ok(game) = lcu.match_history_game(game_id).await {
+        return Ok(match_detail_from_game(game));
+    }
+
+    if let Ok(eog) = lcu.end_of_game_details(game_id).await {
+        if let Some(game) = eog_to_game(eog) {
+            return Ok(match_detail_from_game(game));
+        }
+    }
+
+    Err(AppError::GameDetailNotFound(game_id))
+}
+
+fn today_start_ms() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64 * 1000;
+    let ms_since_midnight = now % 86_400_000;
+    now - ms_since_midnight
+}
+
+pub async fn load_today_custom_games(
+    lcu: &LcuClient,
+    auth: Option<&ClientAuth>,
+    sgp_server_id: Option<&str>,
+    day_start_ms: Option<i64>,
+    day_end_ms: Option<i64>,
+) -> AppResult<TodayCustomGamesResponse> {
+    let puuid = lcu.current_summoner().await?.puuid;
+    let day_start = day_start_ms.unwrap_or_else(today_start_ms);
+    let day_end = day_end_ms.unwrap_or(day_start + 86_400_000);
+
+    let raw_games = if let Some(auth) = auth {
+        match SgpClient::new(lcu, auth, sgp_server_id).await {
+            Ok(sgp) => {
+                let mut games = Vec::new();
+                let mut seen = HashSet::new();
+                let mut start = 0usize;
+                while games.len() < 100 {
+                    let page = sgp.match_history(&puuid, start, 50).await?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    let new: Vec<Game> = page
+                        .into_iter()
+                        .filter(|g| seen.insert(g.game_id))
+                        .collect();
+                    let count = new.len();
+                    games.extend(new);
+                    if count < 50 {
+                        break;
+                    }
+                    start += 50;
+                }
+                games
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let day_games: Vec<&Game> = raw_games
+        .iter()
+        .filter(|g| g.game_creation >= day_start && g.game_creation < day_end)
+        .collect();
+
+    let mut games = Vec::with_capacity(day_games.len());
+    for &game in &day_games {
+        if let Ok(detail) = load_match_detail(lcu, auth, sgp_server_id, game.game_id).await {
+            games.push(detail);
+        }
+    }
+
+    if games.is_empty() {
+        if let Ok(page) = lcu.match_history(&puuid, 0, 49).await {
+            for game in page.games.games {
+                if game.game_creation >= day_start && game.game_creation < day_end {
+                    if let Ok(detail) = load_match_detail(lcu, auth, sgp_server_id, game.game_id).await {
+                        games.push(detail);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(TodayCustomGamesResponse {
+        game_count: games.len(),
+        games,
+    })
 }
 
 pub async fn load_player_stats_with_progress<F>(
@@ -164,6 +270,13 @@ where
 
     if !force_refresh {
         if let Some(cached) = get_cached_stats(&cache_key) {
+            if let Some(games) = read_db_cached_games(&cache_key, depth) {
+                if let Ok(mut cache) = GAME_CACHE.lock() {
+                    for game in games {
+                        cache.insert(game.game_id, game);
+                    }
+                }
+            }
             if !progress(depth, depth) {
                 return Err(super::error::AppError::Cancelled);
             }
@@ -172,6 +285,13 @@ where
 
         if let Some(cached) = read_db_cached_stats(&cache_key, false) {
             store_cached_stats(cache_key.clone(), &cached);
+            if let Some(games) = read_db_cached_games(&cache_key, depth) {
+                if let Ok(mut cache) = GAME_CACHE.lock() {
+                    for game in games {
+                        cache.insert(game.game_id, game);
+                    }
+                }
+            }
             if !progress(depth, depth) {
                 return Err(super::error::AppError::Cancelled);
             }
@@ -203,6 +323,13 @@ where
 
             if let Some(cached) = read_db_cached_stats(&cache_key, true) {
                 store_cached_stats(cache_key.clone(), &cached);
+                if let Some(games) = read_db_cached_games(&cache_key, depth) {
+                    if let Ok(mut cache) = GAME_CACHE.lock() {
+                        for game in games {
+                            cache.insert(game.game_id, game);
+                        }
+                    }
+                }
                 if !progress(depth, depth) {
                     return Err(super::error::AppError::Cancelled);
                 }
@@ -475,7 +602,11 @@ where
     F: FnMut(usize, usize) -> bool + Send,
 {
     if let Some(auth) = auth {
-        return load_games_direct_from_sgp(lcu, auth, sgp_server_id, key, depth, progress).await;
+        let mut games = load_games_direct_from_sgp(lcu, auth, sgp_server_id, key, depth, progress).await?;
+
+        supplement_custom_games_from_lcu(lcu, key, &mut games).await;
+
+        return Ok(games);
     }
 
     load_games_direct_from_lcu(lcu, key, depth, progress).await
@@ -505,8 +636,15 @@ where
         }
 
         let received = page.games.games.len();
+        let page_games = unique_games(page.games.games, &mut seen_game_ids);
+        if page_games.is_empty() {
+            break;
+        }
+
+        store_db_cached_games(key, &page_games);
+
         let before = games.len();
-        games.extend(unique_games(page.games.games, &mut seen_game_ids));
+        games.extend(page_games);
 
         if !progress(games.len().min(depth), depth) {
             return Err(super::error::AppError::Cancelled);
@@ -548,8 +686,15 @@ where
         }
 
         let received = page.len();
+        let page_games = unique_games(page, &mut seen_game_ids);
+        if page_games.is_empty() {
+            break;
+        }
+
+        store_db_cached_games(key, &page_games);
+
         let before = games.len();
-        games.extend(unique_games(page, &mut seen_game_ids));
+        games.extend(page_games);
 
         if !progress(games.len().min(depth), depth) {
             return Err(super::error::AppError::Cancelled);
@@ -563,6 +708,22 @@ where
     }
 
     Ok(games)
+}
+
+/// Try fetching the first page of match history from LCU and merge in any games
+/// (especially custom games) that SGP may have omitted for non-authenticated players.
+async fn supplement_custom_games_from_lcu(lcu: &LcuClient, key: &StatsCacheKey, games: &mut Vec<Game>) {
+    if let Ok(page) = lcu.match_history(&key.puuid, 0, SGP_PAGE_SIZE.saturating_sub(1)).await {
+        let lcu_games = page.games.games;
+        if !lcu_games.is_empty() {
+            let seen: HashSet<u64> = games.iter().map(|g| g.game_id).collect();
+            for game in lcu_games {
+                if !seen.contains(&game.game_id) {
+                    games.push(game);
+                }
+            }
+        }
+    }
 }
 
 fn count_db_cached_games(key: &StatsCacheKey) -> Option<usize> {
@@ -613,6 +774,22 @@ fn read_db_cached_games(key: &StatsCacheKey, depth: usize) -> Option<Vec<Game>> 
             .filter_map(|json| serde_json::from_str::<Game>(&json).ok())
             .collect(),
     )
+}
+
+fn read_db_cached_game_by_id(game_id: u64) -> Option<Game> {
+    let conn = open_cache_db()?;
+    conn.query_row(
+        r#"
+        SELECT game_json
+        FROM match_cache
+        WHERE game_id = ?1
+        LIMIT 1
+        "#,
+        params![game_id as i64],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|json| serde_json::from_str::<Game>(&json).ok())
 }
 
 fn store_db_cached_games(key: &StatsCacheKey, games: &[Game]) -> CachedGameStoreResult {
@@ -758,11 +935,15 @@ where
         load_games_incremental_from_lcu(lcu, key, depth, progress).await?;
     }
 
-    let games = read_db_cached_games(key, depth).unwrap_or_default();
+    let mut games = read_db_cached_games(key, depth).unwrap_or_default();
     if games.is_empty() {
         return Err(super::error::AppError::SgpUnavailable(
             "未能读取到有效的本地增量战绩".to_string(),
         ));
+    }
+
+    if auth.is_some() {
+        supplement_custom_games_from_lcu(lcu, key, &mut games).await;
     }
 
     if !progress(games.len().min(depth), depth) {
@@ -891,6 +1072,12 @@ fn unique_games(games: Vec<Game>, seen_game_ids: &mut HashSet<u64>) -> Vec<Game>
 }
 
 fn analyze_games(summoner: SummonerInfo, depth: usize, games: Vec<Game>) -> PlayerStatsResponse {
+    if let Ok(mut cache) = GAME_CACHE.lock() {
+        for game in &games {
+            cache.insert(game.game_id, game.clone());
+        }
+    }
+
     let mut recent_games = Vec::new();
     let mut champion_map: HashMap<u32, ChampionAccumulator> = HashMap::new();
 
@@ -1033,11 +1220,84 @@ fn match_detail_from_game(game: Game) -> MatchDetailResponse {
     MatchDetailResponse {
         game_id: game.game_id,
         queue_id: game.queue_id,
+        game_type: game.game_type.clone(),
         game_mode: game.game_mode,
         game_creation: game.game_creation,
         game_duration: game.game_duration,
         teams,
     }
+}
+
+fn eog_to_game(eog: serde_json::Value) -> Option<Game> {
+    let game_id = eog["gameId"].as_u64()?;
+    let teams = eog.get("teams")?.as_array()?;
+    let identities = eog.get("participantIdentities")?.as_array()?;
+
+    let participant_identities: Vec<ParticipantIdentity> = identities
+        .iter()
+        .filter_map(|entry| {
+            let participant_id = entry["participantId"].as_u64()? as u32;
+            let player = &entry["player"];
+            Some(ParticipantIdentity {
+                participant_id,
+                player: IdentityPlayer {
+                    puuid: player["puuid"].as_str().unwrap_or("").to_string(),
+                    game_name: player["gameName"].as_str().unwrap_or("").to_string(),
+                    tag_line: player["tagLine"].as_str().unwrap_or("").to_string(),
+                    summoner_name: player["summonerName"].as_str().unwrap_or("").to_string(),
+                },
+            })
+        })
+        .collect();
+
+    let mut participants = Vec::new();
+    let mut game_teams = Vec::new();
+
+    for team in teams {
+        let team_id = team["teamId"].as_u64()? as u32;
+        let mut tower_kills = 0u32;
+
+        if let Some(team_participants) = team["participants"].as_array() {
+            for p in team_participants {
+                tower_kills += p["stats"]["turretKills"].as_u64().unwrap_or(0) as u32;
+
+                let stats =
+                    serde_json::from_value::<ParticipantStats>(p.get("stats")?.clone()).ok()?;
+                let timeline = p
+                    .get("timeline")
+                    .and_then(|t| serde_json::from_value::<ParticipantTimeline>(t.clone()).ok())
+                    .unwrap_or_default();
+
+                participants.push(Participant {
+                    participant_id: p["participantId"].as_u64()? as u32,
+                    champion_id: p["championId"].as_u64()? as u32,
+                    spell1_id: p["spell1Id"].as_u64().unwrap_or(0) as u32,
+                    spell2_id: p["spell2Id"].as_u64().unwrap_or(0) as u32,
+                    team_id,
+                    stats,
+                    timeline,
+                });
+            }
+        }
+
+        game_teams.push(GameTeam { team_id, tower_kills });
+    }
+
+    Some(Game {
+        game_id,
+        queue_id: eog["queueId"].as_u64()? as u32,
+        game_mode: eog["gameMode"].as_str()?.to_string(),
+        game_type: eog
+            .get("gameType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        game_creation: eog["gameCreation"].as_i64()?,
+        game_duration: eog["gameLength"].as_i64()? / 1000,
+        participant_identities,
+        participants,
+        teams: game_teams,
+    })
 }
 
 fn participant_to_recent_game(game: &Game, participant: &Participant) -> RecentGame {

@@ -183,9 +183,15 @@ export interface RecentGame {
   gameDuration: number
 }
 
+export interface TodayCustomGamesResponse {
+  games: MatchDetailResponse[]
+  gameCount: number
+}
+
 export interface MatchDetailResponse {
   gameId: number
   queueId: number
+  gameType: string
   gameMode: string
   gameCreation: number
   gameDuration: number

@@ -28,6 +28,7 @@ pub fn run() {
             commands::search_player,
             commands::search_player_with_progress,
             commands::load_match_detail,
+            commands::load_today_custom_games,
             commands::load_live_game,
             commands::load_friends,
             commands::set_chat_availability,

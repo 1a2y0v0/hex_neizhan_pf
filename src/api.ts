@@ -11,6 +11,7 @@ import type {
   PlayerStatsResponse,
   RankedStatsResponse,
   SummonerSearchCandidate,
+  TodayCustomGamesResponse,
 } from "./types"
 
 export function acceptReadyCheck() {
@@ -151,6 +152,10 @@ export function copyPngToClipboard(bytes: number[]) {
 
 export function loadMatchDetail(gameId: number, sgpServerId?: string) {
   return invoke<MatchDetailResponse>("load_match_detail", { gameId, sgpServerId })
+}
+
+export function loadTodayCustomGames(dayStartMs?: number, dayEndMs?: number) {
+  return invoke<TodayCustomGamesResponse>("load_today_custom_games", { dayStartMs, dayEndMs })
 }
 
 export function loadLiveGame(depth: number) {

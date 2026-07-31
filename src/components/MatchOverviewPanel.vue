@@ -333,7 +333,7 @@ function abilityQueueMatches(game: RecentGame, source: RecentGame | MatchDetailR
 }
 
 function isHexAram(queueId: number, gameMode: string) {
-  return queueId === 2400 || ["STRAWBERRY", "KIWI"].includes(gameMode.toUpperCase())
+  return queueId === 2400 || ["CHERRY", "STRAWBERRY", "KIWI"].includes(gameMode.toUpperCase())
 }
 
 function errorMessage(error: unknown) {
