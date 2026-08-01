@@ -188,18 +188,23 @@ pub async fn load_today_custom_games(
                 let mut games = Vec::new();
                 let mut seen = HashSet::new();
                 let mut start = 0usize;
-                while games.len() < 100 {
+                // SGP 分页按时间倒序返回，翻页直到整页都早于起始日期为止，
+                // 上限 1000 局仅作兜底保护，避免日期跨度大时漏掉旧对局。
+                while games.len() < 1000 {
                     let page = sgp.match_history(&puuid, start, 50).await?;
                     if page.is_empty() {
                         break;
                     }
+                    let page_past_start = page
+                        .last()
+                        .map_or(false, |g| g.game_creation < day_start);
                     let new: Vec<Game> = page
                         .into_iter()
                         .filter(|g| seen.insert(g.game_id))
                         .collect();
                     let count = new.len();
                     games.extend(new);
-                    if count < 50 {
+                    if count < 50 || page_past_start {
                         break;
                     }
                     start += 50;

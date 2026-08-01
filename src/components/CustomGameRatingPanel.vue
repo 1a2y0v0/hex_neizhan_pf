@@ -2,20 +2,33 @@
 import { computed, onMounted, ref } from "vue"
 import { Calendar, Check, ChevronDown, ChevronUp, ChevronsUpDown, Crown, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
 import { loadTodayCustomGames } from "../api"
+import { matchTeamSummary } from "../matchTeamSummary"
 import { buildChampionProfiles, buildPlayerProfile, profileScoreLevel, type ChampionProfile, type PlayerProfile } from "../playerProfile"
-import { scoreEvaluationLabel } from "../scoring"
-import type { ChampionSummaryItem, GameAssetEntry, MatchDetailPlayer, TodayCustomGamesResponse } from "../types"
-import { championName } from "../utils"
+import { calculateOutputRating, outputRatingTitle, scoreEvaluationLabel } from "../scoring"
+import type { ChampionSummaryItem, GameAssetBundle, GameAssetEntry, MatchDetailPlayer, MatchDetailResponse, RecentGame, TodayCustomGamesResponse } from "../types"
+import { championName, fixed, mitigationValue, teamMitigationValue } from "../utils"
+import AssetIcon from "./AssetIcon.vue"
+import ChampionAvatar from "./ChampionAvatar.vue"
 import PlayerRadarPanel from "./PlayerRadarPanel.vue"
 
-const props = defineProps<{ champions: Record<number, ChampionSummaryItem>; items?: GameAssetEntry[] }>()
+const props = defineProps<{
+  champions: Record<number, ChampionSummaryItem>
+  items?: GameAssetEntry[]
+  gameAssets?: GameAssetBundle
+}>()
 
-const itemMap = computed(() => {
-  if (!props.items) return {}
+function indexAssets(entries?: GameAssetEntry[]) {
   const map: Record<number, GameAssetEntry> = {}
-  for (const item of props.items) map[item.id] = item
+  if (!entries) return map
+  for (const entry of entries) map[entry.id] = entry
   return map
-})
+}
+
+const itemMap = computed(() => indexAssets(props.items))
+const spellMap = computed(() => indexAssets(props.gameAssets?.summonerSpells))
+const perkMap = computed(() => indexAssets(props.gameAssets?.perks))
+const augmentMap = computed(() => indexAssets(props.gameAssets?.augments))
+const ratingContext = computed(() => ({ items: itemMap.value, champions: props.champions }))
 
 /* ── helpers ── */
 const loading = ref(false)
@@ -46,6 +59,51 @@ function abilityClass(s: number) { return s >= 80 ? "ab-high" : s >= 60 ? "ab-mi
 function scoreClass(s: number) { return s >= 80 ? "sc-high" : s >= 60 ? "sc-mid" : "sc-low" }
 function kdaScore(k: number, d: number, a: number) { return Math.round((k + a) / Math.max(d, 0.5) * 10) / 10 }
 function winRate(r: { wins: number; gamesPlayed: number }) { return r.wins / r.gamesPlayed * 100 }
+
+/* ── detail view helpers ── */
+function kNumber(value: number) { return `${(value / 1000).toFixed(1)}k` }
+function shareSuffix(part: number, total: number) { return `(${total > 0 ? Math.round(part / total * 100) : 0}%)` }
+function detailTeamSummary(team: { players: MatchDetailPlayer[]; towerKills?: number }) {
+  return matchTeamSummary(team as Parameters<typeof matchTeamSummary>[0])
+}
+function damageConversion(game: RecentGame) {
+  const goldShare = game.teamGoldEarned > 0 ? game.goldEarned / game.teamGoldEarned : 0
+  if (goldShare === 0) return "0.00"
+  return fixed((game.damageToChampions / Math.max(game.teamDamageToChampions, 1)) / goldShare)
+}
+function detailStatLeader(game: RecentGame, kind: "damage" | "gold" | "mitigation" | "healing" | "conversion") {
+  switch (kind) {
+    case "damage": return game.gameDamageLeader || game.teamDamageLeader
+    case "gold": return game.teamGoldLeader
+    case "mitigation": return game.teamMitigationLeader
+    case "healing": return game.teamHealingLeader
+    case "conversion": return game.teamDamageConversionLeader
+  }
+}
+function outputRating(game: RecentGame) {
+  return calculateOutputRating(game, ratingContext.value)
+}
+function outputRatingHint(game: RecentGame) {
+  return outputRatingTitle(game, ratingContext.value)
+}
+function detailScoreClass(player: MatchDetailPlayer) {
+  return `score-${outputRating(player).level}`
+}
+function augmentName(augmentId: number) {
+  return augmentMap.value[augmentId]?.name || perkMap.value[augmentId]?.name || `强化 ${augmentId}`
+}
+function shortAugmentName(augmentId: number) {
+  return Array.from(augmentName(augmentId)).slice(0, 5).join("")
+}
+function augmentRarityClass(augmentId: number) {
+  switch (augmentMap.value[augmentId]?.rarity || perkMap.value[augmentId]?.rarity) {
+    case "kPrismatic": return "augment-prismatic"
+    case "kGold": return "augment-gold"
+    case "kSilver": return "augment-silver"
+    case "kBronze": return "augment-bronze"
+    default: return ""
+  }
+}
 
 /* ── types ── */
 interface PlayerRating {
@@ -94,6 +152,13 @@ const customOnly = ref(true)
 const fiveV5Only = ref(true)
 const minDuration8 = ref(true)
 
+const minGameCount = ref(0)
+const minGameCountText = ref("")
+function applyMinGameCount() {
+  const v = parseInt(minGameCountText.value, 10)
+  minGameCount.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+
 const visibleGames = computed(() => {
   if (!data.value) return []
   const del = deletedGameIds.value
@@ -106,9 +171,18 @@ const visibleGames = computed(() => {
   })
 })
 
+const rawGameById = computed(() => {
+  const map = new Map<number, MatchDetailResponse>()
+  for (const g of visibleGames.value) map.set(g.gameId, g)
+  return map
+})
+function rawGame(gameId: number): MatchDetailResponse | undefined {
+  return rawGameById.value.get(gameId)
+}
+
 // game list
-const gameTypeFilter = ref<"all" | "quick" | "long">("all")
 const gameListVisible = ref(true)
+const filteredGames = computed(() => enrichedGames.value)
 const expandedGames = ref<Set<number>>(new Set())
 const hoveredGameId = ref<number | null>(null)
 
@@ -116,8 +190,6 @@ const hoveredGameId = ref<number | null>(null)
 const sortColumn = ref<string>("overallScore")
 const sortDirection = ref<"asc" | "desc">("desc")
 const filterText = ref("")
-const filterTags = ref<string[]>([])
-const tagDropdownOpen = ref(false)
 const showSubColumns = ref(false)
 const hoveredPlayer = ref<PlayerRating | null>(null)
 
@@ -152,13 +224,6 @@ const enrichedGames = computed<GameEnriched[]>(() => {
       tags, gameCreation: game.gameCreation,
     }
   })
-})
-
-const filteredGames = computed(() => {
-  let gs = enrichedGames.value
-  if (gameTypeFilter.value === "quick") gs = gs.filter((g) => g.gameDuration < 900)
-  else if (gameTypeFilter.value === "long") gs = gs.filter((g) => g.gameDuration > 1440)
-  return gs
 })
 
 function toggleGameExpand(gameId: number) {
@@ -225,15 +290,8 @@ const chartTopChamps = computed(() => {
 })
 
 const chartsVisible = ref(false)
-const reviewsVisible = ref(false)
 
 /* ── table sort / filter ── */
-const availableTags = computed(() => {
-  const s = new Set<string>()
-  for (const r of playerRatings.value) for (const tag of r.profile.tags) s.add(tag)
-  return Array.from(s).sort()
-})
-
 function sortBy(col: string) {
   if (sortColumn.value === col) sortDirection.value = sortDirection.value === "asc" ? "desc" : "asc"
   else { sortColumn.value = col; sortDirection.value = "desc" }
@@ -255,7 +313,6 @@ const filteredAndSortedRatings = computed(() => {
     const q = filterText.value.toLowerCase()
     list = list.filter((r) => r.gameName.toLowerCase().includes(q) || r.tagLine.toLowerCase().includes(q))
   }
-  if (filterTags.value.length) list = list.filter((r) => filterTags.value.some((t) => r.profile.tags.includes(t)))
 
   const col = sortColumn.value; const dir = sortDirection.value; const ratings = [...list]
   ratings.sort((a, b) => {
@@ -297,303 +354,6 @@ function tierPercent(tier: string): number {
 }
 
 const showExtremes = ref(true)
-
-interface PlayerReview {
-  puuid: string; gameName: string; tagLine: string; score: number; lines: string[]
-}
-
-/* Simple pseudo-random based on string + index for style variety */
-function pick<T>(arr: T[], seed: string, idx: number): T {
-  return arr[(Math.abs(hashStr(seed) + idx * 31) % arr.length)]
-}
-function hashStr(s: string): number {
-  let h = 0
-  for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0 }
-  return h
-}
-
-/* champion name helper */
-function cname(id: number): string {
-  return championName(props.champions, id) || `英雄${id}`
-}
-
-const playerReviews = computed<PlayerReview[]>(() => {
-  return [...playerRatings.value].sort((a, b) => b.profile.overallScore - a.profile.overallScore).map((r) => {
-    const lines: string[] = []
-    const s = r.profile
-    const ds = avgChampProp(r.championProfiles, (cp) => cp.averageDamageShare)
-    const ms = avgChampProp(r.championProfiles, (cp) => cp.averageMitigationShare)
-    const k = r.avgKills; const d = r.avgDeaths; const a = r.avgAssists
-    const seed = r.puuid
-
-    const isExcellent = s.overallScore >= 80
-    const isGood = s.overallScore >= 65
-    const isMid = s.overallScore >= 40 && s.overallScore < 65
-
-    /* ═══════════════ 1. 单局英雄逐局锐评 ═══════════════ */
-    lines.push(`【单局英雄逐局锐评】`)
-    for (let gi = 0; gi < r.gameRecords.length; gi++) {
-      const g = r.gameRecords[gi]
-      const champ = cname(g.championId)
-      const dmgs = (g.damageShare * 100).toFixed(0)
-      const mits = (g.mitigationShare * 100).toFixed(0)
-      const kda = `${g.kills}/${g.deaths}/${g.assists}`
-      const winStr = g.win ? "胜" : "败"
-      const durMin = (g.gameDuration / 60).toFixed(0)
-      const sSeed = seed + "_g" + gi
-      const isDmgLeader = r.leaderGameIds.damage.includes(g.gameId)
-      const isMitLeader = r.leaderGameIds.mitigation.includes(g.gameId)
-      const isAstLeader = r.leaderGameIds.assist.includes(g.gameId)
-      const perf = g.kills + g.assists - g.deaths * 2
-
-      /* pick style per game for variety */
-      const styleIdx = hashStr(sSeed) % 7
-
-      if (perf >= 8 && isDmgLeader) {
-        if (styleIdx === 0) lines.push(`${champ}（${kda}·${winStr}·${durMin}min）—— 伤害占比${dmgs}%带队掀桌，建议对面直接投。`)
-        else if (styleIdx === 1) lines.push(`${champ}这局${kda}/${dmgs}%伤害占比，打出了年薪千万的身价，可惜工资没到账。`)
-        else if (styleIdx === 2) lines.push(`${champ}这局${kda}，伤害占比${dmgs}%，打得不赖，继续保持。`)
-        else if (styleIdx === 3) lines.push(`${champ}！这个选手用${champ}打出了全场最高的伤害占比${dmgs}%，这就是终极核心的统治力！`)
-        else if (styleIdx === 4) lines.push(`${champ} ${kda}，伤害占比${dmgs}%——天选之人，一人成军，燃爆全场！`)
-        else if (styleIdx === 5) lines.push(`${champ} ${kda}，伤害拉满，对面被你点得头皮发麻。`)
-        else lines.push(`${champ}这数据${kda}，${winStr}局伤害占比${dmgs}%，建议对面回家好好反省一下为什么没针对你。`)
-      } else if (perf >= 5) {
-        if (styleIdx === 0) lines.push(`${champ}（${kda}·${winStr}·${durMin}min）伤害${dmgs}%承伤${mits}%，中规中矩，及格了但不够C。`)
-        else if (styleIdx === 1) lines.push(`${champ}这局${kda}，只能说还像个人，离带飞还差一个段位。`)
-        else if (styleIdx === 2) lines.push(`${champ} ${kda}，伤害${dmgs}%，发挥稳定，要是能再凶一点就好了。`)
-        else if (styleIdx === 3) lines.push(`${champ}！虽然数据${kda}并不华丽，但伤害占比${dmgs}%为团队提供了稳定火力。`)
-        else if (styleIdx === 4) lines.push(`${champ} ${kda}，平凡但可靠，不是主角但也不是小兵。`)
-        else if (styleIdx === 5) lines.push(`${champ} ${kda}，比上不足比下有余，你说菜吧又不菜，说C吧又C不动。`)
-        else lines.push(`${champ}（${kda}）发挥在及格线附近晃悠，稳是稳，但也可以理解为缺乏存在感。`)
-      } else if (perf >= 0) {
-        if (styleIdx === 0) lines.push(`${champ}（${kda}·${winStr}）—— ${dmgs}%伤害占比，数据平平，像极了来峡谷补觉的。`)
-        else if (styleIdx === 1) lines.push(`${champ}这局${kda}，伤害${dmgs}%承伤${mits}%，感觉你玩的是单机模式，队友死活跟你没关系。`)
-        else if (styleIdx === 2) lines.push(`${champ} ${kda}，表现有些挣扎，下次试试少送几个？`)
-        else if (styleIdx === 3) lines.push(`${champ}这局的发挥只能说还需要更多训练，${kda}的数据难以让人满意。`)
-        else if (styleIdx === 4) lines.push(`${champ}...${kda}，这就是你修炼多年的结果？再练练吧。`)
-        else if (styleIdx === 5) lines.push(`${champ} ${kda}，承伤${mits}%伤害${dmgs}%，突出一个"来过"。`)
-        else lines.push(`${champ}（${kda}）数据平淡如水，建议把ID改成"凑数的"。`)
-      } else {
-        if (styleIdx === 0) lines.push(`${champ}（${kda}·${g.win ? '胜' : '负'}）—— 这${champ}玩得像在送温暖，对面估计给你点了赞。`)
-        else if (styleIdx === 1) lines.push(`${champ}这局${kda}，伤害占比才${dmgs}%死${g.deaths}次，你是峡谷慈善家？`)
-        else if (styleIdx === 2) lines.push(`${champ}这局有些不在状态，${kda}的数据需要好好总结一下。`)
-        else if (styleIdx === 3) lines.push(`${champ}！这个数据${kda}实在是太辣眼睛了，观众席都看不下去了！`)
-        else if (styleIdx === 4) lines.push(`${champ} ${kda}——黑暗降临，这局就当是渡劫了。`)
-        else if (styleIdx === 5) lines.push(`${champ} ${kda}，你这操作我看得血压都上来了。`)
-        else lines.push(`${champ}（${kda}·${dmgs}%伤害）这局纯属靠队友带，建议赛后请全队喝奶茶。`)
-      }
-
-      /* extra line for leader achievements per game */
-      const extraFlags: string[] = []
-      if (isDmgLeader) extraFlags.push("伤害")
-      if (isMitLeader) extraFlags.push("承伤")
-      if (isAstLeader) extraFlags.push("助攻")
-      if (extraFlags.length && perf >= 0) {
-        const flagLine = pick(
-          [`本局拿下${extraFlags.join("/")}榜首！`, `（${extraFlags.join("/")}三项数据位列全场第一）`, `，同时斩获${extraFlags.join("/")}头名`],
-          sSeed + "_extra", gi,
-        )
-        lines.push(`  → ${flagLine}`)
-      }
-
-      if (g.kills === 0 && g.deaths > 3) {
-        lines.push(pick(
-          [`这把零击杀死${g.deaths}次，建议把手捐了。`, `拿了${g.deaths}个死没拿一个头，？？？`, `0杀${g.deaths}死，这战绩发群里会被嘲笑的。`],
-          sSeed + "_0k", gi,
-        ))
-      }
-      if (g.kills >= 10) {
-        lines.push(pick(
-          [`${g.kills}个人头！这${champ}在你手里跟杀神一样。`, `${g.kills}杀！对面被你这${champ}打出了心理阴影。`, `爆杀${g.kills}个，这局你说了算。`],
-          sSeed + "_10k", gi,
-        ))
-      }
-    }
-
-    /* ═══════════════ 2. 全局单项榜首数据点评 ═══════════════ */
-    lines.push(`【全局榜首数据点评】`)
-    const dLead = r.damageLeaderCount
-    const mLead = r.mitigationLeaderCount
-    const aLead = r.assistLeaderCount
-    const totLead = dLead + mLead + aLead
-
-    if (totLead === 0) {
-      lines.push(pick(
-        [`${r.gamesPlayed}局打下来，没有在任何一项数据上登顶过榜首，建议换个车队或者换个游戏。`,
-         `三项榜首次数全部挂零，突出一个"雨露均沾但都不突出"。`,
-         `伤害/承伤/助攻榜首一个没拿到，这就是传说中的均衡之道？`],
-        seed + "_l0", 0,
-      ))
-    }
-    if (dLead > 0) {
-      if (dLead >= 3) lines.push(pick(
-        [`伤害榜首 ×${dLead} —— 团战输出机器，对面看到你的伤害面板就想点投降。`,
-         `${dLead}局伤害登顶，你就是行走的伤害统计器，站在那就是威胁。`,
-         `拿下${dLead}局伤害最高，你的字典里没有"划水"两个字。`],
-        seed + "_ld", dLead,
-      ))
-      else if (dLead >= 2) lines.push(pick(
-        [`${dLead}局伤害登顶，输出端的稳定火力点，偶尔也能当爹。`,
-         `${dLead}次伤害榜首，证明你不是来峡谷观光的，是真在打伤害。`,
-         `伤害榜首拿了${dLead}次，还不错，虽然不多但胜在有。`],
-        seed + "_ld2", dLead,
-      ))
-      else lines.push(pick(
-        [`1局伤害最高，昙花一现的爆发力，建议再努把力。`,
-         `只拿了1次伤害榜首，说明你还有很大的进步空间。`,
-         `1次伤害登顶，给你颁个"瞬间爆发奖"。`],
-        seed + "_ld1", dLead,
-      ))
-    }
-    if (mLead > 0) {
-      if (mLead >= 3) lines.push(pick(
-        [`承伤榜首 ×${mLead} —— 前排真男人，对面的技能全往你脸上招呼了。`,
-         `${mLead}局承伤拉满，堪称人肉沙包，队友的盾都省了。`,
-         `承伤之王${mLead}次登顶，这就是真正的坦克精神！`],
-        seed + "_lm", mLead,
-      ))
-      else if (mLead >= 2) lines.push(pick(
-        [`${mLead}局承伤榜首，前排抗伤意识在线，挨打也是一门艺术。`,
-         `${mLead}次承伤登顶，肉得对面怀疑人生。`,
-         `承伤拿了${mLead}次第一，肉盾本职完成得不错。`],
-        seed + "_lm2", mLead,
-      ))
-      else lines.push(pick(
-        [`1次承伤榜首，证明你能扛一次，但不能扛一辈子。`,
-         `承伤榜首只拿1次，下次试试多吃点技能？`,
-         `1局承伤最高，说明你偶尔也想当个男人。`],
-        seed + "_lm1", mLead,
-      ))
-    }
-    if (aLead > 0) {
-      if (aLead >= 3) lines.push(pick(
-        [`助攻榜首 ×${aLead} —— 团队发动机，你的助攻比你的KDA还亮眼。`,
-         `${aLead}局助攻最多，你是团队粘合剂，没了你队友连架都打不赢。`,
-         `助攻之王${aLead}次，你就是峡谷里的快递员，把胜利送到每个人手上。`],
-        seed + "_la", aLead,
-      ))
-      else if (aLead >= 2) lines.push(pick(
-        [`${aLead}局助攻最多，团队节奏带动者，给AD当狗当得心甘情愿。`,
-         `${aLead}次助攻登顶，工具人当得出神入化。`,
-         `助攻${aLead}局第一，团队型选手，适合五排车队。`],
-        seed + "_la2", aLead,
-      ))
-      else lines.push(pick(
-        [`1次助攻最高，你可能是个隐藏的辅助奇才。`,
-         `助攻榜首拿1次，偶尔也当了一回绿叶。`,
-         `1局助攻最多，证明你还是有团队意识的……大概吧。`],
-        seed + "_la1", aLead,
-      ))
-    }
-
-    /* ═══════════════ 3. 今日整体总表现总结 ═══════════════ */
-    lines.push(`【今日整体总表现总结】`)
-    const wr = r.wins / r.gamesPlayed * 100
-    const mainRole = s.mainRoleLabel || "全能"
-    const label = scoreEvaluationLabel(s.overallScore)
-    const hl = r.highlightGames; const dl = r.disasterGames
-    const vol = s.volatility
-
-    /* header – rating-based */
-    if (isExcellent) {
-      lines.push(pick(
-        [`综合评分 ${s.overallScore.toFixed(1)}（${label}），${r.gamesPlayed}局${wr.toFixed(0)}%胜率、${hl}局高光——今日峡谷大魔王，建议拳头削你。`,
-         `评分${s.overallScore.toFixed(1)}，评级${label}，今天你就是全场最靓的仔，队友躺赢就完事了。`,
-         `${s.overallScore.toFixed(1)}分，${label}级，${r.gamesPlayed}局${wr.toFixed(0)}%的胜率说明你在这个分段就是降维打击。`],
-        seed + "_s1", 0,
-      ))
-    } else if (isGood) {
-      lines.push(pick(
-        [`综合评分 ${s.overallScore.toFixed(1)}（${label}），${r.gamesPlayed}局${wr.toFixed(0)}%胜率、${hl}局高光、${dl}局战犯——有点东西，但不多。`,
-         `${s.overallScore.toFixed(1)}分，评级${label}，今天算是个合格的队友。`,
-         `评分${s.overallScore.toFixed(1)}，${label}，${r.gamesPlayed}局总体不错，细节再打磨一下就是大腿了。`],
-        seed + "_s2", 0,
-      ))
-    } else if (isMid) {
-      lines.push(pick(
-        [`综合评分 ${s.overallScore.toFixed(1)}（${label}），${r.gamesPlayed}局${wr.toFixed(0)}%胜率——说菜吧又不太菜，说强吧又不太强，主打一个尴尬。`,
-         `${s.overallScore.toFixed(1)}分，${label}级，属于那种"赢了没你功劳，输了有你份"的玩家。`,
-         `评分${s.overallScore.toFixed(1)}，评级${label}，你的发挥就像薛定谔的猫——又菜又C的叠加态。`],
-        seed + "_s3", 0,
-      ))
-    } else {
-      lines.push(pick(
-        [`综合评分 ${s.overallScore.toFixed(1)}（${label}），${r.gamesPlayed}局仅${r.wins}胜，${dl}局战犯——要不咱换个游戏？`,
-         `评分${s.overallScore.toFixed(1)}，${label}级，这数据发到朋友圈会被拉黑吧。`,
-         `${s.overallScore.toFixed(1)}分，${label}，建议最近别碰排位，去大乱斗沉淀一下。`],
-        seed + "_s4", 0,
-      ))
-    }
-
-    /* data-driven mid-section */
-    if (d > 0 && k / Math.max(d, 0.5) > 3.5 && isGood) {
-      lines.push(pick(
-        [`场均KDA ${k.toFixed(1)}/${d.toFixed(1)}/${a.toFixed(1)}，这KDA比你的脸还干净，稳健得一批。`,
-         `KDA ${k.toFixed(1)}/${d.toFixed(1)}/${a.toFixed(1)}，又稳又C，建议去职业队试训。`],
-        seed + "_kda1", 0,
-      ))
-    } else if (d > 0 && k / Math.max(d, 0.5) < 1) {
-      lines.push(pick(
-        [`KDA ${k.toFixed(1)}/${d.toFixed(1)}/${a.toFixed(1)}，死得比杀得多，建议下局玩塔姆，至少跑得快。`,
-         `${k.toFixed(1)}杀${d.toFixed(1)}死，这KDA，我奶奶来打都不会死这么多次。`],
-        seed + "_kda2", 0,
-      ))
-    }
-    if (ds < 0.18 && ms < 0.18) {
-      lines.push(pick(
-        [`伤害${(ds * 100).toFixed(0)}%承伤${(ms * 100).toFixed(0)}%，两项数据都低于18%，你今天的表现完美诠释了"隐身"二字。`,
-         `输出和承伤都垫底，你头上是不是顶着个问号——"队友去哪了？"`],
-        seed + "_dmlow", 0,
-      ))
-    } else if (ds >= 0.28 && ms >= 0.28) {
-      lines.push(pick(
-        [`伤害${(ds * 100).toFixed(0)}%+承伤${(ms * 100).toFixed(0)}%，能打能扛，团队基石就是你。`,
-         `双高数据${(ds * 100).toFixed(0)}%/${(ms * 100).toFixed(0)}%，六边形战士本士。`],
-        seed + "_dmhigh", 0,
-      ))
-    }
-    if (vol > 18) {
-      lines.push(pick(
-        [`波动率${vol.toFixed(1)}，你的状态比女朋友的心情还难以预测，建议去算一卦再开游戏。`,
-         `稳定性${vol.toFixed(1)}，神一场鬼一场，队友的心脏受不了。`],
-        seed + "_vol", 0,
-      ))
-    }
-
-    /* concluding line */
-    if (isExcellent) {
-      lines.push(pick(
-        [`定位${mainRole}，建议以后组车队你当队长，其他人安心当狗就行了。`,
-         `核心定位${mainRole}，今天你就是峡谷唯一真神。`,
-         `${mainRole}玩明白了，建议出教学视频，我一定给你三连。`],
-        seed + "_end1", 0,
-      ))
-    } else if (isGood) {
-      lines.push(pick(
-        [`定位${mainRole}，下次想上分建议找两个靠谱的队友带你飞。`,
-         `主要定位${mainRole}，距离顶尖还差一步，今天先这样吧。`,
-         `${mainRole}是你能吃分的路子，以后就认准这个位置打。`],
-        seed + "_end2", 0,
-      ))
-    } else if (isMid) {
-      lines.push(pick(
-        [`定位${mainRole}，建议多练练，少送点，争取下次不当副作用。`,
-         `最适合你的位置是${mainRole}，但今天的数据说明你还有很长的路要走。`,
-         `${mainRole}是你的舒适区，但舒适不等于优秀，加油练吧。`],
-        seed + "_end3", 0,
-      ))
-    } else {
-      lines.push(pick(
-        [`建议先去训练营练补刀，别来排位祸害队友了。`,
-         `听哥一句劝，这游戏不适合你，去玩点休闲游戏不好吗？`,
-         `今天就这样吧，建议你把游戏卸了，明天重新下回来换个手感。`],
-        seed + "_end4", 0,
-      ))
-    }
-
-    return { puuid: r.puuid, gameName: r.gameName, tagLine: r.tagLine, score: s.overallScore, lines }
-  })
-})
 
 /* ── column max/min markers ── */
 const REVERSE_COLS = new Set(["avgDeaths", "disasterGames"])
@@ -693,6 +453,7 @@ const playerRatings = computed<PlayerRating[]>(() => {
     const championProfiles = buildChampionProfiles(entry.records, ctx)
     const player = entry.records[0]
     const n = entry.records.length
+    if (n < minGameCount.value) continue
     const totalK = entry.records.reduce((s, r) => s + r.kills, 0)
     const totalD = entry.records.reduce((s, r) => s + r.deaths, 0)
     const totalA = entry.records.reduce((s, r) => s + r.assists, 0)
@@ -742,24 +503,6 @@ onMounted(load)
         <h2>内战评分</h2>
       </div>
       <div class="header-actions">
-        <div class="date-picker-wrap">
-          <Calendar :size="14" />
-          <input type="date" v-model="startDate" @change="load" class="date-input" />
-          <span class="date-sep">—</span>
-          <input type="date" v-model="endDate" @change="load" class="date-input" />
-        </div>
-        <button class="toggle-sub" :class="{ active: customOnly }" @click="customOnly = !customOnly; load()" style="min-width:72px">
-          <component :is="customOnly ? Check : X" :size="16" />
-          <span style="font-size:13px">{{ customOnly ? '仅显示内战' : '全部对局' }}</span>
-        </button>
-        <button class="toggle-sub" :class="{ active: fiveV5Only }" @click="fiveV5Only = !fiveV5Only" style="min-width:72px">
-          <component :is="fiveV5Only ? Check : X" :size="16" />
-          <span style="font-size:13px">5V5</span>
-        </button>
-        <button class="toggle-sub" :class="{ active: minDuration8 }" @click="minDuration8 = !minDuration8" style="min-width:72px">
-          <component :is="minDuration8 ? Check : X" :size="16" />
-          <span style="font-size:13px">>8min</span>
-        </button>
         <button class="primary-action" @click="load" :disabled="loading">
           <RefreshCw v-if="loading" class="spin" :size="16" />
           <RefreshCw v-else :size="16" />
@@ -823,10 +566,36 @@ onMounted(load)
             </span>
           </div>
           <div class="gsh-right">
-            <div class="game-filter-buttons">
-              <button :class="{ active: gameTypeFilter === 'all' }" @click="gameTypeFilter = 'all'">全部</button>
-              <button :class="{ active: gameTypeFilter === 'quick' }" @click="gameTypeFilter = 'quick'">速推</button>
-              <button :class="{ active: gameTypeFilter === 'long' }" @click="gameTypeFilter = 'long'">鏖战</button>
+            <div class="date-picker-wrap">
+              <Calendar :size="14" />
+              <input type="date" v-model="startDate" @change="load" class="date-input" />
+              <span class="date-sep">—</span>
+              <input type="date" v-model="endDate" @change="load" class="date-input" />
+            </div>
+            <button class="toggle-sub" :class="{ active: customOnly }" @click="customOnly = !customOnly; load()" style="min-width:72px">
+              <component :is="customOnly ? Check : X" :size="16" />
+              <span style="font-size:13px">{{ customOnly ? '仅显示内战' : '全部对局' }}</span>
+            </button>
+            <button class="toggle-sub" :class="{ active: fiveV5Only }" @click="fiveV5Only = !fiveV5Only" style="min-width:72px">
+              <component :is="fiveV5Only ? Check : X" :size="16" />
+              <span style="font-size:13px">5V5</span>
+            </button>
+            <button class="toggle-sub" :class="{ active: minDuration8 }" @click="minDuration8 = !minDuration8" style="min-width:72px">
+              <component :is="minDuration8 ? Check : X" :size="16" />
+              <span style="font-size:13px">>8min</span>
+            </button>
+            <div class="toggle-sub min-games-input" :class="{ active: minGameCount > 0 }" title="仅统计场数≥该值的玩家，留空为不限">
+              <span style="font-size:13px">场数≥</span>
+              <input
+                v-model="minGameCountText"
+                type="number"
+                min="1"
+                step="1"
+                placeholder="不限"
+                class="min-games-input-box"
+                @change="applyMinGameCount"
+                @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+              />
             </div>
           </div>
         </div>
@@ -836,6 +605,7 @@ onMounted(load)
             <div
               class="game-card"
               :class="{ 'game-has-expanded': expandedGames.has(game.gameId) }"
+              @click="toggleGameExpand(game.gameId)"
               @mouseenter="hoveredGameId = game.gameId"
               @mouseleave="hoveredGameId = null"
             >
@@ -844,11 +614,7 @@ onMounted(load)
                 <div class="team-players-row">
                   <div v-for="p in game.teams[0]?.players || []" :key="p.puuid" class="tp-avatar-wrap">
                     <div class="tp-avatar-frame">
-                      <img
-                        :src="`https://ddragon.leagueoflegends.com/cdn/15.7.1/img/champion/${(props.champions as Record<number, any>)[p.championId]?.alias || p.championId}.png`"
-                        class="tp-avatar"
-                        :title="(props.champions as Record<number, any>)[p.championId]?.name || ''"
-                      />
+                      <ChampionAvatar :champion-id="p.championId" :champions="props.champions" :size="32" />
                       <Crown v-if="p.puuid === game.mvp.puuid" :size="10" class="mvp-crown" />
                     </div>
                     <span class="tp-name">{{ p.gameName.length > 6 ? p.gameName.slice(0, 6) + '..' : p.gameName }}</span>
@@ -882,11 +648,7 @@ onMounted(load)
                 <div class="team-players-row">
                   <div v-for="p in game.teams[1]?.players || []" :key="p.puuid" class="tp-avatar-wrap">
                     <div class="tp-avatar-frame">
-                      <img
-                        :src="`https://ddragon.leagueoflegends.com/cdn/15.7.1/img/champion/${(props.champions as Record<number, any>)[p.championId]?.alias || p.championId}.png`"
-                        class="tp-avatar"
-                        :title="(props.champions as Record<number, any>)[p.championId]?.name || ''"
-                      />
+                      <ChampionAvatar :champion-id="p.championId" :champions="props.champions" :size="32" />
                       <Crown v-if="p.puuid === game.mvp.puuid" :size="10" class="mvp-crown" />
                     </div>
                     <span class="tp-name">{{ p.gameName.length > 6 ? p.gameName.slice(0, 6) + '..' : p.gameName }}</span>
@@ -896,46 +658,137 @@ onMounted(load)
               </div>
 
               <!-- expand btn -->
-              <button class="game-expand-btn" @click="toggleGameExpand(game.gameId)">
+              <button class="game-expand-btn" @click.stop="toggleGameExpand(game.gameId)">
                 <ChevronDown v-if="!expandedGames.has(game.gameId)" :size="14" />
                 <ChevronUp v-else :size="14" />
               </button>
-              <button class="game-delete-btn" @click="deleteGame(game.gameId)" title="临时删除此局">
+              <button class="game-delete-btn" @click.stop="deleteGame(game.gameId)" title="临时删除此局">
                 <X :size="12" />
               </button>
             </div>
 
-            <!-- expanded per-game table -->
-            <div v-if="expandedGames.has(game.gameId)" class="game-expanded-table">
-              <table class="mini-game-table">
-                <thead>
-                  <tr>
-                    <th>队伍</th><th>玩家</th><th>英雄</th><th>K</th><th>D</th><th>A</th><th>KDA分</th><th>伤害</th><th>承伤</th><th>治疗</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="(team, ti) in game.teams" :key="ti">
-                    <td v-for="p in team.players" :key="p.puuid" style="display:contents">
-                      <!-- We need a flat list; use nested approach -->
-                    </td>
-                  </tr>
-                  <!-- Flat list of all players -->
-                  <template v-for="(p) in game.teams.flatMap((t, ti) => t.players.map(pl => ({ ...pl, teamIdx: ti, teamWin: t.win })))" :key="p.puuid">
-                    <tr :class="p.teamWin ? 'tr-win-bg' : 'tr-lose-bg'">
-                      <td class="mg-team">{{ p.teamWin ? '🔵' : '🔴' }}</td>
-                      <td class="mg-player">{{ p.gameName }}</td>
-                      <td class="mg-champ"><img :src="`https://ddragon.leagueoflegends.com/cdn/15.7.1/img/champion/${(props.champions as Record<number, any>)[p.championId]?.alias || p.championId}.png`" class="mg-champ-icon"/></td>
-                      <td class="mg-stat">{{ p.kills }}</td>
-                      <td class="mg-stat">{{ p.deaths }}</td>
-                      <td class="mg-stat">{{ p.assists }}</td>
-                      <td class="mg-stat"><span :class="scoreClass(p.gameScore)">{{ p.gameScore }}</span></td>
-                      <td class="mg-stat">{{ (p.damageDealtToChampions / 1000).toFixed(1) }}k</td>
-                      <td class="mg-stat">{{ (p.totalDamageTaken / 1000).toFixed(1) }}k</td>
-                      <td class="mg-stat">{{ (p.totalHeal / 1000).toFixed(1) }}k</td>
-                    </tr>
-                  </template>
-                </tbody>
-              </table>
+            <!-- expanded per-game detail -->
+            <div v-if="expandedGames.has(game.gameId) && rawGame(game.gameId)" class="game-expanded-table">
+              <section v-for="team in rawGame(game.gameId)!.teams" :key="team.teamId" class="detail-team-block">
+                <div class="detail-team-header" :class="team.win ? 'win' : 'lose'">
+                  <div class="detail-team-result">
+                    <strong>{{ team.name || (team.teamId === 100 ? '蓝方' : '红方') }}</strong>
+                    <span>{{ team.win ? '胜利' : '失败' }}</span>
+                  </div>
+                  <div class="detail-team-summary">
+                    <span>队伍总经济 <b>{{ kNumber(detailTeamSummary(team).goldEarned) }}</b></span>
+                    <span>队伍总伤害 <b>{{ kNumber(detailTeamSummary(team).damageToChampions) }}</b></span>
+                    <span>队伍总推塔数 <b>{{ detailTeamSummary(team).towerKills }}</b></span>
+                  </div>
+                  <strong class="detail-team-kda">
+                    {{ detailTeamSummary(team).kills }}/{{ detailTeamSummary(team).deaths }}/{{ detailTeamSummary(team).assists }}
+                  </strong>
+                  <span>伤害</span>
+                  <span>经济</span>
+                  <span>承伤</span>
+                  <span>治疗</span>
+                  <span>伤转</span>
+                  <span>评分</span>
+                </div>
+
+                <div class="detail-list">
+                  <article
+                    v-for="p in team.players"
+                    :key="`${team.teamId}:${p.puuid}`"
+                    class="detail-row"
+                    :class="{ win: p.win, lose: !p.win }"
+                    :title="outputRatingHint(p)"
+                  >
+                    <div class="champion-cell">
+                      <ChampionAvatar :champion-id="p.championId" :champions="props.champions" :size="40" />
+                      <span>{{ p.gameName }}</span>
+                    </div>
+
+                    <div class="spell-column">
+                      <AssetIcon
+                        v-if="p.spell1Id"
+                        :path="spellMap[p.spell1Id]?.iconPath"
+                        :label="spellMap[p.spell1Id]?.name"
+                        :fallback="String(p.spell1Id)"
+                        :size="16"
+                      />
+                      <AssetIcon
+                        v-if="p.spell2Id"
+                        :path="spellMap[p.spell2Id]?.iconPath"
+                        :label="spellMap[p.spell2Id]?.name"
+                        :fallback="String(p.spell2Id)"
+                        :size="16"
+                      />
+                    </div>
+
+                    <div class="item-grid">
+                      <AssetIcon
+                        v-for="itemId in p.itemIds"
+                        :key="itemId"
+                        :path="itemMap[itemId]?.iconPath"
+                        :label="itemMap[itemId]?.name"
+                        :fallback="String(itemId)"
+                        :size="30"
+                      />
+                    </div>
+
+                    <div class="rune-grid text-grid" v-if="p.augmentIds.length">
+                      <span v-for="augmentId in p.augmentIds.slice(0, 4)" :key="augmentId" :class="['augment-tag', augmentRarityClass(augmentId)]">
+                        {{ shortAugmentName(augmentId) }}
+                      </span>
+                    </div>
+                    <div class="rune-grid" v-else>
+                      <AssetIcon
+                        v-for="perkId in p.perkIds.slice(0, 4)"
+                        :key="perkId"
+                        :path="perkMap[perkId]?.iconPath"
+                        :label="perkMap[perkId]?.name"
+                        :fallback="String(perkId)"
+                        :size="18"
+                      />
+                    </div>
+
+                    <div class="kda-cell">
+                      <strong>{{ p.kills }}/{{ p.deaths }}/{{ p.assists }}</strong>
+                    </div>
+
+                    <div class="stat-cell">
+                      <strong :class="{ leader: detailStatLeader(p, 'damage') }">
+                        {{ kNumber(p.damageToChampions) }}<em>{{ shareSuffix(p.damageToChampions, p.teamDamageToChampions) }}</em>
+                      </strong>
+                    </div>
+
+                    <div class="stat-cell">
+                      <strong :class="{ leader: detailStatLeader(p, 'gold') }">
+                        {{ kNumber(p.goldEarned) }}<em>{{ shareSuffix(p.goldEarned, p.teamGoldEarned) }}</em>
+                      </strong>
+                    </div>
+
+                    <div class="stat-cell">
+                      <strong :class="{ leader: detailStatLeader(p, 'mitigation') }">
+                        {{ kNumber(mitigationValue(p)) }}<em>{{ shareSuffix(mitigationValue(p), teamMitigationValue(p)) }}</em>
+                      </strong>
+                    </div>
+
+                    <div class="stat-cell">
+                      <strong :class="{ leader: detailStatLeader(p, 'healing') }">
+                        {{ kNumber(p.totalHeal) }}<em>{{ shareSuffix(p.totalHeal, p.teamTotalHeal) }}</em>
+                      </strong>
+                    </div>
+
+                    <div class="stat-cell">
+                      <strong :class="{ leader: detailStatLeader(p, 'conversion') }">
+                        {{ damageConversion(p) }}
+                      </strong>
+                    </div>
+
+                    <div :class="['score-cell', detailScoreClass(p)]" :title="outputRatingHint(p)">
+                      <strong>{{ outputRating(p).score }}分</strong>
+                      <span>{{ outputRating(p).role.label }} · {{ outputRating(p).label }}</span>
+                    </div>
+                  </article>
+                </div>
+              </section>
             </div>
 
             <!-- hover tooltip -->
@@ -943,7 +796,7 @@ onMounted(load)
               <div v-for="team in game.teams" :key="team.teamId" class="ght-team">
                 <div class="ght-header" :class="team.win ? 'ght-win' : 'ght-lose'">{{ team.win ? '胜利' : '失败' }} (均分 {{ team.avgScore.toFixed(0) }})</div>
                 <div v-for="p in team.players" :key="p.puuid" class="ght-player">
-                  <img :src="`https://ddragon.leagueoflegends.com/cdn/15.7.1/img/champion/${(props.champions as Record<number, any>)[p.championId]?.alias || p.championId}.png`" class="ght-icon"/>
+                  <ChampionAvatar :champion-id="p.championId" :champions="props.champions" :size="16" />
                   <span class="ght-name">{{ p.gameName }}</span>
                   <span class="ght-kda">{{ p.kills }}/{{ p.deaths }}/{{ p.assists }}</span>
                   <span class="ght-score" :class="scoreClass(p.gameScore)">{{ p.gameScore }}</span>
@@ -969,18 +822,6 @@ onMounted(load)
 
         <div class="filter-bar">
           <input v-model="filterText" placeholder="搜索玩家..." class="filter-input" />
-          <div class="tag-dropdown-wrap">
-            <button class="filter-select tag-dropdown-trigger" @click="tagDropdownOpen = !tagDropdownOpen" @blur="(e) => { const t = e.currentTarget as HTMLElement | null; const rt = e.relatedTarget as HTMLElement | null; if (t && (!rt || !t.contains(rt))) tagDropdownOpen = false }">
-              标签{{ filterTags.length ? ` (${filterTags.length})` : '' }}
-            </button>
-            <div v-if="tagDropdownOpen" class="tag-dropdown-panel" @mousedown.prevent>
-              <label v-for="tag in availableTags" :key="tag" class="tag-dd-item">
-                <input type="checkbox" :value="tag" v-model="filterTags" />
-                <span>{{ tag }}</span>
-              </label>
-              <div v-if="!availableTags.length" class="tag-dd-empty">暂无标签</div>
-            </div>
-          </div>
           <button class="toggle-sub" :class="{ active: showExtremes }" @click="showExtremes = !showExtremes" style="min-width:52px">
             <component :is="showExtremes ? ChevronDown : ChevronUp" :size="14" />
             极值
@@ -1035,7 +876,7 @@ onMounted(load)
                 <td class="col-champs">
                   <div class="champ-icons">
                     <div v-for="cp in rating.championProfiles.slice(0, 3)" :key="cp.championId" class="champ-with-score">
-                      <img :src="`https://ddragon.leagueoflegends.com/cdn/15.7.1/img/champion/${(props.champions as Record<number, any>)[cp.championId]?.alias || cp.championId}.png`" class="champ-icon-lg" />
+                      <ChampionAvatar :champion-id="cp.championId" :champions="props.champions" :size="28" />
                       <span class="champ-score" :class="scoreClass(cp.averageScore)">{{ cp.averageScore.toFixed(0) }}</span>
                     </div>
                   </div>
@@ -1084,7 +925,7 @@ onMounted(load)
             <div class="rhc-divider"></div>
             <div class="rhc-section-l">英雄详情</div>
             <div v-for="cp in hoveredPlayer.championProfiles" :key="cp.championId" class="rhc-champ">
-              <img :src="`https://ddragon.leagueoflegends.com/cdn/15.7.1/img/champion/${(props.champions as Record<number, any>)[cp.championId]?.alias || cp.championId}.png`" class="rhc-ci" />
+              <ChampionAvatar :champion-id="cp.championId" :champions="props.champions" :size="24" />
               <div class="rhc-cinfo"><span class="rhc-cn">{{ championName(champions, cp.championId) }}</span><span class="rhc-cs">{{ cp.games }}场 · 均分 <span :class="scoreClass(cp.averageScore)">{{ cp.averageScore.toFixed(0) }}</span> · 伤{{ (cp.averageDamageShare * 100).toFixed(0) }}%</span></div>
             </div>
           </div>
@@ -1127,24 +968,6 @@ onMounted(load)
           </div>
 
 
-        </div>
-      </div>
-
-      <!-- ═══════════════ PLAYER REVIEWS ═══════════════ -->
-      <div v-if="playerRatings.length > 0" class="review-section">
-        <div class="review-header" @click="reviewsVisible = !reviewsVisible">
-          <component :is="reviewsVisible ? ChevronUp : ChevronDown" :size="16" />
-          <span>玩家锐评</span>
-        </div>
-        <div v-show="reviewsVisible" class="review-body">
-          <div v-for="review in playerReviews" :key="review.puuid" class="review-card">
-            <div class="review-title">
-              <span class="review-name">{{ review.gameName }}#{{ review.tagLine }}</span>
-              <span class="review-score" :class="scoreClass(review.score)">{{ review.score.toFixed(1) }}</span>
-              <span class="review-eval">{{ scoreEvaluationLabel(review.score) }}</span>
-            </div>
-            <div class="review-line" v-for="(line, li) in review.lines" :key="li">{{ line }}</div>
-          </div>
         </div>
       </div>
 
@@ -1194,18 +1017,15 @@ onMounted(load)
 
 /* ── game section ── */
 .game-section { display: flex; flex-direction: column; gap: 8px; }
-.game-section-header { display: flex; align-items: center; justify-content: space-between; }
+.game-section-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .gsh-left { display: flex; align-items: center; gap: 8px; }
-.section-title { font-size: 14px; font-weight: 600; color: var(--text-muted, #888); display: flex; align-items: center; gap: 4px; }
-.game-filter-buttons { display: flex; gap: 4px; }
-.game-filter-buttons button { padding: 3px 10px; border: 1px solid var(--border, #444); background: transparent; color: var(--text-muted, #888); border-radius: 4px; font-size: 11px; cursor: pointer; }
-.game-filter-buttons button.active { background: var(--accent, #6366f1); border-color: var(--accent, #6366f1); color: #fff; }
+.gsh-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 .game-list { display: flex; flex-direction: column; gap: 6px; }
 
 /* ── game card ── */
 .game-card-outer { position: relative; }
-.game-card { display: flex; align-items: stretch; gap: 0; background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; overflow: hidden; position: relative; }
+.game-card { display: flex; align-items: stretch; gap: 0; background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; overflow: hidden; position: relative; cursor: pointer; }
 .game-has-expanded { border-radius: 8px 8px 0 0; }
 
 .team-col { display: flex; flex: 1; padding: 8px 10px; min-width: 0; position: relative; }
@@ -1219,7 +1039,6 @@ onMounted(load)
 .team-players-row { display: flex; gap: 6px; align-items: center; width: 100%; justify-content: space-around; }
 .tp-avatar-wrap { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 0; flex: 1; }
 .tp-avatar-frame { position: relative; }
-.tp-avatar { width: 32px; height: 32px; border-radius: 6px; object-fit: cover; display: block; }
 .mvp-crown { position: absolute; top: -5px; right: -5px; color: #fbbf24; filter: drop-shadow(0 0 2px rgba(251, 191, 36, 0.6)); }
 .tp-name { font-size: 10px; color: var(--text-muted, #888); text-align: center; max-width: 50px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.2; }
 .tp-score { font-size: 10px; font-weight: 700; padding: 0 4px; border-radius: 2px; line-height: 1.3; }
@@ -1249,17 +1068,49 @@ onMounted(load)
 .game-delete-btn:hover { color: #f87171; }
 
 /* expanded mini table */
-.game-expanded-table { background: var(--bg-secondary, #1a1a2e); border: 1px solid var(--border, #333); border-top: none; border-radius: 0 0 8px 8px; padding: 8px 12px; overflow-x: auto; }
-.mini-game-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.mini-game-table th { padding: 4px 6px; text-align: center; font-weight: 600; color: var(--text-muted, #888); font-size: 10px; text-transform: uppercase; border-bottom: 1px solid var(--border, #333); }
-.mini-game-table td { padding: 4px 6px; text-align: center; }
-.tr-win-bg { background: rgba(34, 197, 94, 0.04); }
-.tr-lose-bg { background: rgba(239, 68, 68, 0.03); }
-.mg-team { font-size: 14px; }
-.mg-player { text-align: left; font-weight: 600; white-space: nowrap; }
-.mg-champ { text-align: center; }
-.mg-champ-icon { width: 20px; height: 20px; border-radius: 3px; }
-.mg-stat { font-variant-numeric: tabular-nums; font-size: 11px; }
+.game-expanded-table { background: var(--bg-secondary, #1a1a2e); border: 1px solid var(--border, #333); border-top: none; border-radius: 0 0 8px 8px; padding: 8px 12px; overflow-x: auto; display: flex; flex-direction: column; gap: 10px; }
+
+.detail-team-block { overflow-x: auto; border: 1px solid var(--border, #444); border-radius: 8px; background: #16161d; padding: 8px; }
+.detail-team-header,
+.detail-row { display: grid; grid-template-columns: 160px 22px 252px 160px 59px repeat(5, 62px) 128px; min-width: 1131px; align-items: center; gap: 4px; }
+.detail-team-header { border-radius: 6px; margin-bottom: 6px; padding: 6px 7px; }
+.detail-team-header.win { color: #7db8f0; background: rgba(31, 95, 159, 0.22); }
+.detail-team-header.lose { color: #f0a0a0; background: rgba(162, 61, 61, 0.22); }
+.detail-team-result { display: flex; min-width: 0; align-items: center; gap: 6px; }
+.detail-team-result strong { font-size: 15.6px; line-height: 1; }
+.detail-team-result span, .detail-team-header > span { font-size: 12px; font-weight: 900; line-height: 1; white-space: nowrap; }
+.detail-team-summary { display: grid; min-width: 0; grid-column: span 3; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: center; gap: 4px; }
+.detail-team-summary span { overflow: hidden; font-size: 11px; font-weight: 800; line-height: 1; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.detail-team-summary b, .detail-team-kda { font-size: 12px; font-weight: 950; white-space: nowrap; }
+.detail-team-kda { text-align: center; }
+.detail-team-header > span { text-align: center; }
+.detail-list { display: flex; flex-direction: column; gap: 4px; }
+.detail-row { height: 48px; min-height: 48px; max-height: 48px; overflow: hidden; border: 1px solid var(--border, #444); border-left-width: 5px; border-radius: 8px; padding: 2px 7px; }
+.detail-row:hover { filter: brightness(1.12); }
+.detail-row.win { border-color: rgba(47, 120, 214, 0.35); border-left-color: #2f78d6; background: rgba(47, 120, 214, 0.13); }
+.detail-row.lose { border-color: rgba(202, 75, 75, 0.35); border-left-color: #ca4b4b; background: rgba(202, 75, 75, 0.13); }
+.champion-cell { display: flex; min-width: 0; align-items: center; gap: 6px; }
+.champion-cell span { min-width: 0; overflow: hidden; color: #d8d8e0; font-size: 13.5px; text-overflow: ellipsis; white-space: nowrap; }
+.spell-column { display: flex; height: 42px; flex-direction: column; justify-content: center; gap: 2px; }
+.item-grid { display: flex; min-width: 0; flex-wrap: nowrap; gap: 3px; }
+.rune-grid { display: grid; grid-template-columns: repeat(2, max-content); grid-auto-rows: 20px; align-content: center; justify-content: center; gap: 2px 4px; overflow: hidden; }
+.text-grid .augment-tag { display: inline-flex; box-sizing: border-box; width: calc(5em + 8px); height: 19px; align-items: center; justify-content: center; overflow: hidden; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 5px; color: #d8d8e0; font-size: 13.5px; font-weight: 700; line-height: 1; padding: 0 3px; text-align: center; white-space: nowrap; }
+.text-grid .augment-prismatic { border-color: rgba(170, 72, 215, 0.42); color: #e2b8ff; background: linear-gradient(135deg, rgba(109, 44, 145, 0.5), rgba(141, 70, 170, 0.5)); }
+.text-grid .augment-gold { border-color: rgba(199, 144, 36, 0.48); color: #ffd36a; background: rgba(123, 77, 2, 0.45); }
+.text-grid .augment-silver { border-color: rgba(134, 151, 166, 0.48); color: #c6d4de; background: rgba(73, 96, 111, 0.45); }
+.text-grid .augment-bronze { border-color: rgba(167, 105, 60, 0.46); color: #e8b48a; background: rgba(122, 67, 35, 0.45); }
+.kda-cell, .stat-cell, .score-cell { display: flex; min-width: 0; align-items: center; justify-content: center; }
+.kda-cell strong { color: #e8e8f0; font-size: 13px; line-height: 1; white-space: nowrap; }
+.stat-cell strong { display: inline-flex; flex-direction: column; align-items: center; gap: 1px; color: #e8e8f0; font-size: 16.5px; line-height: 1; white-space: nowrap; }
+.stat-cell strong.leader, .stat-cell strong.leader em { color: #ff6b6b; font-weight: 900; }
+.stat-cell em { color: #8a989c; font-size: 13.5px; font-style: normal; font-weight: 700; }
+.score-cell { height: 42px; flex-direction: column; gap: 2px; border-radius: 7px; background: rgba(255, 255, 255, 0.06); padding: 3px; text-align: center; }
+.score-cell strong { position: relative; z-index: 1; color: inherit; font-size: 18px; font-weight: 950; line-height: 1; white-space: nowrap; }
+.score-cell span { position: relative; z-index: 1; max-width: 100%; color: inherit; font-size: 10.5px; font-weight: 900; line-height: 1; white-space: nowrap; }
+.score-excellent { position: relative; overflow: hidden; color: #5d3300; border: 1px solid rgba(245, 185, 52, 0.72); background: linear-gradient(135deg, rgba(255, 244, 184, 0.96), rgba(255, 195, 64, 0.9) 45%, rgba(255, 236, 150, 0.96)), #ffd36a; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.36), 0 0 16px rgba(255, 191, 58, 0.34); }
+.score-good { color: #145b3e; background: rgba(204, 239, 218, 0.88); }
+.score-average { color: #174d83; background: rgba(205, 229, 255, 0.92); }
+.score-poor { color: #8f3434; background: rgba(248, 214, 213, 0.92); }
 
 /* hover tooltip */
 .game-hover-tooltip { position: absolute; top: 100%; left: 0; right: 0; z-index: 100; background: #1a1a2e; border: 1px solid #444; border-radius: 8px; padding: 10px 14px; display: flex; gap: 16px; margin-top: 4px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
@@ -1268,7 +1119,6 @@ onMounted(load)
 .ght-win { color: #4ade80; }
 .ght-lose { color: #f87171; }
 .ght-player { display: flex; align-items: center; gap: 5px; font-size: 11px; padding: 2px 4px; background: rgba(255,255,255,0.04); border-radius: 3px; }
-.ght-icon { width: 16px; height: 16px; border-radius: 3px; }
 .ght-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text, #ddd); }
 .ght-kda { font-size: 10px; color: var(--text-muted, #888); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ght-score { font-size: 10px; font-weight: 700; padding: 0 3px; border-radius: 2px; }
@@ -1277,13 +1127,11 @@ onMounted(load)
 .filter-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
 .filter-input { padding: 5px 10px; background: var(--bg-tertiary, #2a2a2a); border: 1px solid var(--border, #444); border-radius: 4px; color: var(--text, #eee); font-size: 12px; outline: none; width: 120px; }
 .filter-input::placeholder { color: var(--text-muted, #666); }
-.filter-select { padding: 5px 8px; background: var(--bg-tertiary, #2a2a2a); border: 1px solid var(--border, #444); border-radius: 4px; color: var(--text, #eee); font-size: 12px; outline: none; min-width: 80px; cursor: pointer; }
-.tag-dropdown-wrap { position: relative; }
-.tag-dropdown-panel { position: absolute; top: 100%; left: 0; z-index: 300; background: #1a1a2e; border: 1px solid #444; border-radius: 6px; padding: 6px; min-width: 120px; max-height: 240px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
-.tag-dd-item { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 3px; cursor: pointer; font-size: 12px; color: var(--text, #ddd); white-space: nowrap; }
-.tag-dd-item:hover { background: rgba(99, 102, 241, 0.12); }
-.tag-dd-item input { accent-color: #6366f1; }
-.tag-dd-empty { padding: 8px; color: var(--text-muted, #666); font-size: 11px; text-align: center; }
+.min-games-input { padding: 6px 10px; gap: 4px; }
+.min-games-input-box { width: 42px; background: none; border: none; outline: none; color: inherit; font-size: 13px; font-variant-numeric: tabular-nums; }
+.min-games-input-box::-webkit-inner-spin-button,
+.min-games-input-box::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.min-games-input-box::placeholder { color: var(--text-muted, #888); font-size: 12px; }
 .toggle-sub { display: inline-flex; align-items: center; gap: 4px; padding: 5px 10px; background: #fff; border: 1px solid #d0d0d0; border-radius: 4px; color: #333; font-size: 11px; cursor: pointer; }
 .toggle-sub:hover { border-color: var(--accent, #6366f1); color: var(--accent, #6366f1); }
 .toggle-sub.active { background: var(--accent, #6366f1); border-color: var(--accent, #6366f1); color: #fff; }
@@ -1330,7 +1178,6 @@ onMounted(load)
 
 .champ-icons { display: flex; gap: 4px; justify-content: center; }
 .champ-with-score { display: flex; flex-direction: column; align-items: center; gap: 2px; }
-.champ-icon-lg { width: 28px; height: 28px; border-radius: 5px; object-fit: cover; }
 .champ-score { font-size: 10px; font-weight: 700; line-height: 1; padding: 1px 3px; border-radius: 3px; font-variant-numeric: tabular-nums; }
 .sc-high { color: #4ade80; background: rgba(74, 222, 128, 0.15); }
 .sc-mid { color: #60a5fa; background: rgba(96, 165, 250, 0.18); }
@@ -1365,7 +1212,6 @@ onMounted(load)
 .rhc-divider { height: 1px; background: var(--border, #333); margin: 4px 0; }
 .rhc-section-l { font-size: 11px; font-weight: 600; color: var(--text-muted, #888); text-transform: uppercase; letter-spacing: 0.3px; margin-top: 2px; }
 .rhc-champ { display: flex; align-items: center; gap: 8px; padding: 3px 6px; background: rgba(255,255,255,0.04); border-radius: 5px; }
-.rhc-ci { width: 24px; height: 24px; border-radius: 4px; }
 .rhc-cinfo { display: flex; flex-direction: column; gap: 1px; }
 .rhc-cn { font-size: 12px; font-weight: 600; color: var(--text, #eee); }
 .rhc-cs { font-size: 11px; color: var(--text-muted, #888); }
@@ -1392,16 +1238,6 @@ onMounted(load)
 
 /* ── reviews ── */
 .review-section { border-top: 1px solid var(--border, #333); padding-top: 8px; }
-.review-header { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-muted, #888); font-size: 13px; font-weight: 600; padding: 6px 0; }
-.review-header:hover { color: var(--accent, #6366f1); }
-.review-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 0; }
-.review-card { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px 14px; }
-.review-title { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.review-name { font-size: 14px; font-weight: 700; color: var(--text, #eee); }
-.review-score { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; padding: 0 6px; border-radius: 3px; }
-.review-eval { font-size: 11px; color: var(--text-muted, #888); font-weight: 600; }
-.review-line { font-size: 13px; line-height: 1.6; color: #ccc; padding: 2px 0; }
-.review-line::before { content: "▸ "; color: var(--accent, #6366f1); }
 
 .loading-state, .error-state, .empty-state { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 48px 0; color: var(--text-muted, #888); }
 .spin { animation: spin 1s linear infinite; }

@@ -1954,7 +1954,7 @@ onUnmounted(() => {
       </section>
 
       <section class="custom-page" v-show="activePage === 'custom'">
-        <CustomGameRatingPanel :champions="championMap" :items="gameAssets.items" />
+        <CustomGameRatingPanel :champions="championMap" :items="gameAssets.items" :game-assets="gameAssets" />
       </section>
 
       <section class="search-page" v-show="activePage === 'search'">
