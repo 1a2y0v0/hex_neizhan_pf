@@ -584,19 +584,6 @@ onMounted(load)
               <component :is="minDuration8 ? Check : X" :size="16" />
               <span style="font-size:13px">>8min</span>
             </button>
-            <div class="toggle-sub min-games-input" :class="{ active: minGameCount > 0 }" title="仅统计场数≥该值的玩家，留空为不限">
-              <span style="font-size:13px">场数≥</span>
-              <input
-                v-model="minGameCountText"
-                type="number"
-                min="1"
-                step="1"
-                placeholder="不限"
-                class="min-games-input-box"
-                @change="applyMinGameCount"
-                @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
-              />
-            </div>
           </div>
         </div>
 
@@ -809,7 +796,7 @@ onMounted(load)
       </div>
 
       <!-- ═══════════════ EMPTY ═══════════════ -->
-      <div v-if="playerRatings.length === 0" class="empty-state"><Swords :size="32" /><span>该日期没有对局记录</span></div>
+      <div v-if="enrichedGames.length === 0" class="empty-state"><Swords :size="32" /><span>该日期没有对局记录</span></div>
 
       <!-- ═══════════════ RATING TABLE ═══════════════ -->
       <div v-else class="rating-table-wrap">
@@ -830,6 +817,19 @@ onMounted(load)
             <component :is="showSubColumns ? ChevronUp : ChevronDown" :size="14" />
             {{ showSubColumns ? '收起' : '展开' }}详细
           </button>
+          <div class="toggle-sub min-games-input" :class="{ active: minGameCount > 0 }" title="仅统计场数≥该值的玩家，留空为不限">
+            <span style="font-size:13px">场数≥</span>
+            <input
+              v-model="minGameCountText"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="不限"
+              class="min-games-input-box"
+              @change="applyMinGameCount"
+              @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+            />
+          </div>
           <span class="filter-count">{{ filteredAndSortedRatings.length }} / {{ playerRatings.length }}</span>
         </div>
 
@@ -864,6 +864,11 @@ onMounted(load)
               </tr>
             </thead>
             <tbody>
+              <tr v-if="filteredAndSortedRatings.length === 0">
+                <td colspan="19" class="empty-table-row">
+                  {{ minGameCount > 0 ? `场数≥${minGameCount} 过滤后暂无玩家，请调低场数限制` : '该日期没有对局记录' }}
+                </td>
+              </tr>
               <tr
                 v-for="(rating, index) in filteredAndSortedRatings"
                 :key="rating.puuid"
@@ -1137,6 +1142,7 @@ onMounted(load)
 .toggle-sub.active { background: var(--accent, #6366f1); border-color: var(--accent, #6366f1); color: #fff; }
 .toggle-sub.active:hover { opacity: 0.85; }
 .filter-count { font-size: 11px; color: var(--text-muted, #666); margin-left: auto; white-space: nowrap; }
+.empty-table-row { text-align: center; color: var(--text-muted, #888); font-size: 12px; padding: 24px 0 !important; }
 
 /* ── rating table ── */
 .rating-table-wrap { overflow-x: auto; position: relative; }
