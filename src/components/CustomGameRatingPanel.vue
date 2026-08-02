@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue"
-import { Calendar, Check, ChevronDown, ChevronUp, ChevronsUpDown, Crown, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
+import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, ChevronsUpDown, Crown, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
 import { loadTodayCustomGames } from "../api"
 import { matchTeamSummary } from "../matchTeamSummary"
 import { buildChampionProfiles, buildPlayerProfile, profileScoreLevel, type ChampionProfile, type PlayerProfile } from "../playerProfile"
@@ -181,10 +181,15 @@ function rawGame(gameId: number): MatchDetailResponse | undefined {
 }
 
 // game list
-const gameListVisible = ref(true)
+const gameListVisible = ref(false)
 const filteredGames = computed(() => enrichedGames.value)
 const expandedGames = ref<Set<number>>(new Set())
 const hoveredGameId = ref<number | null>(null)
+
+// collapsible sections
+const ratingSectionVisible = ref(true)
+const championSectionVisible = ref(false)
+const augmentSectionVisible = ref(false)
 
 // rating table
 const sortColumn = ref<string>("overallScore")
@@ -493,6 +498,189 @@ async function load() {
 }
 
 onMounted(load)
+
+/* ── 英雄/海克斯统计模块 ── */
+interface StatPlayerRow { puuid: string; gameName: string; picks: number; wins: number; winRate: number }
+interface ChampionStatEntry {
+  championId: number
+  name: string
+  picks: number
+  wins: number
+  winRate: number
+  players: StatPlayerRow[]
+  favorite: { gameName: string; picks: number } | null
+  best: { gameName: string; picks: number; winRate: number } | null
+  worst: { gameName: string; picks: number; winRate: number } | null
+}
+interface AugmentStatEntry {
+  id: number
+  name: string
+  picks: number
+  wins: number
+  winRate: number
+  topPlayer: { gameName: string; picks: number } | null
+  players: StatPlayerRow[]
+}
+
+function addPlayerStat(list: StatPlayerRow[], puuid: string, gameName: string, win: boolean): number {
+  let pl = list.find((x) => x.puuid === puuid)
+  if (!pl) { pl = { puuid, gameName, picks: 0, wins: 0, winRate: 0 }; list.push(pl) }
+  pl.picks++
+  if (win) pl.wins++
+  return list.length
+}
+
+const championStat = computed<ChampionStatEntry[]>(() => {
+  const map = new Map<number, ChampionStatEntry>()
+  for (const game of visibleGames.value) {
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        let e = map.get(p.championId)
+        if (!e) {
+          e = { championId: p.championId, name: championName(props.champions, p.championId), picks: 0, wins: 0, winRate: 0, players: [], favorite: null, best: null, worst: null }
+          map.set(p.championId, e)
+        }
+        e.picks++
+        if (p.win) e.wins++
+        addPlayerStat(e.players, p.puuid, p.gameName, p.win)
+      }
+    }
+  }
+  for (const e of map.values()) {
+    e.winRate = e.picks ? (e.wins / e.picks) * 100 : 0
+    for (const pl of e.players) pl.winRate = pl.picks ? (pl.wins / pl.picks) * 100 : 0
+    e.players.sort((a, b) => b.picks - a.picks)
+    e.favorite = e.players.length ? { gameName: e.players[0].gameName, picks: e.players[0].picks } : null
+    if (e.players.length) {
+      const bestPool =
+        championBestMinPicks.value > 0
+          ? e.players.filter((pl) => pl.picks >= championBestMinPicks.value)
+          : e.players
+      const worstPool =
+        championWorstMinPicks.value > 0
+          ? e.players.filter((pl) => pl.picks >= championWorstMinPicks.value)
+          : e.players
+      const best = [...bestPool].sort((a, b) => b.winRate - a.winRate || b.picks - a.picks)[0]
+      if (best) e.best = { gameName: best.gameName, picks: best.picks, winRate: best.winRate }
+      else e.best = null
+      const worstCandidates = worstPool.filter((pl) => !best || pl.puuid !== best.puuid)
+      const worst = [...(worstCandidates.length ? worstCandidates : worstPool)].sort(
+        (a, b) => a.winRate - b.winRate || b.picks - a.picks
+      )[0]
+      if (worst) e.worst = { gameName: worst.gameName, picks: worst.picks, winRate: worst.winRate }
+      else e.worst = null
+    }
+  }
+  return [...map.values()].sort((a, b) => b.picks - a.picks)
+})
+
+const augmentStat = computed<AugmentStatEntry[]>(() => {
+  const map = new Map<number, AugmentStatEntry>()
+  for (const game of visibleGames.value) {
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        for (const aid of p.augmentIds || []) {
+          if (aid <= 0) continue
+          let e = map.get(aid)
+          if (!e) {
+            e = { id: aid, name: augmentName(aid), picks: 0, wins: 0, winRate: 0, topPlayer: null, players: [] }
+            map.set(aid, e)
+          }
+          e.picks++
+          if (p.win) e.wins++
+          addPlayerStat(e.players, p.puuid, p.gameName, p.win)
+        }
+      }
+    }
+  }
+  for (const e of map.values()) {
+    e.winRate = e.picks ? (e.wins / e.picks) * 100 : 0
+    for (const pl of e.players) pl.winRate = pl.picks ? (pl.wins / pl.picks) * 100 : 0
+    e.players.sort((a, b) => b.picks - a.picks)
+    e.topPlayer = e.players.length ? { gameName: e.players[0].gameName, picks: e.players[0].picks } : null
+  }
+  return [...map.values()].sort((a, b) => b.picks - a.picks)
+})
+
+const statHasData = computed(() => championStat.value.length > 0 || augmentStat.value.length > 0)
+
+const championSort = ref<"picks" | "winRate" | "name">("picks")
+const championSortDir = ref<"asc" | "desc">("desc")
+const augmentSort = ref<"picks" | "winRate">("picks")
+const augmentSortDir = ref<"asc" | "desc">("desc")
+const championSearch = ref("")
+const augmentSearch = ref("")
+const championMinPicks = ref(0)
+const championMinPicksText = ref("")
+const championBestMinPicks = ref(2)
+const championBestMinPicksText = ref("2")
+const championWorstMinPicks = ref(2)
+const championWorstMinPicksText = ref("2")
+const augmentMinPicks = ref(0)
+const augmentMinPicksText = ref("")
+
+function applyChampionMinPicks() {
+  const v = parseInt(championMinPicksText.value, 10)
+  championMinPicks.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+function applyChampionBestMinPicks() {
+  const v = parseInt(championBestMinPicksText.value, 10)
+  championBestMinPicks.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+function applyChampionWorstMinPicks() {
+  const v = parseInt(championWorstMinPicksText.value, 10)
+  championWorstMinPicks.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+function applyAugmentMinPicks() {
+  const v = parseInt(augmentMinPicksText.value, 10)
+  augmentMinPicks.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+
+function toggleChampionSort(col: "picks" | "winRate") {
+  if (championSort.value === col) championSortDir.value = championSortDir.value === "asc" ? "desc" : "asc"
+  else { championSort.value = col; championSortDir.value = "desc" }
+}
+function championSortIcon(col: "picks" | "winRate") {
+  if (championSort.value !== col) return ""
+  return championSortDir.value === "asc" ? " ▲" : " ▼"
+}
+function toggleAugmentSort(col: "picks" | "winRate") {
+  if (augmentSort.value === col) augmentSortDir.value = augmentSortDir.value === "asc" ? "desc" : "asc"
+  else { augmentSort.value = col; augmentSortDir.value = "desc" }
+}
+function augmentSortIcon(col: "picks" | "winRate") {
+  if (augmentSort.value !== col) return ""
+  return augmentSortDir.value === "asc" ? " ▲" : " ▼"
+}
+
+const sortedChampionStat = computed(() => {
+  let arr = championStat.value
+  const q = championSearch.value.trim().toLowerCase()
+  if (q) arr = arr.filter((e) => e.name.toLowerCase().includes(q))
+  const mp = championMinPicks.value
+  if (mp > 0) arr = arr.filter((e) => e.picks >= mp)
+  const list = [...arr]
+  const m = championSortDir.value === "asc" ? 1 : -1
+  if (championSort.value === "winRate") list.sort((a, b) => (a.winRate - b.winRate) * m || b.picks - a.picks)
+  else if (championSort.value === "name") list.sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+  else list.sort((a, b) => (a.picks - b.picks) * m)
+  return list
+})
+
+const sortedAugmentStat = computed(() => {
+  let arr = augmentStat.value
+  const q = augmentSearch.value.trim().toLowerCase()
+  if (q) arr = arr.filter((e) => e.name.toLowerCase().includes(q))
+  const mp = augmentMinPicks.value
+  if (mp > 0) arr = arr.filter((e) => e.picks >= mp)
+  const list = [...arr]
+  const m = augmentSortDir.value === "asc" ? 1 : -1
+  if (augmentSort.value === "winRate") list.sort((a, b) => (a.winRate - b.winRate) * m || b.picks - a.picks)
+  else list.sort((a, b) => (a.picks - b.picks) * m)
+  return list
+})
+
+function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mid" : "sc-low" }
 </script>
 
 <template>
@@ -503,6 +691,24 @@ onMounted(load)
         <h2>内战评分</h2>
       </div>
       <div class="header-actions">
+        <div class="date-picker-wrap">
+          <Calendar :size="14" />
+          <input type="date" v-model="startDate" @change="load" class="date-input" />
+          <span class="date-sep">—</span>
+          <input type="date" v-model="endDate" @change="load" class="date-input" />
+        </div>
+        <button class="toggle-sub" :class="{ active: customOnly }" @click="customOnly = !customOnly; load()" style="min-width:72px">
+          <component :is="customOnly ? Check : X" :size="16" />
+          <span style="font-size:13px">{{ customOnly ? '仅显示内战' : '全部对局' }}</span>
+        </button>
+        <button class="toggle-sub" :class="{ active: fiveV5Only }" @click="fiveV5Only = !fiveV5Only" style="min-width:72px">
+          <component :is="fiveV5Only ? Check : X" :size="16" />
+          <span style="font-size:13px">5V5</span>
+        </button>
+        <button class="toggle-sub" :class="{ active: minDuration8 }" @click="minDuration8 = !minDuration8" style="min-width:72px">
+          <component :is="minDuration8 ? Check : X" :size="16" />
+          <span style="font-size:13px">>8min</span>
+        </button>
         <button class="primary-action" @click="load" :disabled="loading">
           <RefreshCw v-if="loading" class="spin" :size="16" />
           <RefreshCw v-else :size="16" />
@@ -561,29 +767,9 @@ onMounted(load)
         <div class="game-section-header">
           <div class="gsh-left">
             <span class="section-title" @click="gameListVisible = !gameListVisible" style="cursor:pointer">
-              <ChevronDown v-if="gameListVisible" :size="14" /><ChevronUp v-else :size="14" />
+              <component :is="gameListVisible ? ChevronDown : ChevronRight" :size="14" />
               对局列表 ({{ filteredGames.length }})
             </span>
-          </div>
-          <div class="gsh-right">
-            <div class="date-picker-wrap">
-              <Calendar :size="14" />
-              <input type="date" v-model="startDate" @change="load" class="date-input" />
-              <span class="date-sep">—</span>
-              <input type="date" v-model="endDate" @change="load" class="date-input" />
-            </div>
-            <button class="toggle-sub" :class="{ active: customOnly }" @click="customOnly = !customOnly; load()" style="min-width:72px">
-              <component :is="customOnly ? Check : X" :size="16" />
-              <span style="font-size:13px">{{ customOnly ? '仅显示内战' : '全部对局' }}</span>
-            </button>
-            <button class="toggle-sub" :class="{ active: fiveV5Only }" @click="fiveV5Only = !fiveV5Only" style="min-width:72px">
-              <component :is="fiveV5Only ? Check : X" :size="16" />
-              <span style="font-size:13px">5V5</span>
-            </button>
-            <button class="toggle-sub" :class="{ active: minDuration8 }" @click="minDuration8 = !minDuration8" style="min-width:72px">
-              <component :is="minDuration8 ? Check : X" :size="16" />
-              <span style="font-size:13px">>8min</span>
-            </button>
           </div>
         </div>
 
@@ -800,13 +986,15 @@ onMounted(load)
 
       <!-- ═══════════════ RATING TABLE ═══════════════ -->
       <div v-else class="rating-table-wrap">
-        <div class="section-title" style="margin-bottom:8px">
+        <div class="section-title" style="display:flex;align-items:center;margin-bottom:8px;cursor:pointer" @click="ratingSectionVisible = !ratingSectionVisible">
+          <component :is="ratingSectionVisible ? ChevronDown : ChevronRight" :size="14" />
           玩家评分
-          <button class="toggle-sub" :class="{ active: gameListVisible }" @click="gameListVisible = !gameListVisible" style="margin-left:8px;font-size:11px">
+          <button class="toggle-sub" :class="{ active: gameListVisible }" @click.stop="gameListVisible = !gameListVisible" style="margin-left:8px;font-size:11px">
             <ChevronsUpDown :size="12" /> {{ gameListVisible ? '隐藏对局' : '显示对局' }}
           </button>
         </div>
 
+        <div v-show="ratingSectionVisible">
         <div class="filter-bar">
           <input v-model="filterText" placeholder="搜索玩家..." class="filter-input" />
           <button class="toggle-sub" :class="{ active: showExtremes }" @click="showExtremes = !showExtremes" style="min-width:52px">
@@ -935,12 +1123,13 @@ onMounted(load)
             </div>
           </div>
         </div>
+        </div>
       </div>
 
       <!-- ═══════════════ CHARTS ═══════════════ -->
       <div v-if="playerRatings.length > 0" class="charts-section">
         <div class="charts-header" @click="chartsVisible = !chartsVisible">
-          <component :is="chartsVisible ? ChevronUp : ChevronDown" :size="16" />
+          <component :is="chartsVisible ? ChevronDown : ChevronRight" :size="14" />
           <span>数据可视化</span>
         </div>
         <div v-show="chartsVisible" class="charts-body">
@@ -978,6 +1167,163 @@ onMounted(load)
 
       <!-- ═══════════════ PLAYER RADAR ═══════════════ -->
       <PlayerRadarPanel v-if="playerRatings.length > 0" :players="playerRatings" />
+
+      <!-- ═══════════════ 英雄 / 海克斯统计 ═══════════════ -->
+      <div v-if="statHasData" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="championSectionVisible = !championSectionVisible">
+            <component :is="championSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">英雄榜</span>
+            <span class="stat-subtitle">{{ championStat.length }} 位英雄 · {{ championStat.reduce((s, e) => s + e.picks, 0) }} 次出场</span>
+          </div>
+          <div v-show="championSectionVisible" class="stat-section-body">
+          <div class="stat-header">
+            <input v-model="championSearch" placeholder="搜英雄" class="stat-search" />
+            <div class="toggle-sub min-games-input" :class="{ active: championMinPicks > 0 }" title="只显示出现次数≥该值的英雄，留空为不限">
+              <span style="font-size:13px">次数≥</span>
+              <input
+                v-model="championMinPicksText"
+                type="number"
+                min="1"
+                step="1"
+                placeholder="不限"
+                class="min-games-input-box"
+                @change="applyChampionMinPicks"
+                @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+              />
+            </div>
+            <div class="toggle-sub min-games-input" :class="{ active: championBestMinPicks > 0 }" title="胜率最高只统计使用次数≥该值的玩家，留空为不限">
+              <span style="font-size:13px">胜率最高局数≥</span>
+              <input
+                v-model="championBestMinPicksText"
+                type="number"
+                min="1"
+                step="1"
+                placeholder="不限"
+                class="min-games-input-box"
+                @change="applyChampionBestMinPicks"
+                @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+              />
+            </div>
+            <div class="toggle-sub min-games-input" :class="{ active: championWorstMinPicks > 0 }" title="胜率最低只统计使用次数≥该值的玩家，留空为不限">
+              <span style="font-size:13px">胜率最低局数≥</span>
+              <input
+                v-model="championWorstMinPicksText"
+                type="number"
+                min="1"
+                step="1"
+                placeholder="不限"
+                class="min-games-input-box"
+                @change="applyChampionWorstMinPicks"
+                @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+              />
+            </div>
+          </div>
+          <div class="stat-table-scroll">
+            <table class="stat-table champion-table">
+              <thead>
+                <tr>
+                  <th class="st-champ">英雄</th>
+                  <th class="st-num sortable" @click="toggleChampionSort('picks')">次数{{ championSortIcon('picks') }}</th>
+                  <th class="st-num sortable" @click="toggleChampionSort('winRate')">胜率{{ championSortIcon('winRate') }}</th>
+                  <th class="st-player">最喜欢</th>
+                  <th class="st-player">胜率最高</th>
+                  <th class="st-player">胜率最低</th>
+                  <th class="st-players">使用玩家</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="sortedChampionStat.length === 0">
+                  <td colspan="7" class="empty-table-row">
+                    {{ championMinPicks > 0 ? `次数≥${championMinPicks} 过滤后暂无英雄，请调低次数限制` : championSearch ? '搜索无匹配英雄' : '该日期没有英雄记录' }}
+                  </td>
+                </tr>
+                <tr v-for="ch in sortedChampionStat" :key="ch.championId">
+                  <td class="st-champ">
+                    <ChampionAvatar :champion-id="ch.championId" :champions="props.champions" :size="24" />
+                    <span class="st-champ-name">{{ ch.name }}</span>
+                  </td>
+                  <td class="st-num">{{ ch.picks }}</td>
+                  <td class="st-num"><span :class="winRateClass(ch.winRate)">{{ ch.winRate.toFixed(0) }}%</span></td>
+                  <td class="st-player">{{ ch.favorite ? `${ch.favorite.gameName}·${ch.favorite.picks}局` : '-' }}</td>
+                  <td class="st-player" v-if="ch.best">{{ ch.best.gameName }}·{{ ch.best.picks }}局·<span :class="winRateClass(ch.best.winRate)">{{ ch.best.winRate.toFixed(0) }}%</span></td>
+                  <td class="st-player" v-else>-</td>
+                  <td class="st-player" v-if="ch.worst">{{ ch.worst.gameName }}·{{ ch.worst.picks }}局·<span :class="winRateClass(ch.worst.winRate)">{{ ch.worst.winRate.toFixed(0) }}%</span></td>
+                  <td class="st-player" v-else>-</td>
+                  <td class="st-players">
+                    <template v-for="pl in ch.players.slice(0, 5)" :key="pl.puuid">
+                      <span class="st-pick" :class="winRateClass(pl.winRate)" :title="`${pl.gameName} · ${pl.picks}局 · 胜率${pl.winRate.toFixed(0)}%`">{{ pl.gameName.slice(0, 6) }}<em>{{ pl.picks }}</em></span>
+                    </template>
+                    <span v-if="ch.players.length > 5" class="st-more">+{{ ch.players.length - 5 }}</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          </div>
+        </div>
+
+        <div v-if="augmentStat.length > 0" class="stat-section">
+          <div class="stat-title-line" @click="augmentSectionVisible = !augmentSectionVisible">
+            <component :is="augmentSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">海克斯榜</span>
+            <span class="stat-subtitle">{{ augmentStat.length }} 个海克斯强化</span>
+          </div>
+          <div v-show="augmentSectionVisible" class="stat-section-body">
+          <div class="stat-header">
+            <input v-model="augmentSearch" placeholder="搜海克斯" class="stat-search" />
+            <div class="toggle-sub min-games-input" :class="{ active: augmentMinPicks > 0 }" title="只显示次数≥该值的海克斯，留空为不限">
+              <span style="font-size:13px">次数≥</span>
+              <input
+                v-model="augmentMinPicksText"
+                type="number"
+                min="1"
+                step="1"
+                placeholder="不限"
+                class="min-games-input-box"
+                @change="applyAugmentMinPicks"
+                @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+              />
+            </div>
+          </div>
+          <div class="stat-table-scroll">
+            <table class="stat-table augment-table">
+              <thead>
+                <tr>
+                  <th class="st-name">海克斯强化</th>
+                  <th class="st-num sortable" @click="toggleAugmentSort('picks')">次数{{ augmentSortIcon('picks') }}</th>
+                  <th class="st-num sortable" @click="toggleAugmentSort('winRate')">胜率{{ augmentSortIcon('winRate') }}</th>
+                  <th class="st-player">最喜欢拿</th>
+                  <th class="st-players">拿起玩家</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="sortedAugmentStat.length === 0">
+                  <td colspan="5" class="empty-table-row">
+                    {{ augmentMinPicks > 0 ? `次数≥${augmentMinPicks} 过滤后暂无海克斯，请调低次数限制` : augmentSearch ? '搜索无匹配海克斯' : '该日期没有海克斯记录' }}
+                  </td>
+                </tr>
+                <tr v-for="a in sortedAugmentStat" :key="a.id">
+                  <td class="st-name">
+                    <span class="augment-dot" :class="augmentRarityClass(a.id)"></span>
+                    <span class="st-aug-name" :title="a.name">{{ a.name }}</span>
+                  </td>
+                  <td class="st-num">{{ a.picks }}</td>
+                  <td class="st-num"><span :class="winRateClass(a.winRate)">{{ a.winRate.toFixed(0) }}%</span></td>
+                  <td class="st-player">{{ a.topPlayer ? `${a.topPlayer.gameName}·${a.topPlayer.picks}次` : '-' }}</td>
+                  <td class="st-players">
+                    <template v-for="pl in a.players.slice(0, 5)" :key="pl.puuid">
+                      <span class="st-pick" :class="winRateClass(pl.winRate)" :title="`${pl.gameName} · ${pl.picks}次 · 胜率${pl.winRate.toFixed(0)}%`">{{ pl.gameName.slice(0, 6) }}<em>{{ pl.picks }}</em></span>
+                    </template>
+                    <span v-if="a.players.length > 5" class="st-more">+{{ a.players.length - 5 }}</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          </div>
+        </div>
+      </div>
     </template>
   </div>
 </template>
@@ -1224,7 +1570,7 @@ onMounted(load)
 
 /* ── charts ── */
 .charts-section { border-top: 1px solid var(--border, #333); padding-top: 8px; }
-.charts-header { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-muted, #888); font-size: 13px; font-weight: 600; padding: 6px 0; }
+.charts-header { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 6px 0; }
 .charts-header:hover { color: var(--accent, #6366f1); }
 .charts-body { display: flex; gap: 20px; flex-wrap: wrap; padding: 12px 0; }
 .chart-block { flex: 1; min-width: 240px; max-width: 400px; }
@@ -1248,4 +1594,39 @@ onMounted(load)
 .loading-state, .error-state, .empty-state { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 48px 0; color: var(--text-muted, #888); }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+/* ── 英雄 / 海克斯统计模块 ── */
+.stat-module { display: flex; flex-direction: column; gap: 16px; padding-top: 8px; }
+.stat-section { border-top: 1px solid var(--border, #333); padding-top: 6px; }
+.stat-title-line { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 6px 0; user-select: none; }
+.stat-title-line:hover { color: var(--accent, #6366f1); }
+.stat-section-body { margin-top: 8px; }
+.stat-header { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.stat-subtitle { font-size: 12px; color: var(--text-muted, #888); }
+.stat-sorts { display: flex; gap: 4px; margin-left: 8px; }
+.stat-table-scroll { max-height: 480px; overflow-y: auto; margin-top: 8px; border: 1px solid var(--border, #333); border-radius: 8px; background: var(--bg-tertiary, #1e1e1e); }
+.stat-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.stat-table th { position: sticky; top: 0; z-index: 2; background: #17171f; padding: 6px 10px; text-align: left; font-size: 11px; font-weight: 600; color: var(--text-muted, #888); border-bottom: 1px solid var(--border, #333); white-space: nowrap; }
+.stat-table th.sortable { cursor: pointer; user-select: none; }
+.stat-table th.sortable:hover { color: var(--accent, #a5b4fc); }
+.stat-table td { padding: 5px 10px; border-bottom: 1px solid rgba(255,255,255,0.04); vertical-align: middle; }
+.stat-table tr:last-child td { border-bottom: none; }
+.stat-table .st-champ { min-width: 110px; }
+.st-champ { display: flex; align-items: center; gap: 6px; }
+.st-champ-name { font-weight: 600; color: var(--text, #eee); white-space: nowrap; }
+.st-num { text-align: right; font-variant-numeric: tabular-nums; color: var(--text, #ddd); }
+.st-player { color: var(--text-muted, #aaa); white-space: nowrap; }
+.st-players { min-width: 240px; }
+.st-pick { display: inline-block; margin: 2px 3px 0 0; padding: 1px 5px; border-radius: 3px; background: rgba(255,255,255,0.06); white-space: nowrap; }
+.st-pick em { font-style: normal; font-weight: 700; margin-left: 2px; opacity: 0.75; background: rgba(0,0,0,0.25); border-radius: 2px; padding: 0 3px; }
+.st-more { color: var(--text-muted, #666); font-size: 11px; margin-left: 3px; }
+.st-name { min-width: 200px; }
+.st-aug-name { margin-left: 4px; color: var(--text-muted, #ccc); }
+.augment-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; vertical-align: middle; }
+.augment-dot.augment-prismatic { background: #c77dff; box-shadow: 0 0 6px rgba(199, 125, 255, 0.6); }
+.augment-dot.augment-gold { background: #f0b429; box-shadow: 0 0 5px rgba(240, 180, 41, 0.5); }
+.augment-dot.augment-silver { background: #a9b7c6; }
+.augment-dot.augment-bronze { background: #c68a4e; }
+.stat-search { padding: 5px 8px; background: var(--bg-tertiary, #2a2a2a); border: 1px solid var(--border, #444); border-radius: 4px; color: var(--text, #eee); font-size: 12px; outline: none; width: 150px; }
+.stat-search::placeholder { color: var(--text-muted, #888); }
 </style>

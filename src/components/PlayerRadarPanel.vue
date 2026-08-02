@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue"
-import { Check, ChevronDown, ChevronUp, ImageDown, Minus, Plus, Radar, UserRound, X } from "lucide-vue-next"
+import { Check, ChevronDown, ChevronRight, ChevronUp, ImageDown, Minus, Plus, UserRound, X } from "lucide-vue-next"
 import { copyElementAsPng } from "../imageShare"
 
 interface RadarAbility { averageScore: number }
@@ -63,7 +63,7 @@ function loadSavedSize(): SizeKey {
   return "medium"
 }
 
-const radarVisible = ref(true)
+const radarVisible = ref(false)
 const showAvgRadar = ref(true)
 const size = ref<SizeKey>(loadSavedSize())
 const singleMode = ref(false)
@@ -302,8 +302,7 @@ const statusText = computed(() => {
 <template>
   <div class="radar-section">
     <div class="radar-header" @click="radarVisible = !radarVisible">
-      <Radar :size="16" />
-      <component :is="radarVisible ? ChevronUp : ChevronDown" :size="16" />
+      <component :is="radarVisible ? ChevronDown : ChevronRight" :size="14" />
       <span>玩家能力雷达</span>
       <span class="radar-header-count" v-if="selectedPlayers.length">已选 {{ selectedPlayers.length }} 人</span>
     </div>
@@ -434,6 +433,8 @@ const statusText = computed(() => {
           </div>
         </div>
       </div>
+
+      <div class="radar-status" :style="{ fontSize: cfg.statusFont + 'px' }">{{ statusText }}</div>
     </div>
 
     <div v-show="exporting" ref="exportRef" class="radar-export-area">
@@ -473,15 +474,14 @@ const statusText = computed(() => {
       <div class="export-status-bar">{{ statusText }}</div>
     </div>
 
-    <div class="radar-status" :style="{ fontSize: cfg.statusFont + 'px' }">{{ statusText }}</div>
   </div>
 </template>
 
 <style scoped>
 .radar-section { border-top: 1px solid var(--border, #333); padding-top: 8px; }
-.radar-header { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-muted, #888); font-size: 13px; font-weight: 600; padding: 6px 0; }
+.radar-header { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 6px 0; }
 .radar-header:hover { color: var(--accent, #6366f1); }
-.radar-header-count { margin-left: auto; font-size: 11px; font-weight: 400; color: var(--text-muted, #666); }
+.radar-header-count { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--text-muted, #666); }
 .radar-body { display: flex; gap: 16px; padding: 12px 0; align-items: flex-start; }
 
 .radar-canvas-wrap { position: relative; background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 10px; padding: 8px; flex-shrink: 0; }
