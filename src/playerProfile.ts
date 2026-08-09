@@ -138,7 +138,7 @@ export function buildChampionProfiles(
         averageDamageShare: summary.damageShare,
         averageDamageConversion: summary.damageConversion,
         averageMitigationShare: summary.mitigationShare,
-        averageHealingShare: summary.healingShare,
+        averageHealingShare: summary.protectionShare,
       }
     })
     .sort((a, b) => b.games - a.games || b.averageScore - a.averageScore)
@@ -205,7 +205,7 @@ function buildAbilityProfile(key: AbilityKey, entries: RatedGame[]): AbilityProf
     averageDamageShare: average(selected.map((entry) => entry.rating.metrics.damageShare)),
     averageDamageConversion: average(selected.map((entry) => entry.rating.metrics.damageConversion)),
     averageMitigationShare: average(selected.map((entry) => entry.rating.metrics.mitigationShare)),
-    averageHealingShare: average(selected.map((entry) => entry.rating.metrics.healingShare)),
+    averageHealingShare: average(selected.map((entry) => entry.rating.metrics.protectionShare)),
   }
 }
 
@@ -284,7 +284,7 @@ function positiveProfileTags(
   if (summary.deathShare >= 0.27 && summary.damageShare >= 0.25) tags.push("浴血奋战")
   if (summary.mitigationShare >= 0.29 && summary.damageShare >= 0.23) tags.push("半肉战神")
   else if (summary.mitigationShare >= 0.29 || frontlineGamesRate >= 0.35) tags.push("哪来的城墙")
-  if (summary.healingShare >= 0.25 || supportGamesRate >= 0.35 || mainRoleLabel === "辅助") {
+  if (summary.protectionShare >= 0.25 || supportGamesRate >= 0.35 || mainRoleLabel === "辅助") {
     tags.push("团队功能")
   }
   tags.push(...controlProfileTags(summary))
@@ -504,6 +504,7 @@ function summarizeRatedGames(entries: RatedGame[]) {
     mitigationShare: average(metrics.map((item) => item.mitigationShare)),
     mitigationPerDeath: average(metrics.map((item) => item.mitigationPerDeath)),
     healingShare: average(metrics.map((item) => item.healingShare)),
+    protectionShare: average(metrics.map((item) => item.protectionShare)),
     immobilizationsPerMinute: average(metrics.map((item) => item.immobilizationsPerMinute)),
     immobilizationShare: average(metrics.map((item) => item.immobilizationShare)),
     immobilizeKillConversion: average(metrics.map((item) => item.immobilizeKillConversion)),

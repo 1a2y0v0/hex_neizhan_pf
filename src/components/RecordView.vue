@@ -392,8 +392,15 @@ function buildChampionStats(games: RecentGame[]): ChampionStat[] {
         (sum, game) => sum + teamMitigationValue(game),
         0,
       )
-      const healing = championGames.reduce((sum, game) => sum + game.totalHeal, 0)
-      const teamHealing = championGames.reduce((sum, game) => sum + game.teamTotalHeal, 0)
+      const healing = championGames.reduce(
+        (sum, game) => sum + (game.totalHeal || 0) + (game.totalDamageShieldedOnTeammates || 0),
+        0,
+      )
+      const teamHealing = championGames.reduce(
+        (sum, game) =>
+          sum + (game.teamTotalHeal || 0) + (game.teamTotalDamageShieldedOnTeammates || 0),
+        0,
+      )
       const damageShare = ratio(damage, teamDamage)
       const goldShare = ratio(gold, teamGold)
 
@@ -414,6 +421,7 @@ function buildChampionStats(games: RecentGame[]): ChampionStat[] {
         damageConversionRate: goldShare === 0 ? 0 : round2(damageShare / goldShare),
         mitigationShare: ratio(mitigated, teamMitigated),
         healingShare: ratio(healing, teamHealing),
+        protectionShare: ratio(healing, teamHealing),
         goldShare,
         lastPlayedAt: Math.max(...championGames.map((game) => game.gameCreation)),
       }

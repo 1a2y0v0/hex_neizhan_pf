@@ -120,6 +120,7 @@ export interface ChampionStat {
   damageConversionRate: number
   mitigationShare: number
   healingShare: number
+  protectionShare: number
   goldShare: number
   lastPlayedAt: number
 }
@@ -173,12 +174,17 @@ export interface RecentGame {
   teamTotalDamageTaken: number
   totalHeal: number
   teamTotalHeal: number
+  totalDamageShieldedOnTeammates?: number
+  teamTotalDamageShieldedOnTeammates?: number
   teamGoldEarned: number
   gameGoldEarned?: number
   enemyChampionImmobilizations: number
   teamEnemyChampionImmobilizations: number
   immobilizeAndKillWithAlly: number
   teamImmobilizeAndKillWithAlly: number
+  carryKills: number
+  carryAssists: number
+  teamCarryKills: number
   gameCreation: number
   gameDuration: number
 }

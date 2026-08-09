@@ -289,6 +289,11 @@ impl LcuClient {
             .await
     }
 
+    pub async fn match_timeline(&self, game_id: u64) -> AppResult<serde_json::Value> {
+        self.get_json(&format!("/lol-match-history/v1/games/{game_id}/timeline"))
+            .await
+    }
+
     pub async fn end_of_game_details(&self, game_id: u64) -> AppResult<serde_json::Value> {
         self.get_json(&format!("/lol-end-of-game/v1/eog-details/{game_id}"))
             .await

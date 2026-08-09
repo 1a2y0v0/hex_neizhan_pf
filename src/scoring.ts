@@ -11,6 +11,10 @@ import { fixed, mitigationValue, teamMitigationValue } from "./utils"
 
 export interface OutputRatingMetrics {
   kda: number
+  carryKills: number
+  carryAssists: number
+  carryTakedowns: number
+  carryParticipation: number
   immobilizationsPerMinute: number
   damageShare: number
   goldShare: number
@@ -22,6 +26,8 @@ export interface OutputRatingMetrics {
   mitigationShare: number
   mitigationPerDeath: number
   healingShare: number
+  shieldingShare: number
+  protectionShare: number
   immobilizationShare: number
   immobilizeKillShare: number
   immobilizeKillConversion: number
@@ -175,6 +181,14 @@ export function outputRatingMetrics(game: RecentGame): OutputRatingMetrics {
 
   return {
     kda: Number(game.kda || 0),
+    carryKills: Number(game.carryKills || 0),
+    carryAssists: Number(game.carryAssists || 0),
+    carryTakedowns: Number(game.carryKills || 0) + Number(game.carryAssists || 0),
+    carryParticipation:
+      Number(game.teamCarryKills || 0) > 0
+        ? (Number(game.carryKills || 0) + Number(game.carryAssists || 0)) /
+          Number(game.teamCarryKills || 0)
+        : 0,
     immobilizationsPerMinute,
     damageShare,
     goldShare,
@@ -187,6 +201,14 @@ export function outputRatingMetrics(game: RecentGame): OutputRatingMetrics {
     mitigationPerDeath:
       teamMitigationPerDeath > 0 ? personalMitigationPerDeath / teamMitigationPerDeath : 0,
     healingShare: ratio(game.totalHeal, game.teamTotalHeal),
+    shieldingShare: ratio(
+      game.totalDamageShieldedOnTeammates || 0,
+      game.teamTotalDamageShieldedOnTeammates || 0,
+    ),
+    protectionShare: ratio(
+      (game.totalHeal || 0) + (game.totalDamageShieldedOnTeammates || 0),
+      (game.teamTotalHeal || 0) + (game.teamTotalDamageShieldedOnTeammates || 0),
+    ),
     immobilizationShare,
     immobilizeKillShare,
     immobilizeKillConversion,
@@ -739,6 +761,7 @@ function ratingFamily(role: PlayerRole): RatingFamily {
     case "fighterAssassin":
       return "fighter"
     case "support":
+    case "utilityCarry":
       return "support"
     default:
       return "carry"
@@ -813,8 +836,9 @@ function calculateRatingParts(
       deathControl: 10 * survivalScore(metrics, 0.28, 0.22),
       roleFit: clamp01((role.finalWeights.tank + role.finalWeights.fighter) / 0.65),
       efficiency: 9 * damageConversionScore(metrics, 0.65, 0.55),
-      healing: 5 * clamp01(metrics.healingShare / 0.25),
+      healing: 5 * clamp01(metrics.protectionShare / 0.25),
       control: damageControl.control,
+      carry: carryContributionScore(metrics, 4),
     }
   }
 
@@ -847,6 +871,7 @@ function calculateRatingParts(
       participation: 8 * clamp01((metrics.killParticipation - 0.43) / 0.37),
       survival: 8 * survivalScore(metrics, 0.24, 0.2),
       killQuality: 5 * killQualityScore(metrics),
+      carry: carryContributionScore(metrics, 8),
     }
   }
 
@@ -884,21 +909,23 @@ function calculateRatingParts(
       killQuality: 9 * killQualityScore(metrics),
       survival: 8 * survivalScore(metrics, 0.2, 0.18),
       economy: 6 * damageConversionScore(metrics, 0.75, 0.65),
+      carry: carryContributionScore(metrics, 8),
     }
   }
 
   if (family === "support") {
-    const protection = Math.max(metrics.healingShare, metrics.mitigationShare * 0.75)
+    const protection = Math.max(metrics.protectionShare, metrics.mitigationShare * 0.75)
 
     return {
       participation: 23 * clamp01((metrics.killParticipation - 0.45) / 0.35),
-      healing: 18 * clamp01(metrics.healingShare / 0.32),
+      healing: 18 * clamp01(metrics.protectionShare / 0.32),
       protection: 14 * clamp01(protection / 0.3),
       effectiveDamage: 13 * clamp01(metrics.damageShare / 0.22),
       deathControl: 9 * survivalScore(metrics, 0.24, 0.2),
       economy: 6 * (1 - clamp01((metrics.goldShare - 0.23) / 0.18)),
       killQuality: 7 * killQualityScore(metrics),
       control: 10 * metrics.controlQuality,
+      carry: carryContributionScore(metrics, 5),
     }
   }
 
@@ -932,6 +959,7 @@ function calculateRatingParts(
     mitigation: combat.mitigation,
     ...dynamicControlPart(role, combat.control),
     economy: 6 * damageConversionScore(metrics, 0.75, 0.65),
+    carry: carryContributionScore(metrics, 10),
   }
 }
 
@@ -1051,6 +1079,19 @@ function killQualityScore(metrics: OutputRatingMetrics) {
     metrics.damageShare,
     performanceProtection(metrics),
   )
+}
+
+function carryContributionScore(metrics: OutputRatingMetrics, maxWeight: number) {
+  if (metrics.carryParticipation <= 0) return 0
+
+  const shareScore = clamp01((metrics.carryParticipation - 0.12) / 0.4)
+  const killWeightRatio =
+    metrics.carryTakedowns > 0
+      ? clamp01(metrics.carryKills / metrics.carryTakedowns)
+      : 0
+  const finishingRatio = 0.55 + killWeightRatio * 0.45
+
+  return maxWeight * shareScore * finishingRatio
 }
 
 function damageConversionScore(metrics: OutputRatingMetrics, base: number, range: number) {
@@ -1355,6 +1396,7 @@ const RATING_PART_LABELS: Record<string, string> = {
   supportControl: "功能控制分",
   participation: "参团",
   killQuality: "人头质量",
+  carry: "切C",
   survival: "生存",
   economy: "经济效率",
   effectiveDamage: "有效伤害",

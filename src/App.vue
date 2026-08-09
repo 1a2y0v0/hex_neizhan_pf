@@ -1049,8 +1049,33 @@ async function loadOverviewTabDetail(id: string, gameId: number, sgpServerId?: s
       "对局详情读取超时，请稍后重试",
     )
     updateOverviewTab(id, { detail, loading: false, error: "" })
+    syncCarryToStatsLists(gameId, detail)
   } catch (error) {
     updateOverviewTab(id, { error: errorMessage(error), loading: false })
+  }
+}
+
+function syncCarryToStatsLists(gameId: number, detail: MatchDetailResponse) {
+  const players = detail.teams.flatMap((team) => team.players)
+  for (const stats of [
+    currentFullStats.value,
+    currentRecentStats.value,
+    searchFullStats.value,
+    searchRecentStats.value,
+  ]) {
+    if (!stats) continue
+    for (const game of stats.recentGames) {
+      if (game.gameId !== gameId) continue
+      const matched = players.find(
+        (p) =>
+          p.championId === game.championId &&
+          p.teamId === game.teamId,
+      )
+      if (!matched) continue
+      game.carryKills = matched.carryKills
+      game.carryAssists = matched.carryAssists
+      game.teamCarryKills = matched.teamCarryKills
+    }
   }
 }
 

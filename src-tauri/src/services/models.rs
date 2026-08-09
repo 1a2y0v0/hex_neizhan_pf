@@ -276,6 +276,12 @@ pub struct Participant {
     pub stats: ParticipantStats,
     #[serde(default)]
     pub timeline: ParticipantTimeline,
+    /// 对敌方C位（射手/法师/刺客）的击杀数，来自 timeline 事件解析。
+    #[serde(default)]
+    pub carry_kills: u32,
+    /// 对敌方C位击杀的助攻数，来自 timeline 事件解析。
+    #[serde(default)]
+    pub carry_assists: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -305,6 +311,8 @@ pub struct ParticipantStats {
     pub total_damage_taken: u32,
     #[serde(default)]
     pub total_heal: u32,
+    #[serde(default)]
+    pub total_damage_shielded_on_teammates: u32,
     #[serde(default)]
     pub enemy_champion_immobilizations: u32,
     #[serde(default)]
@@ -528,6 +536,10 @@ pub struct RecentGame {
     #[serde(default)]
     pub team_total_heal: u32,
     #[serde(default)]
+    pub total_damage_shielded_on_teammates: u32,
+    #[serde(default)]
+    pub team_total_damage_shielded_on_teammates: u32,
+    #[serde(default)]
     pub team_gold_earned: u32,
     #[serde(default)]
     pub game_gold_earned: u32,
@@ -539,6 +551,15 @@ pub struct RecentGame {
     pub immobilize_and_kill_with_ally: u32,
     #[serde(default)]
     pub team_immobilize_and_kill_with_ally: u32,
+    /// 对敌方C位（射手/法师/刺客）的击杀数。
+    #[serde(default)]
+    pub carry_kills: u32,
+    /// 对敌方C位击杀的助攻数。
+    #[serde(default)]
+    pub carry_assists: u32,
+    /// 本队对敌方C位的总击杀数（用于算切C参与率）。
+    #[serde(default)]
+    pub team_carry_kills: u32,
     pub game_creation: i64,
     pub game_duration: i64,
 }

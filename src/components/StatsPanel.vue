@@ -361,6 +361,14 @@ function kNumber(value: number) {
   return `${(value / 1000).toFixed(1)}k`
 }
 
+function protectionValue(game: RecentGame) {
+  return (game.totalHeal || 0) + (game.totalDamageShieldedOnTeammates || 0)
+}
+
+function teamProtectionValue(game: RecentGame) {
+  return (game.teamTotalHeal || 0) + (game.teamTotalDamageShieldedOnTeammates || 0)
+}
+
 function shareText(part: number, total: number) {
   return `${Math.round(ratio(part, total) * 100)}%`
 }
@@ -1125,9 +1133,9 @@ function errorMessage(error: unknown) {
                 <em>{{ shareText(mitigationValue(game), teamMitigationValue(game)) }}</em>
               </div>
               <div :class="{ leader: isGameLeader(game, 'healing') }">
-                <span>治疗</span>
-                <strong>{{ kNumber(game.totalHeal) }}</strong>
-                <em>{{ shareText(game.totalHeal, game.teamTotalHeal) }}</em>
+                <span>治疗/护盾</span>
+                <strong>{{ kNumber(protectionValue(game)) }}</strong>
+                <em>{{ shareText(protectionValue(game), teamProtectionValue(game)) }}</em>
               </div>
               <div :class="{ leader: isGameLeader(game, 'conversion') }">
                 <span>伤转</span>

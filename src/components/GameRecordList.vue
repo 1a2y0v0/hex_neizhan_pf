@@ -92,6 +92,14 @@ function kNumber(value: number) {
   return `${(value / 1000).toFixed(1)}k`
 }
 
+function protectionValue(game: RecentGame) {
+  return (game.totalHeal || 0) + (game.totalDamageShieldedOnTeammates || 0)
+}
+
+function teamProtectionValue(game: RecentGame) {
+  return (game.teamTotalHeal || 0) + (game.teamTotalDamageShieldedOnTeammates || 0)
+}
+
 function damageConversion(game: RecentGame) {
   const goldShare = ratio(game.goldEarned, game.teamGoldEarned)
   if (goldShare === 0) return "0.00"
@@ -174,7 +182,7 @@ function accoladeTags(game: RecentGame) {
   }
 
   if (game.teamHealingLeader) {
-    tags.push({ text: "治疗第一", className: "healing" })
+    tags.push({ text: "治疗/护盾第一", className: "healing" })
   }
 
   if (game.teamDamageConversionLeader) {
@@ -310,11 +318,35 @@ async function openMatchDetail(game: RecentGame) {
 
   try {
     matchDetail.value = await loadMatchDetail(game.gameId, props.sgpServerId)
+    syncCarryFromDetail(game, matchDetail.value)
   } catch (error) {
     detailError.value = errorMessage(error)
   } finally {
     detailLoading.value = false
   }
+}
+
+function syncCarryFromDetail(game: RecentGame, detail: MatchDetailResponse | null) {
+  if (!detail) return
+  const players = detail.teams.flatMap((team) => team.players)
+  const self = findByPuuid(players, props.ownerPuuid)
+    || players.find(
+      (p) =>
+        p.gameId === game.gameId &&
+        p.championId === game.championId &&
+        p.teamId === game.teamId,
+    )
+  if (self) {
+    game.carryKills = self.carryKills
+    game.carryAssists = self.carryAssists
+    game.teamCarryKills = self.teamCarryKills
+  }
+}
+
+function findByPuuid(players: MatchDetailPlayer[], puuid: string | undefined) {
+  const key = (puuid || "").trim().toLowerCase()
+  if (!key) return undefined
+  return players.find((p) => p.puuid && p.puuid.toLowerCase() === key)
 }
 </script>
 
@@ -419,8 +451,8 @@ async function openMatchDetail(game: RecentGame) {
       </div>
 
       <div class="stat-cell">
-        <strong :class="{ leader: detailStatLeader(game, 'healing') }">{{ kNumber(game.totalHeal) }}</strong>
-        <span class="stat-share" :class="{ leader: detailStatLeader(game, 'healing') }">治疗 <b>{{ shareText(game.totalHeal, game.teamTotalHeal) }}</b></span>
+        <strong :class="{ leader: detailStatLeader(game, 'healing') }">{{ kNumber(protectionValue(game)) }}</strong>
+        <span class="stat-share" :class="{ leader: detailStatLeader(game, 'healing') }">治疗/护盾 <b>{{ shareText(protectionValue(game), teamProtectionValue(game)) }}</b></span>
       </div>
 
       <div class="stat-cell">
@@ -498,7 +530,7 @@ async function openMatchDetail(game: RecentGame) {
               <span>伤害</span>
               <span>经济</span>
               <span>承伤</span>
-              <span>治疗</span>
+              <span>治疗/护盾</span>
               <span>伤转</span>
               <span>评分</span>
             </div>
@@ -591,7 +623,7 @@ async function openMatchDetail(game: RecentGame) {
 
                 <div class="stat-cell">
                   <strong :class="{ leader: detailStatLeader(player, 'healing') }">
-                    {{ kNumber(player.totalHeal) }}<em>{{ shareSuffix(player.totalHeal, player.teamTotalHeal) }}</em>
+                    {{ kNumber(protectionValue(player)) }}<em>{{ shareSuffix(protectionValue(player), teamProtectionValue(player)) }}</em>
                   </strong>
                 </div>
 

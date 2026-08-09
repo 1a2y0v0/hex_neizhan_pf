@@ -208,6 +208,47 @@ impl SgpClient {
         self.parse_game_summary_response(response, game_id).await
     }
 
+    /// 国服 SGP 对局时间线（DETAILS 端点包含 frames/events）。
+    ///
+    /// LCU 的 `/lol-match-history/v1/games/{gameId}/timeline` 在国服 404，
+    /// 改用 SGP match-history-query DETAILS 端点，返回结构与 LCU timeline
+    /// 兼容（外层有 `frames` 数组，含 CHAMPION_KILL 事件）。
+    pub async fn match_timeline(&self, game_id: u64) -> AppResult<serde_json::Value> {
+        let sub_id = self
+            .sgp_server_id
+            .strip_prefix("TENCENT_")
+            .unwrap_or(&self.sgp_server_id)
+            .to_ascii_uppercase();
+
+        let response = self
+            .http
+            .get(format!(
+                "{}/match-history-query/v1/products/lol/{}_{}/DETAILS",
+                self.base_url, sub_id, game_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(AppError::SgpUnavailable(format!(
+                "SGP 对局时间线返回 {}",
+                response.status()
+            )));
+        }
+
+        let envelope = parse_sgp_json::<SgpTimelineEnvelope>(response, "SGP 对局时间线").await?;
+
+        let Some(json) = envelope.json else {
+            return Err(AppError::SgpUnavailable(format!(
+                "SGP 对局时间线 {game_id} 缺少 json 数据"
+            )));
+        };
+
+        Ok(json)
+    }
+
     async fn parse_match_history_response(
         &self,
         response: reqwest::Response,
@@ -364,6 +405,12 @@ struct SgpGameEnvelope {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct SgpTimelineEnvelope {
+    #[serde(default)]
+    json: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SgpGameJson {
     #[serde(default)]
@@ -450,6 +497,8 @@ struct SgpParticipant {
     total_damage_taken: u32,
     #[serde(default)]
     total_heal: u32,
+    #[serde(default)]
+    total_damage_shielded_on_teammates: u32,
     #[serde(default)]
     vision_score: u32,
     #[serde(default)]
@@ -586,6 +635,11 @@ fn sgp_game_json_to_lcu_game(game: SgpGameJson) -> Game {
                 challenge_u32(&participant.challenges, "enemyChampionImmobilizations");
             let immobilize_and_kill_with_ally =
                 challenge_u32(&participant.challenges, "immobilizeAndKillWithAlly");
+            let total_damage_shielded_on_teammates = participant.total_damage_shielded_on_teammates
+                .max(challenge_u32(
+                    &participant.challenges,
+                    "totalDamageShieldedOnTeammates",
+                ));
 
             Participant {
                 participant_id: participant.participant_id,
@@ -606,6 +660,7 @@ fn sgp_game_json_to_lcu_game(game: SgpGameJson) -> Game {
                     damage_self_mitigated: participant.damage_self_mitigated,
                     total_damage_taken: participant.total_damage_taken,
                     total_heal: participant.total_heal,
+                    total_damage_shielded_on_teammates,
                     enemy_champion_immobilizations,
                     immobilize_and_kill_with_ally,
                     vision_score: participant.vision_score,
@@ -635,6 +690,8 @@ fn sgp_game_json_to_lcu_game(game: SgpGameJson) -> Game {
                     lane: participant.lane,
                     role: participant.role,
                 },
+                carry_kills: 0,
+                carry_assists: 0,
             }
         })
         .collect();

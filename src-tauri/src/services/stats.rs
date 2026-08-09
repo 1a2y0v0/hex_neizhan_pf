@@ -26,7 +26,7 @@ const MAX_DEPTH: usize = 1000;
 const MIN_VALID_GAME_DURATION_SECONDS: i64 = 8 * 60;
 const STATS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DATABASE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const CACHE_SCHEMA_VERSION: i64 = 12;
+const CACHE_SCHEMA_VERSION: i64 = 14;
 const DATABASE_FILE_NAME: &str = "lol-stats.sqlite3";
 
 static STATS_CACHE: LazyLock<Mutex<HashMap<StatsCacheKey, StatsCacheEntry>>> =
@@ -34,6 +34,10 @@ static STATS_CACHE: LazyLock<Mutex<HashMap<StatsCacheKey, StatsCacheEntry>>> =
 
 static GAME_CACHE: LazyLock<Mutex<HashMap<u64, Game>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 已执行过 attach_carry_stats 的对局，避免缓存命中时重复拉取详情时间线。
+static CARRY_ATTACHED: LazyLock<Mutex<HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StatsCacheKey {
@@ -72,6 +76,8 @@ struct ChampionAccumulator {
     team_total_damage_taken: u64,
     total_heal: u64,
     team_total_heal: u64,
+    total_damage_shielded_on_teammates: u64,
+    team_total_damage_shielded_on_teammates: u64,
     last_played_at: i64,
 }
 
@@ -82,6 +88,7 @@ struct TeamTotals {
     damage_self_mitigated: u32,
     total_damage_taken: u32,
     total_heal: u32,
+    total_damage_shielded_on_teammates: u32,
     enemy_champion_immobilizations: u32,
     immobilize_and_kill_with_ally: u32,
     kills: u32,
@@ -128,38 +135,312 @@ pub async fn load_match_detail(
     sgp_server_id: Option<&str>,
     game_id: u64,
 ) -> AppResult<MatchDetailResponse> {
-    if let Ok(cache) = GAME_CACHE.lock() {
-        if let Some(game) = cache.get(&game_id) {
-            return Ok(match_detail_from_game(game.clone()));
+    let needs_carry_attach = {
+        let attached = CARRY_ATTACHED.lock().map(|set| set.contains(&game_id));
+        !attached.unwrap_or(false)
+    };
+    let mut game = GAME_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&game_id).cloned());
+    if let Some(mut cached_game) = game {
+        if needs_carry_attach {
+            attach_carry_stats(&mut cached_game, lcu, auth, sgp_server_id).await;
+            if let Ok(mut attached) = CARRY_ATTACHED.lock() {
+                attached.insert(game_id);
+            }
+            if let Ok(mut cache) = GAME_CACHE.lock() {
+                cache.insert(game_id, cached_game.clone());
+            }
+            persist_game_carry_backfill(&cached_game, auth, sgp_server_id);
+        }
+        return Ok(match_detail_from_game(cached_game));
+    }
+
+    let mut game = read_db_cached_game_by_id(game_id);
+
+    if game.is_none() {
+        if let Some(auth) = auth {
+            if let Ok(sgp) = SgpClient::new(lcu, auth, sgp_server_id).await {
+                game = sgp.game_summary(game_id).await.ok();
+            }
+        }
+    }
+    if game.is_none() {
+        game = lcu.match_history_game(game_id).await.ok();
+    }
+    if game.is_none() {
+        game = lcu
+            .end_of_game_details(game_id)
+            .await
+            .ok()
+            .and_then(eog_to_game);
+    }
+
+    let Some(mut game) = game else {
+        return Err(AppError::GameDetailNotFound(game_id));
+    };
+
+    attach_carry_stats(&mut game, lcu, auth, sgp_server_id).await;
+
+    if let Ok(mut cache) = GAME_CACHE.lock() {
+        cache.insert(game_id, game.clone());
+    }
+    persist_game_carry_backfill(&game, auth, sgp_server_id);
+
+    Ok(match_detail_from_game(game))
+}
+
+/// 详情页拿到切C数据后写回 match_cache，让战绩列表/统计缓存重建时能直接读到。
+fn persist_game_carry_backfill(game: &Game, auth: Option<&ClientAuth>, sgp_server_id: Option<&str>) {
+    let Some(conn) = open_cache_db() else {
+        return;
+    };
+    let sgp_server_id = if let Some(auth) = auth {
+        resolve_sgp_server_id(auth, sgp_server_id)
+    } else {
+        sgp_server_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| "LCU_CURRENT".to_string())
+    };
+    let Ok(game_json) = serde_json::to_string(game) else {
+        return;
+    };
+
+    let _ = conn.execute(
+        r#"
+        INSERT INTO match_cache (
+            sgp_server_id, game_id, game_creation, game_duration,
+            queue_id, stored_at_ms, game_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(sgp_server_id, game_id) DO UPDATE SET
+            game_creation = excluded.game_creation,
+            game_duration = excluded.game_duration,
+            queue_id = excluded.queue_id,
+            stored_at_ms = excluded.stored_at_ms,
+            game_json = excluded.game_json
+        "#,
+        params![
+            sgp_server_id,
+            game.game_id as i64,
+            game.game_creation,
+            game.game_duration,
+            game.queue_id as i64,
+            unix_time_ms(),
+            game_json,
+        ],
+    );
+}
+
+/// 脆皮C位英雄ID集合（射手/法师/刺客），来自 LCU champion-summary 的角色标签。
+///
+/// 只算“需要打输出到人头上的角色”，坦克/战士/辅助不算，因此击杀它们的收益不该计为切C。
+/// 缓存一次避免每次拉详情都请求 champion-summary。
+static CARRY_CHAMPION_IDS: LazyLock<Mutex<Option<HashSet<u32>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+async fn carry_champion_ids(lcu: &LcuClient) -> HashSet<u32> {
+    if let Ok(cache) = CARRY_CHAMPION_IDS.lock() {
+        if let Some(ids) = cache.as_ref() {
+            return ids.clone();
         }
     }
 
-    if let Some(game) = read_db_cached_game_by_id(game_id) {
-        if let Ok(mut cache) = GAME_CACHE.lock() {
-            cache.insert(game_id, game.clone());
-        }
-        return Ok(match_detail_from_game(game));
-    }
-
-    if let Some(auth) = auth {
-        if let Ok(sgp) = SgpClient::new(lcu, auth, sgp_server_id).await {
-            if let Ok(game) = sgp.game_summary(game_id).await {
-                return Ok(match_detail_from_game(game));
+    let mut ids = HashSet::new();
+    if let Ok(summary) = lcu.champion_summary().await {
+        for champion in summary {
+            if champion
+                .roles
+                .iter()
+                .any(|role| {
+                    ["marksman", "mage", "assassin"]
+                        .contains(&role.trim().to_ascii_lowercase().as_str())
+                })
+            {
+                ids.insert(champion.id as u32);
             }
         }
     }
 
-    if let Ok(game) = lcu.match_history_game(game_id).await {
-        return Ok(match_detail_from_game(game));
+    if let Ok(mut cache) = CARRY_CHAMPION_IDS.lock() {
+        *cache = Some(ids.clone());
+    }
+    ids
+}
+
+/// 用对局 timeline 的 CHAMPION_KILL 事件统计每位参与者对敌方C位的击杀/助攻。
+///
+/// timeline 结构：frames[].events[]，事件 type 为 CHAMPION_KILL 时携带
+/// killerId / victimId / assistingParticipantIds。受害者是脆皮C位时，
+/// 击杀者计 carry_kills，助攻者计 carry_assists。
+async fn attach_carry_stats(
+    game: &mut Game,
+    lcu: &LcuClient,
+    auth: Option<&ClientAuth>,
+    sgp_server_id: Option<&str>,
+) {
+    let carry_ids = carry_champion_ids(lcu).await;
+    if carry_ids.is_empty() {
+        return;
     }
 
-    if let Ok(eog) = lcu.end_of_game_details(game_id).await {
-        if let Some(game) = eog_to_game(eog) {
-            return Ok(match_detail_from_game(game));
+    let participant_champion: HashMap<u32, u32> = game
+        .participants
+        .iter()
+        .map(|participant| (participant.participant_id, participant.champion_id))
+        .collect();
+
+    let timeline = match lcu.match_timeline(game.game_id).await {
+        Ok(timeline) => timeline,
+        Err(_) => {
+            let Some(auth) = auth else {
+                return;
+            };
+            let Ok(sgp) = SgpClient::new(lcu, auth, sgp_server_id).await else {
+                return;
+            };
+            let Ok(timeline) = sgp.match_timeline(game.game_id).await else {
+                return;
+            };
+            timeline
+        }
+    };
+    let Some(frames) = timeline.get("frames").and_then(|frames| frames.as_array()) else {
+        return;
+    };
+
+    let mut carry_kills: HashMap<u32, u32> = HashMap::new();
+    let mut carry_assists: HashMap<u32, u32> = HashMap::new();
+
+    for frame in frames {
+        let Some(events) = frame.get("events").and_then(|events| events.as_array()) else {
+            continue;
+        };
+        for event in events {
+            if event.get("type").and_then(|t| t.as_str()) != Some("CHAMPION_KILL") {
+                continue;
+            }
+            let Some(victim_id) = event.get("victimId").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            let Some(&victim_champion) = participant_champion.get(&(victim_id as u32)) else {
+                continue;
+            };
+            if !carry_ids.contains(&victim_champion) {
+                continue;
+            }
+            if let Some(killer_id) = event.get("killerId").and_then(|k| k.as_u64()) {
+                if killer_id > 0 && killer_id <= u32::MAX as u64 {
+                    *carry_kills.entry(killer_id as u32).or_default() += 1;
+                }
+            }
+            if let Some(assists) = event
+                .get("assistingParticipantIds")
+                .and_then(|a| a.as_array())
+            {
+                for assist in assists {
+                    if let Some(assist_id) = assist.as_u64() {
+                        if assist_id > 0 && assist_id <= u32::MAX as u64 {
+                            *carry_assists.entry(assist_id as u32).or_default() += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    Err(AppError::GameDetailNotFound(game_id))
+    for participant in &mut game.participants {
+        participant.carry_kills = carry_kills.get(&participant.participant_id).copied().unwrap_or(0);
+        participant.carry_assists = carry_assists
+            .get(&participant.participant_id)
+            .copied()
+            .unwrap_or(0);
+    }
+}
+
+/// 对列表数据中最近若干局批量补切C数据。
+///
+/// 列表接口的 game 从 SGP/LCU summary 来，不携带 timeline；这里对最有价值的
+/// 最近对局做一次切C attach（并发有限、失败静默），并把拿到的时间线结果写回
+/// GAME_CACHE 与 match_cache，之后统计/列表重建也直接带数据。
+async fn attach_carry_stats_batch(
+    games: &mut [Game],
+    lcu: &LcuClient,
+    auth: Option<&ClientAuth>,
+    sgp_server_id: Option<&str>,
+) {
+    const BATCH_LIMIT: usize = 12;
+
+    let mut pending: Vec<(usize, u64)> = Vec::new();
+    {
+        let attached = CARRY_ATTACHED
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let mut scheduled = HashSet::new();
+        for (index, game) in games.iter().enumerate() {
+            if game.game_id == 0 || attached.contains(&game.game_id) {
+                continue;
+            }
+            if pending.len() >= BATCH_LIMIT {
+                break;
+            }
+            if scheduled.insert(game.game_id) {
+                pending.push((index, game.game_id));
+            }
+        }
+    }
+
+    if pending.is_empty() {
+        return;
+    }
+
+    let mut futures = Vec::with_capacity(pending.len());
+    for (index, game_id) in pending {
+        futures.push(carry_attach_task(
+            index,
+            game_id,
+            games[index].clone(),
+            lcu,
+            auth,
+            sgp_server_id,
+        ));
+    }
+
+    for f in futures {
+        if let Some((index, game)) = f.await {
+            games[index] = game;
+        }
+    }
+}
+
+async fn carry_attach_task(
+    index: usize,
+    game_id: u64,
+    mut game: Game,
+    lcu: &LcuClient,
+    auth: Option<&ClientAuth>,
+    sgp_server_id: Option<&str>,
+) -> Option<(usize, Game)> {
+    attach_carry_stats(&mut game, lcu, auth, sgp_server_id).await;
+
+    if let Ok(mut set) = CARRY_ATTACHED.lock() {
+        set.insert(game_id);
+    }
+    if let Ok(mut cache) = GAME_CACHE.lock() {
+        cache.insert(game_id, game.clone());
+    }
+    if game
+        .participants
+        .iter()
+        .any(|p| p.carry_kills > 0 || p.carry_assists > 0)
+    {
+        persist_game_carry_backfill(&game, auth, sgp_server_id);
+    }
+
+    Some((index, game))
 }
 
 fn today_start_ms() -> i64 {
@@ -275,7 +556,8 @@ where
 
     if !force_refresh {
         if let Some(cached) = get_cached_stats(&cache_key) {
-            if let Some(games) = read_db_cached_games(&cache_key, depth) {
+            if let Some(mut games) = read_db_cached_games(&cache_key, depth) {
+                attach_carry_stats_batch(&mut games, lcu, auth, sgp_server_id).await;
                 if let Ok(mut cache) = GAME_CACHE.lock() {
                     for game in games {
                         cache.insert(game.game_id, game);
@@ -285,12 +567,13 @@ where
             if !progress(depth, depth) {
                 return Err(super::error::AppError::Cancelled);
             }
-            return Ok(cached);
+            return Ok(merge_carry_from_game_cache(cached));
         }
 
         if let Some(cached) = read_db_cached_stats(&cache_key, false) {
             store_cached_stats(cache_key.clone(), &cached);
-            if let Some(games) = read_db_cached_games(&cache_key, depth) {
+            if let Some(mut games) = read_db_cached_games(&cache_key, depth) {
+                attach_carry_stats_batch(&mut games, lcu, auth, sgp_server_id).await;
                 if let Ok(mut cache) = GAME_CACHE.lock() {
                     for game in games {
                         cache.insert(game.game_id, game);
@@ -300,7 +583,7 @@ where
             if !progress(depth, depth) {
                 return Err(super::error::AppError::Cancelled);
             }
-            return Ok(cached);
+            return Ok(merge_carry_from_game_cache(cached));
         }
     }
 
@@ -314,13 +597,15 @@ where
     let loaded =
         load_games_incremental(lcu, auth, sgp_server_id, &cache_key, depth, &mut progress).await;
 
-    let games = match loaded {
+    let mut games = match loaded {
         Ok(games) => games,
         Err(error) => {
-            if let Some(games) =
+            if let Some(mut games) =
                 read_db_cached_games(&cache_key, depth).filter(|games| !games.is_empty())
             {
-                let response = analyze_games(summoner, depth, games);
+                attach_carry_stats_batch(&mut games, lcu, auth, sgp_server_id).await;
+                let mut response = analyze_games(summoner, depth, games);
+                response = merge_carry_from_game_cache(response);
                 write_db_cached_stats(&cache_key, &response);
                 store_cached_stats(cache_key.clone(), &response);
                 return Ok(response);
@@ -338,14 +623,16 @@ where
                 if !progress(depth, depth) {
                     return Err(super::error::AppError::Cancelled);
                 }
-                return Ok(cached);
+                return Ok(merge_carry_from_game_cache(cached));
             }
 
             return Err(error);
         }
     };
 
-    let response = analyze_games(summoner, depth, games);
+    attach_carry_stats_batch(&mut games, lcu, auth, sgp_server_id).await;
+    let mut response = analyze_games(summoner, depth, games);
+    response = merge_carry_from_game_cache(response);
     write_db_cached_stats(&cache_key, &response);
     store_cached_stats(cache_key, &response);
     Ok(response)
@@ -1136,6 +1423,11 @@ fn analyze_games(summoner: SummonerInfo, depth: usize, games: Vec<Game>) -> Play
         entry.team_total_damage_taken += team_totals.total_damage_taken as u64;
         entry.total_heal += participant.stats.total_heal as u64;
         entry.team_total_heal += team_totals.total_heal as u64;
+        entry.total_damage_shielded_on_teammates += participant
+            .stats
+            .total_damage_shielded_on_teammates as u64;
+        entry.team_total_damage_shielded_on_teammates += team_totals
+            .total_damage_shielded_on_teammates as u64;
         entry.last_played_at = entry.last_played_at.max(game.game_creation);
 
         recent_games.push(participant_to_recent_game(&game, participant));
@@ -1281,6 +1573,8 @@ fn eog_to_game(eog: serde_json::Value) -> Option<Game> {
                     team_id,
                     stats,
                     timeline,
+                    carry_kills: 0,
+                    carry_assists: 0,
                 });
             }
         }
@@ -1303,6 +1597,42 @@ fn eog_to_game(eog: serde_json::Value) -> Option<Game> {
         participants,
         teams: game_teams,
     })
+}
+
+/// 若某局已在 GAME_CACHE 中 attach 过切C数据，用其覆盖 recent_games 中的评分原始数据。
+fn merge_carry_from_game_cache(mut response: PlayerStatsResponse) -> PlayerStatsResponse {
+    let Ok(cache) = GAME_CACHE.lock() else {
+        return response;
+    };
+    for game in &mut response.recent_games {
+        let Some(cached) = cache.get(&game.game_id) else {
+            continue;
+        };
+        let Some(participant) = cached
+            .participants
+            .iter()
+            .find(|candidate| {
+                candidate.champion_id == game.champion_id
+                    && candidate.team_id == game.team_id
+            })
+        else {
+            continue;
+        };
+        if participant.carry_kills == game.carry_kills
+            && participant.carry_assists == game.carry_assists
+        {
+            continue;
+        }
+        game.carry_kills = participant.carry_kills;
+        game.carry_assists = participant.carry_assists;
+        game.team_carry_kills = cached
+            .participants
+            .iter()
+            .filter(|candidate| same_stat_team(cached, participant, candidate))
+            .map(|candidate| candidate.carry_kills)
+            .sum();
+    }
+    response
 }
 
 fn participant_to_recent_game(game: &Game, participant: &Participant) -> RecentGame {
@@ -1396,12 +1726,22 @@ fn participant_to_recent_game(game: &Game, participant: &Participant) -> RecentG
         team_total_damage_taken: team_totals.total_damage_taken,
         total_heal: participant.stats.total_heal,
         team_total_heal: team_totals.total_heal,
+        total_damage_shielded_on_teammates: participant.stats.total_damage_shielded_on_teammates,
+        team_total_damage_shielded_on_teammates: team_totals.total_damage_shielded_on_teammates,
         team_gold_earned: team_totals.gold_earned,
         game_gold_earned: game_totals.gold_earned,
         enemy_champion_immobilizations: participant.stats.enemy_champion_immobilizations,
         team_enemy_champion_immobilizations: team_totals.enemy_champion_immobilizations,
         immobilize_and_kill_with_ally: participant.stats.immobilize_and_kill_with_ally,
         team_immobilize_and_kill_with_ally: team_totals.immobilize_and_kill_with_ally,
+        carry_kills: participant.carry_kills,
+        carry_assists: participant.carry_assists,
+        team_carry_kills: game
+            .participants
+            .iter()
+            .filter(|candidate| same_stat_team(game, participant, candidate))
+            .map(|candidate| candidate.carry_kills)
+            .sum(),
         game_creation: game.game_creation,
         game_duration: game.game_duration,
     }
@@ -1483,7 +1823,11 @@ fn champion_accumulator_to_stat(c: ChampionAccumulator, total_games: usize) -> C
             c.team_damage_self_mitigated
                 .saturating_add(c.team_total_damage_taken),
         ),
-        healing_share: ratio_u64(c.total_heal, c.team_total_heal),
+        healing_share: ratio_u64(
+            c.total_heal.saturating_add(c.total_damage_shielded_on_teammates),
+            c.team_total_heal
+                .saturating_add(c.team_total_damage_shielded_on_teammates),
+        ),
         gold_share,
         last_played_at: c.last_played_at,
     }
@@ -1519,6 +1863,9 @@ fn team_totals_for_participant(game: &Game, participant: &Participant) -> TeamTo
             totals.damage_self_mitigated += candidate.stats.damage_self_mitigated;
             totals.total_damage_taken += candidate.stats.total_damage_taken;
             totals.total_heal += candidate.stats.total_heal;
+            totals.total_damage_shielded_on_teammates += candidate
+                .stats
+                .total_damage_shielded_on_teammates;
             totals.enemy_champion_immobilizations += candidate.stats.enemy_champion_immobilizations;
             totals.immobilize_and_kill_with_ally += candidate.stats.immobilize_and_kill_with_ally;
             totals.kills += candidate.stats.kills;
@@ -1536,6 +1883,9 @@ fn game_totals(game: &Game) -> TeamTotals {
             totals.damage_self_mitigated += participant.stats.damage_self_mitigated;
             totals.total_damage_taken += participant.stats.total_damage_taken;
             totals.total_heal += participant.stats.total_heal;
+            totals.total_damage_shielded_on_teammates += participant
+                .stats
+                .total_damage_shielded_on_teammates;
             totals.enemy_champion_immobilizations +=
                 participant.stats.enemy_champion_immobilizations;
             totals.immobilize_and_kill_with_ally += participant.stats.immobilize_and_kill_with_ally;
@@ -1600,7 +1950,7 @@ fn game_accolades_for_participant(
         .unwrap_or(0);
     let team_healing_max = team_participants
         .iter()
-        .map(|candidate| candidate.stats.total_heal)
+        .map(|candidate| candidate.stats.total_heal + candidate.stats.total_damage_shielded_on_teammates)
         .max()
         .unwrap_or(0);
     let team_gold_max = team_participants
@@ -1623,7 +1973,10 @@ fn game_accolades_for_participant(
             participant_mitigation_value(participant),
             team_mitigation_max,
         ),
-        team_healing_leader: is_u32_leader(participant.stats.total_heal, team_healing_max),
+        team_healing_leader: is_u32_leader(
+            participant.stats.total_heal + participant.stats.total_damage_shielded_on_teammates,
+            team_healing_max,
+        ),
         team_damage_conversion_leader: team_damage_conversion_max > 0.0
             && my_damage_conversion >= team_damage_conversion_max,
         team_gold_leader: is_u32_leader(participant.stats.gold_earned, team_gold_max),

@@ -9,6 +9,7 @@ import type { ChampionSummaryItem, GameAssetBundle, GameAssetEntry, MatchDetailP
 import { championName, fixed, mitigationValue, teamMitigationValue } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
+import ChampionDetailDrawer from "./ChampionDetailDrawer.vue"
 import PlayerRadarPanel from "./PlayerRadarPanel.vue"
 
 const props = defineProps<{
@@ -63,6 +64,12 @@ function winRate(r: { wins: number; gamesPlayed: number }) { return r.wins / r.g
 /* ── detail view helpers ── */
 function kNumber(value: number) { return `${(value / 1000).toFixed(1)}k` }
 function shareSuffix(part: number, total: number) { return `(${total > 0 ? Math.round(part / total * 100) : 0}%)` }
+function protectionValue(game: RecentGame) {
+  return (game.totalHeal || 0) + (game.totalDamageShieldedOnTeammates || 0)
+}
+function teamProtectionValue(game: RecentGame) {
+  return (game.teamTotalHeal || 0) + (game.teamTotalDamageShieldedOnTeammates || 0)
+}
 function detailTeamSummary(team: { players: MatchDetailPlayer[]; towerKills?: number }) {
   return matchTeamSummary(team as Parameters<typeof matchTeamSummary>[0])
 }
@@ -209,7 +216,7 @@ const enrichedGames = computed<GameEnriched[]>(() => {
         win: p.win,
         damageDealtToChampions: p.damageToChampions || 0,
         totalDamageTaken: p.totalDamageTaken || 0,
-        totalHeal: p.totalHeal || 0,
+        totalHeal: (p.totalHeal || 0) + (p.totalDamageShieldedOnTeammates || 0),
         teamDamageToChampions: p.teamDamageToChampions || 0,
         teamTotalDamageTaken: p.teamTotalDamageTaken || 0,
         teamDamageSelfMitigated: p.damageSelfMitigated || 0,
@@ -604,6 +611,21 @@ const augmentStat = computed<AugmentStatEntry[]>(() => {
 
 const statHasData = computed(() => championStat.value.length > 0 || augmentStat.value.length > 0)
 
+const drawerChampionId = ref<number | null>(null)
+const drawerGames = computed(() => visibleGames.value)
+const drawerChampionMeta = computed(() => {
+  const id = drawerChampionId.value
+  const entry = id != null ? championStat.value.find((c) => c.championId === id) : null
+  return entry ? entry : null
+})
+
+function openChampionDrawer(championId: number) {
+  drawerChampionId.value = championId
+}
+function closeChampionDrawer() {
+  drawerChampionId.value = null
+}
+
 const championSort = ref<"picks" | "winRate" | "name">("picks")
 const championSortDir = ref<"asc" | "desc">("desc")
 const augmentSort = ref<"picks" | "winRate">("picks")
@@ -859,7 +881,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                   <span>伤害</span>
                   <span>经济</span>
                   <span>承伤</span>
-                  <span>治疗</span>
+                  <span>治疗/护盾</span>
                   <span>伤转</span>
                   <span>评分</span>
                 </div>
@@ -923,6 +945,9 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 
                     <div class="kda-cell">
                       <strong>{{ p.kills }}/{{ p.deaths }}/{{ p.assists }}</strong>
+                      <span v-if="p.carryKills > 0 || p.carryAssists > 0" class="carry-chip" :title="`切C：击杀敌方C位 ${p.carryKills} 次，参与 ${p.carryAssists} 次助攻（本队对C位总击杀 ${p.teamCarryKills}）`">
+                        切C {{ p.carryKills }}/{{ p.carryAssists }}
+                      </span>
                     </div>
 
                     <div class="stat-cell">
@@ -945,7 +970,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 
                     <div class="stat-cell">
                       <strong :class="{ leader: detailStatLeader(p, 'healing') }">
-                        {{ kNumber(p.totalHeal) }}<em>{{ shareSuffix(p.totalHeal, p.teamTotalHeal) }}</em>
+                        {{ kNumber(protectionValue(p)) }}<em>{{ shareSuffix(protectionValue(p), teamProtectionValue(p)) }}</em>
                       </strong>
                     </div>
 
@@ -1039,7 +1064,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                 <th class="col-ability sortable" @click="sortBy('support')">辅助{{ sortIcon('support') }}</th>
                 <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('damageShare')">伤害%{{ sortIcon('damageShare') }}</th>
                 <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('mitigationShare')">承伤%{{ sortIcon('mitigationShare') }}</th>
-                <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('healingShare')">治疗%{{ sortIcon('healingShare') }}</th>
+                <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('healingShare')">治疗/护盾%{{ sortIcon('healingShare') }}</th>
                 <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('damageConversion')">转化{{ sortIcon('damageConversion') }}</th>
                 <th class="col-tags">标签</th>
                 <th class="col-num sortable" @click="sortBy('highlightGames')">高光{{ sortIcon('highlightGames') }}</th>
@@ -1238,7 +1263,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                     {{ championMinPicks > 0 ? `次数≥${championMinPicks} 过滤后暂无英雄，请调低次数限制` : championSearch ? '搜索无匹配英雄' : '该日期没有英雄记录' }}
                   </td>
                 </tr>
-                <tr v-for="ch in sortedChampionStat" :key="ch.championId">
+                <tr v-for="ch in sortedChampionStat" :key="ch.championId" class="champion-row" @click="openChampionDrawer(ch.championId)">
                   <td class="st-champ">
                     <ChampionAvatar :champion-id="ch.championId" :champions="props.champions" :size="24" />
                     <span class="st-champ-name">{{ ch.name }}</span>
@@ -1324,6 +1349,19 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
           </div>
         </div>
       </div>
+
+      <ChampionDetailDrawer
+        v-if="drawerChampionId != null && drawerChampionMeta"
+        :champion-id="drawerChampionId"
+        :champion-name="drawerChampionMeta.name"
+        :games="drawerGames"
+        :champions="props.champions"
+        :item-map="itemMap"
+        :spell-map="spellMap"
+        :champion-total-picks="drawerChampionMeta.picks"
+        :champion-total-win-rate="drawerChampionMeta.winRate"
+        @close="closeChampionDrawer"
+      />
     </template>
   </div>
 </template>
@@ -1452,6 +1490,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 .text-grid .augment-bronze { border-color: rgba(167, 105, 60, 0.46); color: #e8b48a; background: rgba(122, 67, 35, 0.45); }
 .kda-cell, .stat-cell, .score-cell { display: flex; min-width: 0; align-items: center; justify-content: center; }
 .kda-cell strong { color: #e8e8f0; font-size: 13px; line-height: 1; white-space: nowrap; }
+.kda-cell .carry-chip { margin-top: 2px; padding: 1px 5px; border: 1px solid rgba(251, 146, 60, 0.45); border-radius: 6px; background: rgba(251, 146, 60, 0.12); color: #fdba74; font-size: 10px; font-weight: 800; line-height: 1.2; white-space: nowrap; }
 .stat-cell strong { display: inline-flex; flex-direction: column; align-items: center; gap: 1px; color: #e8e8f0; font-size: 16.5px; line-height: 1; white-space: nowrap; }
 .stat-cell strong.leader, .stat-cell strong.leader em { color: #ff6b6b; font-weight: 900; }
 .stat-cell em { color: #8a989c; font-size: 13.5px; font-style: normal; font-weight: 700; }
@@ -1609,6 +1648,8 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 .stat-table th { position: sticky; top: 0; z-index: 2; background: #17171f; padding: 6px 10px; text-align: left; font-size: 11px; font-weight: 600; color: var(--text-muted, #888); border-bottom: 1px solid var(--border, #333); white-space: nowrap; }
 .stat-table th.sortable { cursor: pointer; user-select: none; }
 .stat-table th.sortable:hover { color: var(--accent, #a5b4fc); }
+.champion-table tbody tr { cursor: pointer; }
+.champion-table tbody tr:hover { background: rgba(99, 102, 241, 0.08); }
 .stat-table td { padding: 5px 10px; border-bottom: 1px solid rgba(255,255,255,0.04); vertical-align: middle; }
 .stat-table tr:last-child td { border-bottom: none; }
 .stat-table .st-champ { min-width: 110px; }
