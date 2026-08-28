@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, ChevronsUpDown, Crown, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
 import { loadTodayCustomGames } from "../api"
 import { matchTeamSummary } from "../matchTeamSummary"
@@ -41,8 +41,8 @@ function toLocalDateStr(ts: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
 }
 function todayDateStr() { return toLocalDateStr(Date.now()) }
-function dateToDayStart(dateStr: string) { return new Date(dateStr + "T00:00:00Z").getTime() }
-function dateToDayEnd(dateStr: string) { return new Date(dateStr + "T23:59:59Z").getTime() }
+function dateToDayStart(dateStr: string) { const [y, m, d] = dateStr.split("-").map(Number); return new Date(y, m - 1, d).getTime() }
+function dateToDayEnd(dateStr: string) { const [y, m, d] = dateStr.split("-").map(Number); return new Date(y, m - 1, d + 1).getTime() }
 
 const startDate = ref(todayDateStr())
 const endDate = ref(todayDateStr())
@@ -50,7 +50,7 @@ const rangeStartMs = computed(() => dateToDayStart(startDate.value))
 const rangeEndMs = computed(() => dateToDayEnd(endDate.value))
 
 const queueNames: Record<number, string> = {
-  0: "自定义", 400: "匹配", 420: "单双排", 430: "匹配", 440: "灵活排", 450: "大乱斗",
+  0: "自定义", 3270: "自定义", 400: "匹配", 420: "单双排", 430: "匹配", 440: "灵活排", 450: "大乱斗",
   700: "Clash", 800: "AI", 820: "AI", 830: "AI", 840: "AI", 850: "AI", 900: "乌迪尔",
   920: "魄罗", 1020: "无限火力", 1300: "涅槃", 1400: "终极魔典", 1700: "斗魂竞技场", 1900: "斗魂",
 }
@@ -58,6 +58,7 @@ function queueLabel(qid: number) { return queueNames[qid] ?? `队列${qid}` }
 
 function abilityClass(s: number) { return s >= 80 ? "ab-high" : s >= 60 ? "ab-mid" : "ab-low" }
 function scoreClass(s: number) { return s >= 80 ? "sc-high" : s >= 60 ? "sc-mid" : "sc-low" }
+function kdaClass(s: number) { return s >= 4 ? "sc-high" : s >= 2.5 ? "sc-mid" : "sc-low" }
 function kdaScore(k: number, d: number, a: number) { return Math.round((k + a) / Math.max(d, 0.5) * 10) / 10 }
 function winRate(r: { wins: number; gamesPlayed: number }) { return r.wins / r.gamesPlayed * 100 }
 
@@ -127,7 +128,7 @@ interface PlayerRating {
 interface PlayerGameRecord {
   gameId: number; championId: number
   kills: number; deaths: number; assists: number; win: boolean
-  gameDuration: number; damageShare: number; mitigationShare: number
+  gameDuration: number; damageShare: number; mitigationShare: number; score: number
 }
 
 interface GamePlayerEnriched {
@@ -147,12 +148,36 @@ interface GameEnriched {
 }
 
 /* ── state ── */
-const deletedGameIds = ref<Set<number>>(new Set())
+const DELETED_GAME_IDS_KEY = "lol-stats:crp:deleted-game-ids:v1"
+function readDeletedGameIds(): Set<number> {
+  try {
+    const raw = localStorage.getItem(DELETED_GAME_IDS_KEY)
+    if (!raw) return new Set()
+    const arr = JSON.parse(raw)
+    return new Set(Array.isArray(arr) ? arr.filter((id: unknown) => typeof id === "number") : [])
+  } catch {
+    return new Set()
+  }
+}
+function persistDeletedGameIds() {
+  try {
+    localStorage.setItem(DELETED_GAME_IDS_KEY, JSON.stringify([...deletedGameIds.value]))
+  } catch {
+    // 忽略持久化失败
+  }
+}
+const deletedGameIds = ref<Set<number>>(readDeletedGameIds())
 
 function deleteGame(gameId: number) {
   const s = new Set(deletedGameIds.value)
   s.add(gameId)
   deletedGameIds.value = s
+  persistDeletedGameIds()
+}
+
+function restoreDeletedGames() {
+  deletedGameIds.value = new Set()
+  persistDeletedGameIds()
 }
 
 const customOnly = ref(true)
@@ -212,7 +237,7 @@ const enrichedGames = computed<GameEnriched[]>(() => {
       const players = team.players.map((p) => ({
         puuid: p.puuid, gameName: p.gameName, championId: p.championId,
         kills: p.kills, deaths: p.deaths, assists: p.assists,
-        gameScore: kdaScore(p.kills, p.deaths, p.assists),
+        gameScore: calculateOutputRating(p, ratingContext.value).score,
         win: p.win,
         damageDealtToChampions: p.damageToChampions || 0,
         totalDamageTaken: p.totalDamageTaken || 0,
@@ -229,7 +254,7 @@ const enrichedGames = computed<GameEnriched[]>(() => {
     const tags: string[] = []
     if (game.gameDuration < 900) tags.push("速推局")
     if (game.gameDuration > 1440) tags.push("拉锯局")
-    if (teams.length === 2 && Math.abs(teams[0].avgScore - teams[1].avgScore) > 15) tags.push("碾压局")
+    if (teams.length === 2 && Math.abs(teams[0].avgScore - teams[1].avgScore) >= 12) tags.push("碾压局")
     return {
       gameId: game.gameId, queueId: game.queueId, gameDuration: game.gameDuration,
       gameMode: game.gameMode, teams, mvp, mvpName: mvp?.gameName || "",
@@ -250,7 +275,9 @@ const summaryStats = computed(() => {
   if (!ratings.length) return null
   const totalGames = enrichedGames.value.length
   const totalPlayers = ratings.length
-  const avgWinRate = ratings.reduce((s, r) => s + winRate(r), 0) / totalPlayers
+  const totalWins = ratings.reduce((s, r) => s + r.wins, 0)
+  const totalGamesPlayed = ratings.reduce((s, r) => s + r.gamesPlayed, 0)
+  const avgWinRate = totalGamesPlayed > 0 ? (totalWins / totalGamesPlayed) * 100 : 0
   const avgOverallScore = ratings.reduce((s, r) => s + r.profile.overallScore, 0) / totalPlayers
   const avgKdaScore = ratings.reduce((s, r) => s + r.overallKdaScore, 0) / totalPlayers
 
@@ -475,7 +502,7 @@ const playerRatings = computed<PlayerRating[]>(() => {
       const dmgShare = (r.damageToChampions || 0) / Math.max(r.teamDamageToChampions || 0, 1)
       const mitVal = (r.totalDamageTaken || 0) + (r.damageSelfMitigated || 0)
       const mitShare = mitVal / Math.max((r.teamTotalDamageTaken || 0) + (r.teamDamageSelfMitigated || 0), 1)
-      return { gameId: r.gameId, championId: r.championId, kills: r.kills, deaths: r.deaths, assists: r.assists, win: r.win, gameDuration: r.gameDuration, damageShare: dmgShare, mitigationShare: mitShare }
+      return { gameId: r.gameId, championId: r.championId, kills: r.kills, deaths: r.deaths, assists: r.assists, win: r.win, gameDuration: r.gameDuration, damageShare: dmgShare, mitigationShare: mitShare, score: calculateOutputRating(r, ctx).score }
     })
     ratings.push({
       puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine,
@@ -483,8 +510,8 @@ const playerRatings = computed<PlayerRating[]>(() => {
       profile, recentChampionIds: entry.records.map((r) => r.championId), championProfiles, gameRecords,
       avgKills: avgK, avgDeaths: avgD, avgAssists: avgA,
       overallKdaScore: kdaScore(avgK, avgD, avgA),
-      highlightGames: Math.round(profile.highlightRate * n),
-      disasterGames: Math.round(profile.disasterRate * n),
+      highlightGames: gameRecords.filter((r) => r.score >= 80).length,
+      disasterGames: gameRecords.filter((r) => r.score < 60).length,
       damageLeaderCount: lead.damage, mitigationLeaderCount: lead.mitigation, assistLeaderCount: lead.assist,
       leaderGameIds: { damage: lead.damageGames, mitigation: lead.mitigationGames, assist: lead.assistGames },
     })
@@ -495,7 +522,7 @@ const playerRatings = computed<PlayerRating[]>(() => {
 /* ── load ── */
 async function load() {
   loading.value = true; error.value = ""
-  deletedGameIds.value = new Set()
+  // 保留 localStorage 中已删除的对局，不清空
   data.value = null
   try {
     data.value = await loadTodayCustomGames(rangeStartMs.value, rangeEndMs.value)
@@ -608,6 +635,92 @@ const augmentStat = computed<AugmentStatEntry[]>(() => {
   }
   return [...map.values()].sort((a, b) => b.picks - a.picks)
 })
+
+/* ── 玩家组队搭档统计模块 ── */
+interface TeammatePairRow {
+  puuid: string
+  gameName: string
+  games: number
+  wins: number
+  winRate: number
+}
+
+const teamSectionVisible = ref(false)
+const teamMode = ref<"teammate" | "opponent">("teammate")
+const targetPuuid = ref("")
+const teamMinGames = ref(0)
+const teamMinGamesText = ref("")
+function applyTeamMinGames() {
+  const v = parseInt(teamMinGamesText.value, 10)
+  teamMinGames.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+
+const teamPlayers = computed(() => {
+  const map = new Map<string, { puuid: string; gameName: string; games: number; wins: number }>()
+  for (const game of visibleGames.value) {
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        const e = map.get(p.puuid)
+        if (e) { e.games++; if (p.win) e.wins++ }
+        else map.set(p.puuid, { puuid: p.puuid, gameName: p.gameName, games: 1, wins: p.win ? 1 : 0 })
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => b.games - a.games || a.gameName.localeCompare(b.gameName))
+})
+
+const teamTarget = computed(() => teamPlayers.value.find((p) => p.puuid === targetPuuid.value) || teamPlayers.value[0] || null)
+
+const targetStat = computed(() => {
+  const target = teamTarget.value
+  if (!target) return null
+  return { ...target, winRate: target.games ? (target.wins / target.games) * 100 : 0 }
+})
+
+const teamPairRows = computed<TeammatePairRow[]>(() => {
+  const target = teamTarget.value
+  if (!target) return []
+  const map = new Map<string, TeammatePairRow>()
+  for (const game of visibleGames.value) {
+    const myTeam = game.teams.find((t) => t.players.some((p) => p.puuid === target.puuid))
+    if (!myTeam) continue
+    const myWin = myTeam.win
+    for (const team of game.teams) {
+      const isMate = team.teamId === myTeam.teamId
+      if (teamMode.value === "teammate" && !isMate) continue
+      if (teamMode.value === "opponent" && isMate) continue
+      for (const p of team.players) {
+        if (p.puuid === target.puuid) continue
+        const e = map.get(p.puuid)
+        if (e) { e.games++; if (myWin) e.wins++ }
+        else map.set(p.puuid, { puuid: p.puuid, gameName: p.gameName, games: 1, wins: myWin ? 1 : 0, winRate: 0 })
+      }
+    }
+  }
+  const rows = [...map.values()]
+  for (const r of rows) r.winRate = r.games ? (r.wins / r.games) * 100 : 0
+  return rows
+})
+
+const teamQualifiedRows = computed(() => {
+  const mp = teamMinGames.value
+  return teamPairRows.value.filter((r) => mp <= 0 || r.games >= mp)
+})
+
+watch(targetStat, (target) => {
+  if (!targetPuuid.value || !teamPlayers.value.some((p) => p.puuid === targetPuuid.value)) {
+    targetPuuid.value = target?.puuid || ""
+  }
+})
+
+const teamSortedRows = computed(() => [...teamQualifiedRows.value].sort((a, b) => b.winRate - a.winRate || b.games - a.games || a.gameName.localeCompare(b.gameName)))
+const teamSampleInsufficient = computed(() => {
+  const mp = teamMinGames.value
+  if (mp <= 0) return 0
+  return teamPairRows.value.filter((r) => r.games < mp).length
+})
+
+function switchTeamTarget(puuid: string) { targetPuuid.value = puuid }
 
 const statHasData = computed(() => championStat.value.length > 0 || augmentStat.value.length > 0)
 
@@ -731,6 +844,10 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
           <component :is="minDuration8 ? Check : X" :size="16" />
           <span style="font-size:13px">>8min</span>
         </button>
+        <button v-if="deletedGameIds.size > 0" class="toggle-sub" @click="restoreDeletedGames" title="恢复已删除的对局" style="min-width:72px">
+          <X :size="14" />
+          <span style="font-size:13px">已删除 {{ deletedGameIds.size }} 局 · 恢复</span>
+        </button>
         <button class="primary-action" @click="load" :disabled="loading">
           <RefreshCw v-if="loading" class="spin" :size="16" />
           <RefreshCw v-else :size="16" />
@@ -750,7 +867,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
           <div class="summary-item"><span class="sl">总人数</span><span class="sv">{{ summaryStats.totalPlayers }}</span></div>
           <div class="summary-item"><span class="sl">平均胜率</span><span class="sv" :class="summaryStats.avgWinRate >= 50 ? 'ab-high' : 'ab-low'">{{ summaryStats.avgWinRate.toFixed(0) }}%</span></div>
           <div class="summary-item"><span class="sl">均分</span><span class="sv" :class="scoreClass(summaryStats.avgOverallScore)">{{ summaryStats.avgOverallScore.toFixed(1) }}</span></div>
-          <div class="summary-item"><span class="sl">平均KDA分</span><span class="sv" :class="scoreClass(summaryStats.avgKdaScore)">{{ summaryStats.avgKdaScore.toFixed(0) }}</span></div>
+          <div class="summary-item"><span class="sl">平均KDA</span><span class="sv" :class="kdaClass(summaryStats.avgKdaScore)">{{ summaryStats.avgKdaScore.toFixed(1) }}</span></div>
           <div class="summary-item"><span class="sl">🔵 蓝方胜</span><span class="sv" style="color:#60a5fa">{{ summaryStats.blueWins }}</span></div>
           <div class="summary-item"><span class="sl">🔴 红方胜</span><span class="sv" style="color:#f87171">{{ summaryStats.redWins }}</span></div>
         </div>
@@ -857,7 +974,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                 <ChevronDown v-if="!expandedGames.has(game.gameId)" :size="14" />
                 <ChevronUp v-else :size="14" />
               </button>
-              <button class="game-delete-btn" @click.stop="deleteGame(game.gameId)" title="临时删除此局">
+              <button class="game-delete-btn" @click.stop="deleteGame(game.gameId)" title="删除此局">
                 <X :size="12" />
               </button>
             </div>
@@ -1058,7 +1175,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                 <th class="col-num-sortable sortable" @click="sortBy('winRate')">胜率{{ sortIcon('winRate') }}</th>
                 <th class="col-num sortable" @click="sortBy('avgKills')">击杀{{ sortIcon('avgKills') }}</th>
                 <th class="col-num sortable" @click="sortBy('avgDeaths')">死亡{{ sortIcon('avgDeaths') }}</th>
-                <th class="col-kda sortable" @click="sortBy('kdaScore')">KDA分{{ sortIcon('kdaScore') }}</th>
+                <th class="col-kda sortable" @click="sortBy('kdaScore')">KDA{{ sortIcon('kdaScore') }}</th>
                 <th class="col-ability sortable" @click="sortBy('carry')">输出{{ sortIcon('carry') }}</th>
                 <th class="col-ability sortable" @click="sortBy('frontline')">前排{{ sortIcon('frontline') }}</th>
                 <th class="col-ability sortable" @click="sortBy('support')">辅助{{ sortIcon('support') }}</th>
@@ -1104,7 +1221,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                 <td class="col-num wr-cell" :class="winRate(rating) >= 50 ? 'wr-high' : 'wr-low'">{{ winRate(rating).toFixed(0) }}%</td>
                 <td class="col-num" :class="cellExtreme(rating.puuid, 'avgKills')">{{ rating.avgKills.toFixed(1) }}</td>
                 <td class="col-num" :class="cellExtreme(rating.puuid, 'avgDeaths')">{{ rating.avgDeaths.toFixed(1) }}</td>
-                <td class="col-num" :class="cellExtreme(rating.puuid, 'overallKdaScore')"><span :class="scoreClass(rating.overallKdaScore)">{{ rating.overallKdaScore }}</span></td>
+                <td class="col-num" :class="cellExtreme(rating.puuid, 'overallKdaScore')"><span :class="kdaClass(rating.overallKdaScore)">{{ rating.overallKdaScore }}</span></td>
                 <td class="col-ability" :class="cellExtreme(rating.puuid, 'carry')"><span :class="abilityClass(rating.profile.abilities.carry.averageScore)">{{ rating.profile.abilities.carry.averageScore.toFixed(0) }}</span></td>
                 <td class="col-ability" :class="cellExtreme(rating.puuid, 'frontline')"><span :class="abilityClass(rating.profile.abilities.frontline.averageScore)">{{ rating.profile.abilities.frontline.averageScore.toFixed(0) }}</span></td>
                 <td class="col-ability" :class="cellExtreme(rating.puuid, 'support')"><span :class="abilityClass(rating.profile.abilities.support.averageScore)">{{ rating.profile.abilities.support.averageScore.toFixed(0) }}</span></td>
@@ -1136,7 +1253,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
             <div class="rhc-row"><span class="rhc-l">综合评分</span><span class="rhc-v" :class="scoreClass(hoveredPlayer.profile.overallScore)">{{ hoveredPlayer.profile.overallScore.toFixed(1) }}</span><span class="rhc-l">中位数</span><span class="rhc-v">{{ hoveredPlayer.profile.medianScore.toFixed(1) }}</span></div>
             <div class="rhc-row"><span class="rhc-l">波动率</span><span class="rhc-v">{{ hoveredPlayer.profile.volatility.toFixed(1) }}</span><span class="rhc-l">高光率</span><span class="rhc-v sc-high">{{ (hoveredPlayer.profile.highlightRate * 100).toFixed(0) }}%</span><span class="rhc-l">战犯率</span><span class="rhc-v sc-low">{{ (hoveredPlayer.profile.disasterRate * 100).toFixed(0) }}%</span></div>
             <div class="rhc-divider"></div>
-            <div class="rhc-row"><span class="rhc-l">KDA</span><span class="rhc-v">{{ hoveredPlayer.avgKills.toFixed(1) }} / {{ hoveredPlayer.avgDeaths.toFixed(1) }} / {{ hoveredPlayer.avgAssists.toFixed(1) }}</span><span class="rhc-l">KDA分</span><span class="rhc-v" :class="scoreClass(hoveredPlayer.overallKdaScore)">{{ hoveredPlayer.overallKdaScore }}</span></div>
+            <div class="rhc-row"><span class="rhc-l">KDA</span><span class="rhc-v">{{ hoveredPlayer.avgKills.toFixed(1) }} / {{ hoveredPlayer.avgDeaths.toFixed(1) }} / {{ hoveredPlayer.avgAssists.toFixed(1) }}</span><span class="rhc-l">KDA</span><span class="rhc-v" :class="kdaClass(hoveredPlayer.overallKdaScore)">{{ hoveredPlayer.overallKdaScore }}</span></div>
             <div class="rhc-row"><span class="rhc-l">场均击杀</span><span class="rhc-v">{{ hoveredPlayer.avgKills.toFixed(1) }}</span><span class="rhc-l">场均死亡</span><span class="rhc-v">{{ hoveredPlayer.avgDeaths.toFixed(1) }}</span></div>
             <div class="rhc-divider"></div>
             <div class="rhc-row"><span class="rhc-l">标签</span><span class="rhc-tags"><span v-for="tag in hoveredPlayer.profile.tags" :key="tag" class="mini-tag">{{ tag }}</span></span></div>
@@ -1192,6 +1309,84 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 
       <!-- ═══════════════ PLAYER RADAR ═══════════════ -->
       <PlayerRadarPanel v-if="playerRatings.length > 0" :players="playerRatings" />
+
+      <!-- ═══════════════ 玩家组队搭档统计 ═══════════════ -->
+      <div v-if="teamPlayers.length" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="teamSectionVisible = !teamSectionVisible">
+            <component :is="teamSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">玩家组队搭档统计</span>
+            <span class="stat-subtitle">{{ targetStat?.gameName || '' }} · {{ teamMode === 'teammate' ? '搭档胜率' : '对位胜率' }}</span>
+          </div>
+          <div v-show="teamSectionVisible" class="stat-section-body">
+            <div class="stat-header">
+              <select v-model="targetPuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;" title="选择要分析的玩家">
+                <option v-for="p in teamPlayers" :key="p.puuid" :value="p.puuid">{{ p.gameName }}（{{ p.games }}场）</option>
+              </select>
+              <button class="toggle-sub" :class="{ active: teamMode === 'teammate' }" @click="teamMode = 'teammate'">
+                <component :is="teamMode === 'teammate' ? Check : X" :size="14" />
+                <span>搭档</span>
+              </button>
+              <button class="toggle-sub" :class="{ active: teamMode === 'opponent' }" @click="teamMode = 'opponent'">
+                <component :is="teamMode === 'opponent' ? Check : X" :size="14" />
+                <span>对位</span>
+              </button>
+              <div class="toggle-sub min-games-input" :class="{ active: teamMinGames > 0 }" title="只统计共同出场场次≥该值的玩家，留空为不限">
+                <span style="font-size:13px">共同场次≥</span>
+                <input
+                  v-model="teamMinGamesText"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="不限"
+                  class="min-games-input-box"
+                  @change="applyTeamMinGames"
+                  @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+                />
+              </div>
+              <span v-if="teamSampleInsufficient > 0" class="stat-subtitle" style="color:#f87171">样本场次不足{{ teamSampleInsufficient }}人，不计入排名</span>
+            </div>
+            <div v-if="targetStat" class="stat-header" style="margin-top:8px">
+              <span class="stat-subtitle">
+                <b style="color:#a5b4fc">{{ targetStat.gameName }}</b> 全局 {{ targetStat.wins }} 胜 / {{ targetStat.games }} 场 · 总胜率
+                <b :class="winRateClass(targetStat.winRate)">{{ targetStat.winRate.toFixed(0) }}%</b>
+              </span>
+            </div>
+            <div class="stat-table-scroll" style="max-height: 320px">
+              <table class="stat-table champion-table">
+                <thead>
+                  <tr>
+                    <th class="st-champ">{{ teamMode === 'teammate' ? '搭档' : '对手' }}</th>
+                    <th class="st-num" style="text-align:center">{{ teamMode === 'teammate' ? '共同场次' : '交手场次' }}</th>
+                    <th class="st-num" style="text-align:center">胜场</th>
+                    <th class="st-num" style="text-align:center">胜率</th>
+                    <th class="st-player">排名</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="teamQualifiedRows.length === 0">
+                    <td colspan="5" class="empty-table-row">没有满足条件的{{ teamMode === 'teammate' ? '搭档' : '对手' }}记录{{ teamSampleInsufficient > 0 ? '（样本场次不足，不计入排名）' : '' }}</td>
+                  </tr>
+                  <template v-if="teamQualifiedRows.length">
+                    <tr v-for="(r, i) in teamSortedRows" :key="r.puuid" @click="switchTeamTarget(r.puuid)">
+                      <td class="st-champ"><span class="st-champ-name">{{ r.gameName }}</span></td>
+                      <td class="st-num" style="text-align:center">{{ r.games }}</td>
+                      <td class="st-num" style="text-align:center">{{ r.wins }}</td>
+                      <td class="st-num" style="text-align:center"><span :class="winRateClass(r.winRate)">{{ r.winRate.toFixed(0) }}%</span></td>
+                      <td class="st-player">
+                        <span class="st-pick" :class="{ 'sc-high': i === 0 }">全榜第 {{ i + 1 }}</span>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="stat-header" style="margin-top:6px">
+              <span class="stat-subtitle">点击玩家名切换目标玩家 · {{ teamMinGames > 0 ? '仅统计共同出场≥' + teamMinGames + '场' : '不限场次' }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <!-- ═══════════════ 英雄 / 海克斯统计 ═══════════════ -->
       <div v-if="statHasData" class="stat-module">
