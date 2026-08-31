@@ -5,6 +5,7 @@ mod services;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::app_version,
             commands::accept_ready_check,
@@ -12,6 +13,7 @@ pub fn run() {
             commands::check_app_update,
             commands::connection_status,
             commands::copy_png_to_clipboard,
+            commands::save_export_file,
             commands::dismiss_end_of_game,
             commands::get_chat_status,
             commands::get_game_settings_locked,

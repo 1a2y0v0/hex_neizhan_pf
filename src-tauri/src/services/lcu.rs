@@ -408,6 +408,8 @@ fn game_asset_entry_from_value(value: serde_json::Value) -> Option<GameAssetEntr
         ),
         rarity: read_rarity_field(&value),
         categories: read_string_vec_field(&value, "categories"),
+        from: read_u32_vec_field(&value, "from"),
+        to: read_u32_vec_field(&value, "to"),
         price: read_u32_field(&value, "price").unwrap_or_default(),
         price_total: read_u32_field(&value, "priceTotal").unwrap_or_default(),
         in_store: read_bool_field(&value, "inStore"),
@@ -448,6 +450,23 @@ fn read_string_vec_field(value: &serde_json::Value, field: &str) -> Vec<String> 
             items
                 .iter()
                 .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_u32_vec_field(value: &serde_json::Value, field: &str) -> Vec<u32> {
+    value
+        .get(field)
+        .and_then(|raw| raw.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .or_else(|| item.as_str()?.parse::<u32>().ok())
+                })
                 .collect()
         })
         .unwrap_or_default()

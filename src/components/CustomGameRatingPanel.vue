@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue"
-import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, ChevronsUpDown, Crown, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
-import { loadTodayCustomGames } from "../api"
+import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, ChevronsUpDown, Crown, Download, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
+import { loadTodayCustomGames, saveExportFile } from "../api"
+import { save } from "@tauri-apps/plugin-dialog"
+import { toBlob } from "html-to-image"
 import { matchTeamSummary } from "../matchTeamSummary"
 import { buildChampionProfiles, buildPlayerProfile, profileScoreLevel, type ChampionProfile, type PlayerProfile } from "../playerProfile"
 import { calculateOutputRating, outputRatingTitle, scoreEvaluationLabel } from "../scoring"
@@ -61,6 +63,7 @@ function scoreClass(s: number) { return s >= 80 ? "sc-high" : s >= 60 ? "sc-mid"
 function kdaClass(s: number) { return s >= 4 ? "sc-high" : s >= 2.5 ? "sc-mid" : "sc-low" }
 function kdaScore(k: number, d: number, a: number) { return Math.round((k + a) / Math.max(d, 0.5) * 10) / 10 }
 function winRate(r: { wins: number; gamesPlayed: number }) { return r.wins / r.gamesPlayed * 100 }
+function avgValues(values: number[]) { const v = values.filter((x) => Number.isFinite(x)); return v.length ? v.reduce((s, x) => s + x, 0) / v.length : 0 }
 
 /* ── detail view helpers ── */
 function kNumber(value: number) { return `${(value / 1000).toFixed(1)}k` }
@@ -120,6 +123,9 @@ interface PlayerRating {
   recentChampionIds: number[]; championProfiles: ChampionProfile[]
   avgKills: number; avgDeaths: number; avgAssists: number
   overallKdaScore: number; highlightGames: number; disasterGames: number
+  avgGpm: number; avgDpm: number; avgCspm: number; avgKp: number; avgKillShare: number; avgMitigationPerDeath: number
+  honors: Record<string, number>
+  trend: { score: number; win: boolean; gameCreation: number }[]
   damageLeaderCount: number; mitigationLeaderCount: number; assistLeaderCount: number
   leaderGameIds: { damage: number[]; mitigation: number[]; assist: number[] }
   gameRecords: PlayerGameRecord[]
@@ -129,6 +135,7 @@ interface PlayerGameRecord {
   gameId: number; championId: number
   kills: number; deaths: number; assists: number; win: boolean
   gameDuration: number; damageShare: number; mitigationShare: number; score: number
+  gpm: number; dpm: number; cspm: number; kp: number; killShare: number; goldShare: number; mitigationPerDeath: number
 }
 
 interface GamePlayerEnriched {
@@ -228,8 +235,135 @@ const sortColumn = ref<string>("overallScore")
 const sortDirection = ref<"asc" | "desc">("desc")
 const filterText = ref("")
 const showSubColumns = ref(false)
+const showEfficiencyColumns = ref(false)
 const hoveredPlayer = ref<PlayerRating | null>(null)
 
+// image export
+const ratingExportRef = ref<HTMLElement | null>(null)
+const exportMenuOpen = ref(false)
+const exporting = ref(false)
+const exportMessage = ref("")
+
+type ExportPreset = {
+  key: string
+  label: string
+  ext: string
+  type: string
+  ratio: number
+  quality?: number
+}
+
+const exportPresets: ExportPreset[] = [
+  { key: "png2x", label: "PNG · 2x（无损）", ext: "png", type: "image/png", ratio: 2 },
+  { key: "png3x", label: "PNG · 3x（超清）", ext: "png", type: "image/png", ratio: 3 },
+  { key: "jpeg2x", label: "JPEG · 2x（体积小）", ext: "jpg", type: "image/jpeg", ratio: 2, quality: 0.92 },
+  { key: "jpeg3x", label: "JPEG · 3x（清晰）", ext: "jpg", type: "image/jpeg", ratio: 3, quality: 0.9 },
+  { key: "webp2x", label: "WebP · 2x（平衡）", ext: "webp", type: "image/webp", ratio: 2, quality: 0.92 },
+  { key: "webp3x", label: "WebP · 3x（清晰）", ext: "webp", type: "image/webp", ratio: 3, quality: 0.9 },
+]
+
+function exportFileName(preset: ExportPreset) {
+  const range = startDate.value === endDate.value ? startDate.value : `${startDate.value}_${endDate.value}`
+  return `内战玩家评分_${range}_${preset.ratio}x.${preset.ext}`
+}
+
+function ensureExportExtension(path: string, ext: string) {
+  return path.toLowerCase().endsWith(`.${ext}`) ? path : `${path}.${ext}`
+}
+
+function buildExportRoot(): HTMLElement | null {
+  const sourceTable = ratingExportRef.value?.querySelector("table")
+  if (!sourceTable) return null
+
+  const root = document.createElement("div")
+  root.style.cssText = "position:absolute;left:0;top:0;z-index:-1;background:#ffffff;color:#111827;padding:16px;width:max-content;"
+  root.style.fontFamily = getComputedStyle(sourceTable).fontFamily || "system-ui, -apple-system, Microsoft YaHei, sans-serif"
+
+  const title = document.createElement("div")
+  const range = startDate.value === endDate.value ? startDate.value : `${startDate.value} 至 ${endDate.value}`
+  title.textContent = `玩家评分 · ${range}`
+  title.style.cssText = "margin:0 0 12px;font-size:16px;font-weight:700;color:#111827;"
+  root.appendChild(title)
+
+  const table = sourceTable.cloneNode(true) as HTMLElement
+  table.style.width = "auto"
+  table.style.overflow = "visible"
+  table.style.background = "#ffffff"
+  root.appendChild(table)
+
+  const all = root.querySelectorAll<HTMLElement>("*")
+  all.forEach((el) => {
+    el.style.overflow = "visible"
+    el.style.background = "transparent"
+    el.style.color = "#111827"
+    el.style.borderColor = "#d1d5db"
+    el.style.boxShadow = "none"
+    el.style.textShadow = "none"
+  })
+
+  const headers = root.querySelectorAll<HTMLElement>("th")
+  headers.forEach((el) => {
+    el.style.background = "#f3f4f6"
+    el.style.color = "#111827"
+    el.style.borderBottom = "1px solid #9ca3af"
+  })
+
+  const cells = root.querySelectorAll<HTMLElement>("td")
+  cells.forEach((el) => {
+    el.style.background = "#ffffff"
+    el.style.color = "#111827"
+    el.style.borderBottom = "1px solid #e5e7eb"
+  })
+
+  const icons = root.querySelectorAll<HTMLElement>("svg")
+  icons.forEach((el) => {
+    el.style.color = "#111827"
+    el.setAttribute("stroke", "#111827")
+  })
+
+  return root
+}
+
+async function exportRatingImage(preset: ExportPreset) {
+  exportMenuOpen.value = false
+  if (exporting.value) return
+  const exportRoot = buildExportRoot()
+  if (!exportRoot) return
+  exporting.value = true
+  exportMessage.value = "正在生成..."
+  let attached = false
+  try {
+    document.body.appendChild(exportRoot)
+    attached = true
+    await document.fonts?.ready
+    const blob = await toBlob(exportRoot, {
+      type: preset.type,
+      quality: preset.quality,
+      pixelRatio: preset.ratio,
+      backgroundColor: "#ffffff",
+      cacheBust: true,
+    })
+    if (!blob) throw new Error("图片生成失败")
+    const path = await save({
+      title: "导出玩家评分图片",
+      defaultPath: exportFileName(preset),
+      filters: [{ name: preset.label, extensions: [preset.ext] }],
+    })
+    if (!path) {
+      exportMessage.value = ""
+      return
+    }
+    const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
+    await saveExportFile(ensureExportExtension(path, preset.ext), bytes)
+    exportMessage.value = "已导出"
+    window.setTimeout(() => { if (exportMessage.value === "已导出") exportMessage.value = "" }, 3000)
+  } catch (err) {
+    exportMessage.value = `导出失败：${err instanceof Error ? err.message : String(err)}`
+  } finally {
+    if (attached) exportRoot.remove()
+    exporting.value = false
+  }
+}
 /* ── enriched games ── */
 const enrichedGames = computed<GameEnriched[]>(() => {
   return visibleGames.value.map((game) => {
@@ -376,6 +510,12 @@ const filteredAndSortedRatings = computed(() => {
       case "mitigationShare": return cmp(avgChampProp(a.championProfiles, (cp) => cp.averageMitigationShare), avgChampProp(b.championProfiles, (cp) => cp.averageMitigationShare), dir)
       case "healingShare": return cmp(avgChampProp(a.championProfiles, (cp) => cp.averageHealingShare), avgChampProp(b.championProfiles, (cp) => cp.averageHealingShare), dir)
       case "damageConversion": return cmp(avgChampProp(a.championProfiles, (cp) => cp.averageDamageConversion), avgChampProp(b.championProfiles, (cp) => cp.averageDamageConversion), dir)
+      case "gpm": return cmp(a.avgGpm, b.avgGpm, dir)
+      case "dpm": return cmp(a.avgDpm, b.avgDpm, dir)
+      case "cspm": return cmp(a.avgCspm, b.avgCspm, dir)
+      case "kp": return cmp(a.avgKp, b.avgKp, dir)
+      case "killShare": return cmp(a.avgKillShare, b.avgKillShare, dir)
+      case "mitigationPerDeath": return cmp(a.avgMitigationPerDeath, b.avgMitigationPerDeath, dir)
       default: return 0
     }
   })
@@ -419,6 +559,12 @@ const columnExtremes = computed(() => {
     feed("mitigationShare", r.puuid, avgChampProp(r.championProfiles, (cp) => cp.averageMitigationShare))
     feed("healingShare", r.puuid, avgChampProp(r.championProfiles, (cp) => cp.averageHealingShare))
     feed("damageConversion", r.puuid, avgChampProp(r.championProfiles, (cp) => cp.averageDamageConversion))
+    feed("gpm", r.puuid, r.avgGpm)
+    feed("dpm", r.puuid, r.avgDpm)
+    feed("cspm", r.puuid, r.avgCspm)
+    feed("kp", r.puuid, r.avgKp)
+    feed("killShare", r.puuid, r.avgKillShare)
+    feed("mitigationPerDeath", r.puuid, r.avgMitigationPerDeath)
     feed("highlightGames", r.puuid, r.highlightGames)
     feed("disasterGames", r.puuid, r.disasterGames)
     feed("damageLeaderCount", r.puuid, r.damageLeaderCount)
@@ -441,6 +587,8 @@ function cellExtreme(puuid: string, col: string): string {
 
 /* ── player ratings (computed from visible games) ── */
 function leaderInit() { return { damage: 0, mitigation: 0, assist: 0, damageGames: [] as number[], mitigationGames: [] as number[], assistGames: [] as number[] } }
+const honorOrder = ["MVP", "伤害王", "承伤王", "助攻王", "经济王", "KDA王", "控场王"]
+function honorInit() { return { "MVP": 0, "伤害王": 0, "承伤王": 0, "助攻王": 0, "经济王": 0, "KDA王": 0, "控场王": 0 } }
 
 const playerRatings = computed<PlayerRating[]>(() => {
   const raw = data.value
@@ -449,17 +597,26 @@ const playerRatings = computed<PlayerRating[]>(() => {
   if (!games.length) return []
 
   const leaderCounts = new Map<string, ReturnType<typeof leaderInit>>()
+  const honorCounts = new Map<string, Record<string, number>>()
   for (const game of games) {
     const allPlayers = game.teams.flatMap((t) => t.players)
-    let topDamage = -Infinity, topMitigation = -Infinity, topAssist = -Infinity
-    let topDamagePuuid = "", topMitigationPuuid = "", topAssistPuuid = ""
+    let topDamage = -Infinity, topMitigation = -Infinity, topAssist = -Infinity, topGold = -Infinity, topKda = -Infinity, topControl = -Infinity, topMvp = -Infinity
+    let topDamagePuuid = "", topMitigationPuuid = "", topAssistPuuid = "", topGoldPuuid = "", topKdaPuuid = "", topControlPuuid = "", topMvpPuuid = ""
     for (const p of allPlayers) {
       const damageShare = (p.damageToChampions || 0) / Math.max(p.teamDamageToChampions || 0, 1)
       const mitVal = (p.totalDamageTaken || 0) + (p.damageSelfMitigated || 0)
       const mitShare = mitVal / Math.max((p.teamTotalDamageTaken || 0) + (p.teamDamageSelfMitigated || 0), 1)
+      const goldShare = (p.goldEarned || 0) / Math.max(p.teamGoldEarned || 0, 1)
+      const kda = kdaScore(p.kills, p.deaths, p.assists)
+      const control = p.enemyChampionImmobilizations || 0
+      const mvpScore = calculateOutputRating(p, ratingContext.value).score
       if (damageShare > topDamage) { topDamage = damageShare; topDamagePuuid = p.puuid }
       if (mitShare > topMitigation) { topMitigation = mitShare; topMitigationPuuid = p.puuid }
       if ((p.assists || 0) > topAssist) { topAssist = p.assists || 0; topAssistPuuid = p.puuid }
+      if (goldShare > topGold) { topGold = goldShare; topGoldPuuid = p.puuid }
+      if (kda > topKda) { topKda = kda; topKdaPuuid = p.puuid }
+      if (control > topControl) { topControl = control; topControlPuuid = p.puuid }
+      if (mvpScore > topMvp) { topMvp = mvpScore; topMvpPuuid = p.puuid }
     }
     const recordLeader = (puuid: string, key: "damage" | "mitigation" | "assist") => {
       if (!puuid) return
@@ -472,6 +629,19 @@ const playerRatings = computed<PlayerRating[]>(() => {
     recordLeader(topDamagePuuid, "damage")
     recordLeader(topMitigationPuuid, "mitigation")
     recordLeader(topAssistPuuid, "assist")
+    const recordHonor = (puuid: string, honor: string) => {
+      if (!puuid) return
+      if (!honorCounts.has(puuid)) honorCounts.set(puuid, honorInit())
+      const h = honorCounts.get(puuid)!
+      if (honor in h) h[honor]++
+    }
+    recordHonor(topMvpPuuid, "MVP")
+    recordHonor(topDamagePuuid, "伤害王")
+    recordHonor(topMitigationPuuid, "承伤王")
+    recordHonor(topAssistPuuid, "助攻王")
+    recordHonor(topGoldPuuid, "经济王")
+    recordHonor(topKdaPuuid, "KDA王")
+    recordHonor(topControlPuuid, "控场王")
   }
 
   const playerGames = new Map<string, { records: MatchDetailPlayer[]; wins: number }>()
@@ -502,14 +672,27 @@ const playerRatings = computed<PlayerRating[]>(() => {
       const dmgShare = (r.damageToChampions || 0) / Math.max(r.teamDamageToChampions || 0, 1)
       const mitVal = (r.totalDamageTaken || 0) + (r.damageSelfMitigated || 0)
       const mitShare = mitVal / Math.max((r.teamTotalDamageTaken || 0) + (r.teamDamageSelfMitigated || 0), 1)
-      return { gameId: r.gameId, championId: r.championId, kills: r.kills, deaths: r.deaths, assists: r.assists, win: r.win, gameDuration: r.gameDuration, damageShare: dmgShare, mitigationShare: mitShare, score: calculateOutputRating(r, ctx).score }
+      const minutes = Math.max((r.gameDuration || 0) / 60, 1)
+      const score = calculateOutputRating(r, ctx).score
+      const goldShare = (r.goldEarned || 0) / Math.max(r.teamGoldEarned || 0, 1)
+      return { gameId: r.gameId, championId: r.championId, kills: r.kills, deaths: r.deaths, assists: r.assists, win: r.win, gameDuration: r.gameDuration, damageShare: dmgShare, mitigationShare: mitShare, score, gpm: (r.goldEarned || 0) / minutes, dpm: (r.damageToChampions || 0) / minutes, cspm: (r.cs || 0) / minutes, kp: ((r.kills || 0) + (r.assists || 0)) / Math.max(r.teamKills || 0, 1), killShare: (r.kills || 0) / Math.max(r.teamKills || 0, 1), goldShare, mitigationPerDeath: mitVal / Math.max(r.deaths || 0, 1) }
     })
+    const avgGpm = avgValues(gameRecords.map((r) => r.gpm))
+    const avgDpm = avgValues(gameRecords.map((r) => r.dpm))
+    const avgCspm = avgValues(gameRecords.map((r) => r.cspm))
+    const avgKp = avgValues(gameRecords.map((r) => r.kp))
+    const avgKillShare = avgValues(gameRecords.map((r) => r.killShare))
+    const avgMitigationPerDeath = avgValues(gameRecords.map((r) => r.mitigationPerDeath))
+    const trend = [...entry.records].sort((a, b) => a.gameCreation - b.gameCreation).map((r) => ({ score: calculateOutputRating(r, ctx).score, win: r.win, gameCreation: r.gameCreation }))
     ratings.push({
       puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine,
       summonerName: player.summonerName, gamesPlayed: n, wins: entry.wins,
       profile, recentChampionIds: entry.records.map((r) => r.championId), championProfiles, gameRecords,
       avgKills: avgK, avgDeaths: avgD, avgAssists: avgA,
       overallKdaScore: kdaScore(avgK, avgD, avgA),
+      avgGpm, avgDpm, avgCspm, avgKp, avgKillShare, avgMitigationPerDeath,
+      honors: honorCounts.get(player.puuid) || honorInit(),
+      trend,
       highlightGames: gameRecords.filter((r) => r.score >= 80).length,
       disasterGames: gameRecords.filter((r) => r.score < 60).length,
       damageLeaderCount: lead.damage, mitigationLeaderCount: lead.mitigation, assistLeaderCount: lead.assist,
@@ -525,7 +708,7 @@ async function load() {
   // 保留 localStorage 中已删除的对局，不清空
   data.value = null
   try {
-    data.value = await loadTodayCustomGames(rangeStartMs.value, rangeEndMs.value)
+    data.value = await loadTodayCustomGames(rangeStartMs.value, rangeEndMs.value, customOnly.value)
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally { loading.value = false }
@@ -547,6 +730,16 @@ interface ChampionStatEntry {
   worst: { gameName: string; picks: number; winRate: number } | null
 }
 interface AugmentStatEntry {
+  id: number
+  name: string
+  picks: number
+  wins: number
+  winRate: number
+  topPlayer: { gameName: string; picks: number } | null
+  players: StatPlayerRow[]
+}
+
+interface ItemStatEntry {
   id: number
   name: string
   picks: number
@@ -636,6 +829,39 @@ const augmentStat = computed<AugmentStatEntry[]>(() => {
   return [...map.values()].sort((a, b) => b.picks - a.picks)
 })
 
+const EXCLUDED_ITEM_IDS = new Set([2050])
+const EXCLUDED_ITEM_NAMES = ["魄罗佳肴"]
+
+const itemStat = computed<ItemStatEntry[]>(() => {
+  const map = new Map<number, ItemStatEntry>()
+  for (const game of visibleGames.value) {
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        for (const iid of p.itemIds || []) {
+          if (iid <= 0) continue
+          const itemName = itemMap.value[iid]?.name || ""
+          if (EXCLUDED_ITEM_IDS.has(iid) || EXCLUDED_ITEM_NAMES.some((n) => itemName.includes(n))) continue
+          let e = map.get(iid)
+          if (!e) {
+            e = { id: iid, name: itemName || `装备 ${iid}`, picks: 0, wins: 0, winRate: 0, topPlayer: null, players: [] }
+            map.set(iid, e)
+          }
+          e.picks++
+          if (p.win) e.wins++
+          addPlayerStat(e.players, p.puuid, p.gameName, p.win)
+        }
+      }
+    }
+  }
+  for (const e of map.values()) {
+    e.winRate = e.picks ? (e.wins / e.picks) * 100 : 0
+    for (const pl of e.players) pl.winRate = pl.picks ? (pl.wins / pl.picks) * 100 : 0
+    e.players.sort((a, b) => b.picks - a.picks)
+    e.topPlayer = e.players.length ? { gameName: e.players[0].gameName, picks: e.players[0].picks } : null
+  }
+  return [...map.values()].sort((a, b) => b.picks - a.picks)
+})
+
 /* ── 玩家组队搭档统计模块 ── */
 interface TeammatePairRow {
   puuid: string
@@ -643,6 +869,7 @@ interface TeammatePairRow {
   games: number
   wins: number
   winRate: number
+  recent: boolean[]
 }
 
 const teamSectionVisible = ref(false)
@@ -650,9 +877,15 @@ const teamMode = ref<"teammate" | "opponent">("teammate")
 const targetPuuid = ref("")
 const teamMinGames = ref(0)
 const teamMinGamesText = ref("")
+const teamMinWinRate = ref(0)
+const teamMinWinRateText = ref("")
 function applyTeamMinGames() {
   const v = parseInt(teamMinGamesText.value, 10)
   teamMinGames.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+function applyTeamMinWinRate() {
+  const v = parseFloat(teamMinWinRateText.value)
+  teamMinWinRate.value = Number.isFinite(v) && v > 0 ? Math.min(100, v) : 0
 }
 
 const teamPlayers = computed(() => {
@@ -681,6 +914,7 @@ const teamPairRows = computed<TeammatePairRow[]>(() => {
   const target = teamTarget.value
   if (!target) return []
   const map = new Map<string, TeammatePairRow>()
+  const history = new Map<string, { win: boolean; gameCreation: number }[]>()
   for (const game of visibleGames.value) {
     const myTeam = game.teams.find((t) => t.players.some((p) => p.puuid === target.puuid))
     if (!myTeam) continue
@@ -691,20 +925,28 @@ const teamPairRows = computed<TeammatePairRow[]>(() => {
       if (teamMode.value === "opponent" && isMate) continue
       for (const p of team.players) {
         if (p.puuid === target.puuid) continue
-        const e = map.get(p.puuid)
-        if (e) { e.games++; if (myWin) e.wins++ }
-        else map.set(p.puuid, { puuid: p.puuid, gameName: p.gameName, games: 1, wins: myWin ? 1 : 0, winRate: 0 })
+        if (!map.has(p.puuid)) {
+          map.set(p.puuid, { puuid: p.puuid, gameName: p.gameName, games: 0, wins: 0, winRate: 0, recent: [] })
+          history.set(p.puuid, [])
+        }
+        const e = map.get(p.puuid)!
+        e.games++
+        if (myWin) e.wins++
+        history.get(p.puuid)!.push({ win: myWin, gameCreation: game.gameCreation })
       }
     }
   }
-  const rows = [...map.values()]
-  for (const r of rows) r.winRate = r.games ? (r.wins / r.games) * 100 : 0
-  return rows
+  for (const [puuid, e] of map) {
+    e.winRate = e.games ? (e.wins / e.games) * 100 : 0
+    e.recent = (history.get(puuid) || []).sort((a, b) => a.gameCreation - b.gameCreation).slice(-5).map((h) => h.win)
+  }
+  return [...map.values()]
 })
 
 const teamQualifiedRows = computed(() => {
   const mp = teamMinGames.value
-  return teamPairRows.value.filter((r) => mp <= 0 || r.games >= mp)
+  const wr = teamMinWinRate.value
+  return teamPairRows.value.filter((r) => (mp <= 0 || r.games >= mp) && (wr <= 0 || r.winRate >= wr))
 })
 
 watch(targetStat, (target) => {
@@ -713,16 +955,35 @@ watch(targetStat, (target) => {
   }
 })
 
-const teamSortedRows = computed(() => [...teamQualifiedRows.value].sort((a, b) => b.winRate - a.winRate || b.games - a.games || a.gameName.localeCompare(b.gameName)))
+const teamSortColumn = ref<"games" | "wins" | "winRate">("winRate")
+const teamSortDir = ref<"asc" | "desc">("desc")
+function toggleTeamSort(col: "games" | "wins" | "winRate") {
+  if (teamSortColumn.value === col) teamSortDir.value = teamSortDir.value === "asc" ? "desc" : "asc"
+  else { teamSortColumn.value = col; teamSortDir.value = "desc" }
+}
+function teamSortIcon(col: "games" | "wins" | "winRate") {
+  if (teamSortColumn.value !== col) return ""
+  return teamSortDir.value === "asc" ? " ▲" : " ▼"
+}
+const teamSortedRows = computed(() => {
+  const col = teamSortColumn.value
+  const m = teamSortDir.value === "asc" ? 1 : -1
+  return [...teamQualifiedRows.value].sort((a, b) => {
+    const av = col === "games" ? a.games : col === "wins" ? a.wins : a.winRate
+    const bv = col === "games" ? b.games : col === "wins" ? b.wins : b.winRate
+    return (av - bv) * m || b.games - a.games || a.gameName.localeCompare(b.gameName)
+  })
+})
 const teamSampleInsufficient = computed(() => {
   const mp = teamMinGames.value
-  if (mp <= 0) return 0
-  return teamPairRows.value.filter((r) => r.games < mp).length
+  const wr = teamMinWinRate.value
+  if (mp <= 0 && wr <= 0) return 0
+  return teamPairRows.value.filter((r) => (mp > 0 && r.games < mp) || (wr > 0 && r.winRate < wr)).length
 })
 
 function switchTeamTarget(puuid: string) { targetPuuid.value = puuid }
 
-const statHasData = computed(() => championStat.value.length > 0 || augmentStat.value.length > 0)
+const statHasData = computed(() => championStat.value.length > 0 || augmentStat.value.length > 0 || itemStat.value.length > 0)
 
 const drawerChampionId = ref<number | null>(null)
 const drawerGames = computed(() => visibleGames.value)
@@ -753,6 +1014,13 @@ const championWorstMinPicks = ref(2)
 const championWorstMinPicksText = ref("2")
 const augmentMinPicks = ref(0)
 const augmentMinPicksText = ref("")
+const itemSort = ref<"picks" | "winRate">("picks")
+const itemSortDir = ref<"asc" | "desc">("desc")
+const itemSearch = ref("")
+const itemMinPicks = ref(0)
+const itemMinPicksText = ref("")
+const itemSectionVisible = ref(false)
+const onlyCompletedItems = ref(false)
 
 function applyChampionMinPicks() {
   const v = parseInt(championMinPicksText.value, 10)
@@ -770,6 +1038,10 @@ function applyAugmentMinPicks() {
   const v = parseInt(augmentMinPicksText.value, 10)
   augmentMinPicks.value = Number.isFinite(v) && v > 0 ? v : 0
 }
+function applyItemMinPicks() {
+  const v = parseInt(itemMinPicksText.value, 10)
+  itemMinPicks.value = Number.isFinite(v) && v > 0 ? v : 0
+}
 
 function toggleChampionSort(col: "picks" | "winRate") {
   if (championSort.value === col) championSortDir.value = championSortDir.value === "asc" ? "desc" : "asc"
@@ -786,6 +1058,14 @@ function toggleAugmentSort(col: "picks" | "winRate") {
 function augmentSortIcon(col: "picks" | "winRate") {
   if (augmentSort.value !== col) return ""
   return augmentSortDir.value === "asc" ? " ▲" : " ▼"
+}
+function toggleItemSort(col: "picks" | "winRate") {
+  if (itemSort.value === col) itemSortDir.value = itemSortDir.value === "asc" ? "desc" : "asc"
+  else { itemSort.value = col; itemSortDir.value = "desc" }
+}
+function itemSortIcon(col: "picks" | "winRate") {
+  if (itemSort.value !== col) return ""
+  return itemSortDir.value === "asc" ? " ▲" : " ▼"
 }
 
 const sortedChampionStat = computed(() => {
@@ -815,7 +1095,186 @@ const sortedAugmentStat = computed(() => {
   return list
 })
 
+const sortedItemStat = computed(() => {
+  let arr = itemStat.value
+  const q = itemSearch.value.trim().toLowerCase()
+  if (q) arr = arr.filter((e) => e.name.toLowerCase().includes(q))
+  const mp = itemMinPicks.value
+  if (mp > 0) arr = arr.filter((e) => e.picks >= mp)
+  if (onlyCompletedItems.value) {
+    arr = arr.filter((e) => {
+      const asset = itemMap.value[e.id]
+      return asset && asset.from.length > 0 && asset.to.length === 0 && !asset.categories.includes("Consumable") && !asset.categories.includes("Trinket")
+    })
+  }
+  const list = [...arr]
+  const m = itemSortDir.value === "asc" ? 1 : -1
+  if (itemSort.value === "winRate") list.sort((a, b) => (a.winRate - b.winRate) * m || b.picks - a.picks)
+  else list.sort((a, b) => (a.picks - b.picks) * m)
+  return list
+})
+
 function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mid" : "sc-low" }
+
+/* ── 荣誉墙 / 趋势 / 对比 / 阵容搭档 ── */
+const honorWall = computed(() => {
+  const rows: { honor: string; players: { gameName: string; puuid: string; count: number }[] }[] = []
+  for (const honor of honorOrder) {
+    const list = playerRatings.value
+      .map((r) => ({ gameName: r.gameName, puuid: r.puuid, count: r.honors[honor] || 0 }))
+      .filter((x) => x.count > 0)
+      .sort((a, b) => b.count - a.count || a.gameName.localeCompare(b.gameName))
+    rows.push({ honor, players: list.slice(0, 3) })
+  }
+  return rows
+})
+
+const trendPuuid = ref("")
+watch(teamPlayers, () => {
+  if (!trendPuuid.value || !teamPlayers.value.some((p) => p.puuid === trendPuuid.value)) {
+    trendPuuid.value = teamPlayers.value[0]?.puuid || ""
+  }
+})
+const trendPlayer = computed(() => playerRatings.value.find((r) => r.puuid === trendPuuid.value) || playerRatings.value[0] || null)
+const trendPoints = computed(() => trendPlayer.value ? trendPlayer.value.trend : [])
+const trendViewBox = computed(() => "0 0 " + (Math.max(trendPoints.value.length, 1) * 30 + 10) + " 120")
+const trendRecentAvg = computed(() => {
+  const points = trendPoints.value.slice(-5)
+  return points.length ? avgValues(points.map((x) => x.score)) : 0
+})
+const trendStreak = computed(() => {
+  const points = trendPoints.value
+  if (!points.length) return 0
+  let streak = 0
+  const lastWin = points[points.length - 1].win
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (points[i].win === lastWin) streak++
+    else break
+  }
+  return lastWin ? streak : -streak
+})
+function trendY(score: number) { return Math.max(10, Math.min(110, 110 - (score / 100) * 100)) }
+const trendLinePoints = computed(() => trendPoints.value.map((p, i) => String(i * 30 + 5) + "," + String(trendY(p.score))).join(" "))
+
+const comparePuuid = ref("")
+const compareSecondPuuid = ref("")
+watch(playerRatings, () => {
+  if (!playerRatings.value.some((r) => r.puuid === comparePuuid.value)) comparePuuid.value = playerRatings.value[0]?.puuid || ""
+  if (!playerRatings.value.some((r) => r.puuid === compareSecondPuuid.value)) compareSecondPuuid.value = playerRatings.value[1]?.puuid || ""
+})
+const comparePlayerA = computed(() => playerRatings.value.find((r) => r.puuid === comparePuuid.value) || null)
+const comparePlayerB = computed(() => playerRatings.value.find((r) => r.puuid === compareSecondPuuid.value) || null)
+
+function parseMinGamesText(text: string) {
+  const v = parseInt(text, 10)
+  return Number.isFinite(v) && v > 0 ? v : 0
+}
+function parseMinWinRateText(text: string) {
+  const v = parseFloat(text)
+  return Number.isFinite(v) && v > 0 ? Math.min(100, v) : 0
+}
+
+const comboTeamMinGames = ref(2)
+const comboTeamMinGamesText = ref("2")
+const comboTeamMinWinRate = ref(0)
+const comboTeamMinWinRateText = ref("")
+const comboDuoMinGames = ref(0)
+const comboDuoMinGamesText = ref("")
+const comboDuoMinWinRate = ref(0)
+const comboDuoMinWinRateText = ref("")
+const comboTrioMinGames = ref(0)
+const comboTrioMinGamesText = ref("")
+const comboTrioMinWinRate = ref(0)
+const comboTrioMinWinRateText = ref("")
+
+function applyComboTeamMinGames() { comboTeamMinGames.value = parseMinGamesText(comboTeamMinGamesText.value) }
+function applyComboTeamMinWinRate() { comboTeamMinWinRate.value = parseMinWinRateText(comboTeamMinWinRateText.value) }
+function applyComboDuoMinGames() { comboDuoMinGames.value = parseMinGamesText(comboDuoMinGamesText.value) }
+function applyComboDuoMinWinRate() { comboDuoMinWinRate.value = parseMinWinRateText(comboDuoMinWinRateText.value) }
+function applyComboTrioMinGames() { comboTrioMinGames.value = parseMinGamesText(comboTrioMinGamesText.value) }
+function applyComboTrioMinWinRate() { comboTrioMinWinRate.value = parseMinWinRateText(comboTrioMinWinRateText.value) }
+
+const comboTeamSort = ref<"games" | "winRate">("games")
+const comboTeamSortDir = ref<"asc" | "desc">("desc")
+const comboDuoSort = ref<"games" | "winRate">("games")
+const comboDuoSortDir = ref<"asc" | "desc">("desc")
+const comboTrioSort = ref<"games" | "winRate">("games")
+const comboTrioSortDir = ref<"asc" | "desc">("desc")
+function toggleComboTeamSort(col: "games" | "winRate") {
+  if (comboTeamSort.value === col) comboTeamSortDir.value = comboTeamSortDir.value === "asc" ? "desc" : "asc"
+  else { comboTeamSort.value = col; comboTeamSortDir.value = "desc" }
+}
+function comboTeamSortIcon(col: "games" | "winRate") {
+  if (comboTeamSort.value !== col) return ""
+  return comboTeamSortDir.value === "asc" ? " ▲" : " ▼"
+}
+function toggleComboDuoSort(col: "games" | "winRate") {
+  if (comboDuoSort.value === col) comboDuoSortDir.value = comboDuoSortDir.value === "asc" ? "desc" : "asc"
+  else { comboDuoSort.value = col; comboDuoSortDir.value = "desc" }
+}
+function comboDuoSortIcon(col: "games" | "winRate") {
+  if (comboDuoSort.value !== col) return ""
+  return comboDuoSortDir.value === "asc" ? " ▲" : " ▼"
+}
+function toggleComboTrioSort(col: "games" | "winRate") {
+  if (comboTrioSort.value === col) comboTrioSortDir.value = comboTrioSortDir.value === "asc" ? "desc" : "asc"
+  else { comboTrioSort.value = col; comboTrioSortDir.value = "desc" }
+}
+function comboTrioSortIcon(col: "games" | "winRate") {
+  if (comboTrioSort.value !== col) return ""
+  return comboTrioSortDir.value === "asc" ? " ▲" : " ▼"
+}
+function comboKey(puuids: string[]) { return [...puuids].sort().join("|") }
+function addCombo(map: Map<string, { members: string[]; games: number; wins: number }>, puuids: string[], win: boolean) {
+  if (puuids.length < 2) return
+  const key = comboKey(puuids)
+  const e = map.get(key) || { members: puuids.slice().sort(), games: 0, wins: 0 }
+  e.games++
+  if (win) e.wins++
+  map.set(key, e)
+}
+const comboRows = computed(() => {
+  const teamsMap = new Map<string, { members: string[]; games: number; wins: number }>()
+  const duoMap = new Map<string, { members: string[]; games: number; wins: number }>()
+  const trioMap = new Map<string, { members: string[]; games: number; wins: number }>()
+  for (const game of visibleGames.value) {
+    for (const team of game.teams) {
+      const puuids = team.players.map((p) => p.puuid)
+      if (puuids.length === 5) addCombo(teamsMap, puuids, team.win)
+      for (let i = 0; i < puuids.length; i++) {
+        for (let j = i + 1; j < puuids.length; j++) addCombo(duoMap, [puuids[i], puuids[j]], team.win)
+      }
+      for (let i = 0; i < puuids.length; i++) {
+        for (let j = i + 1; j < puuids.length; j++) {
+          for (let k = j + 1; k < puuids.length; k++) addCombo(trioMap, [puuids[i], puuids[j], puuids[k]], team.win)
+        }
+      }
+    }
+  }
+  const toRows = (map: Map<string, { members: string[]; games: number; wins: number }>, minGames: number, minWinRate: number, sortCol: "games" | "winRate", sortDir: "asc" | "desc") =>
+    [...map.values()]
+      .filter((e) => {
+        const winRate = e.games ? (e.wins / e.games) * 100 : 0
+        return (minGames <= 0 || e.games >= minGames) && (minWinRate <= 0 || winRate >= minWinRate)
+      })
+      .map((e) => ({ ...e, winRate: e.games ? (e.wins / e.games) * 100 : 0 }))
+      .sort((a, b) => {
+        const av = sortCol === "games" ? a.games : a.winRate
+        const bv = sortCol === "games" ? b.games : b.winRate
+        return sortDir === "asc" ? av - bv : bv - av
+      })
+  return {
+    teams: toRows(teamsMap, comboTeamMinGames.value, comboTeamMinWinRate.value, comboTeamSort.value, comboTeamSortDir.value),
+    duos: toRows(duoMap, comboDuoMinGames.value, comboDuoMinWinRate.value, comboDuoSort.value, comboDuoSortDir.value),
+    trios: toRows(trioMap, comboTrioMinGames.value, comboTrioMinWinRate.value, comboTrioSort.value, comboTrioSortDir.value),
+  }
+})
+function memberName(puuid: string) { return teamPlayers.value.find((p) => p.puuid === puuid)?.gameName || puuid }
+
+const honorSectionVisible = ref(false)
+const trendSectionVisible = ref(false)
+const compareSectionVisible = ref(false)
+const comboSectionVisible = ref(false)
 </script>
 
 <template>
@@ -1127,8 +1586,8 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
       <div v-if="enrichedGames.length === 0" class="empty-state"><Swords :size="32" /><span>该日期没有对局记录</span></div>
 
       <!-- ═══════════════ RATING TABLE ═══════════════ -->
-      <div v-else class="rating-table-wrap">
-        <div class="section-title" style="display:flex;align-items:center;margin-bottom:8px;cursor:pointer" @click="ratingSectionVisible = !ratingSectionVisible">
+      <div v-else class="rating-table-wrap" ref="ratingExportRef">
+        <div class="section-title" style="display:flex;align-items:center;gap:6px;padding:6px 0;margin-bottom:0;cursor:pointer" @click="ratingSectionVisible = !ratingSectionVisible">
           <component :is="ratingSectionVisible ? ChevronDown : ChevronRight" :size="14" />
           玩家评分
           <button class="toggle-sub" :class="{ active: gameListVisible }" @click.stop="gameListVisible = !gameListVisible" style="margin-left:8px;font-size:11px">
@@ -1147,6 +1606,10 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
             <component :is="showSubColumns ? ChevronUp : ChevronDown" :size="14" />
             {{ showSubColumns ? '收起' : '展开' }}详细
           </button>
+          <button class="toggle-sub" @click="showEfficiencyColumns = !showEfficiencyColumns">
+            <component :is="showEfficiencyColumns ? ChevronUp : ChevronDown" :size="14" />
+            {{ showEfficiencyColumns ? '收起' : '展开' }}效率
+          </button>
           <div class="toggle-sub min-games-input" :class="{ active: minGameCount > 0 }" title="仅统计场数≥该值的玩家，留空为不限">
             <span style="font-size:13px">场数≥</span>
             <input
@@ -1161,6 +1624,19 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
             />
           </div>
           <span class="filter-count">{{ filteredAndSortedRatings.length }} / {{ playerRatings.length }}</span>
+          <div class="export-menu-wrap">
+            <button class="toggle-sub" :class="{ active: exportMenuOpen }" @click="exportMenuOpen = !exportMenuOpen" :disabled="exporting || filteredAndSortedRatings.length === 0" style="min-width:86px">
+              <Download :size="14" />
+              <span style="font-size:13px">{{ exporting ? "导出中..." : "导出图片" }}</span>
+            </button>
+            <div v-if="exportMenuOpen" class="export-menu">
+              <button v-for="p in exportPresets" :key="p.key" class="export-menu-item" @click="exportRatingImage(p)">
+                <span>{{ p.label }}</span>
+                <span class="export-menu-desc">{{ p.type === "image/png" ? "无损" : p.type === "image/jpeg" ? "体积小" : "平衡" }}</span>
+              </button>
+            </div>
+          </div>
+          <span v-if="exportMessage" class="export-message">{{ exportMessage }}</span>
         </div>
 
         <div class="table-scroll" ref="tableScrollRef">
@@ -1183,7 +1659,14 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                 <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('mitigationShare')">承伤%{{ sortIcon('mitigationShare') }}</th>
                 <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('healingShare')">治疗/护盾%{{ sortIcon('healingShare') }}</th>
                 <th v-if="showSubColumns" class="col-detail sortable" @click="sortBy('damageConversion')">转化{{ sortIcon('damageConversion') }}</th>
+                <th v-if="showEfficiencyColumns" class="col-num sortable" @click="sortBy('gpm')">分均经济{{ sortIcon('gpm') }}</th>
+                <th v-if="showEfficiencyColumns" class="col-num sortable" @click="sortBy('dpm')">分均伤害{{ sortIcon('dpm') }}</th>
+                <th v-if="showEfficiencyColumns" class="col-num sortable" @click="sortBy('cspm')">分均补刀{{ sortIcon('cspm') }}</th>
+                <th v-if="showEfficiencyColumns" class="col-detail sortable" @click="sortBy('kp')">参团率{{ sortIcon('kp') }}</th>
+                <th v-if="showEfficiencyColumns" class="col-detail sortable" @click="sortBy('killShare')">击杀占比{{ sortIcon('killShare') }}</th>
+                <th v-if="showEfficiencyColumns" class="col-detail sortable" @click="sortBy('mitigationPerDeath')">承伤每死{{ sortIcon('mitigationPerDeath') }}</th>
                 <th class="col-tags">标签</th>
+                <th class="col-honors">荣誉</th>
                 <th class="col-num sortable" @click="sortBy('highlightGames')">高光{{ sortIcon('highlightGames') }}</th>
                 <th class="col-num sortable" @click="sortBy('disasterGames')">战犯{{ sortIcon('disasterGames') }}</th>
                 <th v-if="showSubColumns" class="col-num-leader sortable" @click="sortBy('damageLeader')" style="color:#fb923c">伤害榜首{{ sortIcon('damageLeader') }}</th>
@@ -1229,7 +1712,14 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                 <td v-if="showSubColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'mitigationShare')">{{ (avgChampProp(rating.championProfiles, (cp) => cp.averageMitigationShare) * 100).toFixed(1) }}%</td>
                 <td v-if="showSubColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'healingShare')">{{ (avgChampProp(rating.championProfiles, (cp) => cp.averageHealingShare) * 100).toFixed(1) }}%</td>
                 <td v-if="showSubColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'damageConversion')">{{ (avgChampProp(rating.championProfiles, (cp) => cp.averageDamageConversion) * 100).toFixed(1) }}%</td>
+                <td v-if="showEfficiencyColumns" class="col-num" :class="cellExtreme(rating.puuid, 'gpm')">{{ rating.avgGpm.toFixed(0) }}</td>
+                <td v-if="showEfficiencyColumns" class="col-num" :class="cellExtreme(rating.puuid, 'dpm')">{{ rating.avgDpm.toFixed(0) }}</td>
+                <td v-if="showEfficiencyColumns" class="col-num" :class="cellExtreme(rating.puuid, 'cspm')">{{ rating.avgCspm.toFixed(1) }}</td>
+                <td v-if="showEfficiencyColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'kp')">{{ (rating.avgKp * 100).toFixed(0) }}%</td>
+                <td v-if="showEfficiencyColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'killShare')">{{ (rating.avgKillShare * 100).toFixed(0) }}%</td>
+                <td v-if="showEfficiencyColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'mitigationPerDeath')">{{ rating.avgMitigationPerDeath.toFixed(1) }}</td>
                 <td class="col-tags"><div class="tag-list"><span v-for="tag in rating.profile.tags.slice(0, 3)" :key="tag" class="mini-tag">{{ tag }}</span></div></td>
+                <td class="col-honors"><div class="tag-list"><template v-for="honor in honorOrder" :key="honor"><span v-if="rating.honors[honor] > 0" class="honor-chip">{{ honor }}×{{ rating.honors[honor] }}</span></template></div></td>
                 <td class="col-num" :class="cellExtreme(rating.puuid, 'highlightGames')"><span :class="rating.highlightGames > 0 ? 'sc-high' : 'dim'">{{ rating.highlightGames }}</span></td>
                 <td class="col-num" :class="cellExtreme(rating.puuid, 'disasterGames')"><span :class="rating.disasterGames > 0 ? 'sc-low' : 'dim'">{{ rating.disasterGames }}</span></td>
                 <td v-if="showSubColumns" class="col-num-leader" :class="cellExtreme(rating.puuid, 'damageLeaderCount')" :title="rating.leaderGameIds.damage.length ? `对局: ${rating.leaderGameIds.damage.slice(0, 5).join(', ')}${rating.leaderGameIds.damage.length > 5 ? '...' : ''}` : ''"><span :class="rating.damageLeaderCount > 0 ? 'ld-damage' : 'dim'">{{ rating.damageLeaderCount }}</span></td>
@@ -1255,6 +1745,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
             <div class="rhc-divider"></div>
             <div class="rhc-row"><span class="rhc-l">KDA</span><span class="rhc-v">{{ hoveredPlayer.avgKills.toFixed(1) }} / {{ hoveredPlayer.avgDeaths.toFixed(1) }} / {{ hoveredPlayer.avgAssists.toFixed(1) }}</span><span class="rhc-l">KDA</span><span class="rhc-v" :class="kdaClass(hoveredPlayer.overallKdaScore)">{{ hoveredPlayer.overallKdaScore }}</span></div>
             <div class="rhc-row"><span class="rhc-l">场均击杀</span><span class="rhc-v">{{ hoveredPlayer.avgKills.toFixed(1) }}</span><span class="rhc-l">场均死亡</span><span class="rhc-v">{{ hoveredPlayer.avgDeaths.toFixed(1) }}</span></div>
+            <div class="rhc-row"><span class="rhc-l">分均经济</span><span class="rhc-v">{{ hoveredPlayer.avgGpm.toFixed(0) }}</span><span class="rhc-l">分均伤害</span><span class="rhc-v">{{ hoveredPlayer.avgDpm.toFixed(0) }}</span><span class="rhc-l">分均补刀</span><span class="rhc-v">{{ hoveredPlayer.avgCspm.toFixed(1) }}</span><span class="rhc-l">参团率</span><span class="rhc-v">{{ (hoveredPlayer.avgKp * 100).toFixed(0) }}%</span></div>
             <div class="rhc-divider"></div>
             <div class="rhc-row"><span class="rhc-l">标签</span><span class="rhc-tags"><span v-for="tag in hoveredPlayer.profile.tags" :key="tag" class="mini-tag">{{ tag }}</span></span></div>
             <div class="rhc-divider"></div>
@@ -1272,7 +1763,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
       <div v-if="playerRatings.length > 0" class="charts-section">
         <div class="charts-header" @click="chartsVisible = !chartsVisible">
           <component :is="chartsVisible ? ChevronDown : ChevronRight" :size="14" />
-          <span>数据可视化</span>
+          <span class="section-title">数据可视化</span>
         </div>
         <div v-show="chartsVisible" class="charts-body">
           <!-- score bar chart -->
@@ -1310,6 +1801,196 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
       <!-- ═══════════════ PLAYER RADAR ═══════════════ -->
       <PlayerRadarPanel v-if="playerRatings.length > 0" :players="playerRatings" />
 
+      <!-- 荣誉墙 -->
+      <div v-if="playerRatings.length > 0" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="honorSectionVisible = !honorSectionVisible">
+            <component :is="honorSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">荣誉墙</span>
+            <span class="stat-subtitle">每局全场 10 人评选</span>
+          </div>
+          <div v-show="honorSectionVisible" class="stat-section-body">
+            <div class="honor-grid">
+              <div v-for="row in honorWall" :key="row.honor" class="honor-card">
+                <div class="honor-name">{{ row.honor }}</div>
+                <div class="honor-players">
+                  <span v-for="(p, i) in row.players" :key="p.puuid" class="honor-player" :class="{ 'sc-high': i === 0 }">{{ p.gameName }}<em>×{{ p.count }}</em></span>
+                  <span v-if="!row.players.length" class="dim">暂无</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 玩家状态趋势 -->
+      <div v-if="playerRatings.length > 0" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="trendSectionVisible = !trendSectionVisible">
+            <component :is="trendSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">玩家状态趋势</span>
+            <span class="stat-subtitle">最近 5 局均分 {{ trendRecentAvg.toFixed(1) }} · 当前 {{ trendStreak > 0 ? trendStreak + ' 连胜' : trendStreak < 0 ? (-trendStreak) + ' 连败' : '无连态' }}</span>
+          </div>
+          <div v-show="trendSectionVisible" class="stat-section-body">
+            <div class="stat-header">
+              <select v-model="trendPuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;">
+                <option v-for="r in playerRatings" :key="r.puuid" :value="r.puuid">{{ r.gameName }}（{{ r.gamesPlayed }}场）</option>
+              </select>
+            </div>
+            <div class="trend-chart">
+              <svg v-if="trendPoints.length > 1" :viewBox="trendViewBox" class="trend-svg">
+                <polyline :points="trendLinePoints" fill="none" stroke="#a5b4fc" stroke-width="2" />
+                <circle v-for="(p, i) in trendPoints" :key="i" :cx="i * 30 + 5" :cy="trendY(p.score)" :r="4" :fill="p.win ? '#4ade80' : '#f87171'" />
+              </svg>
+              <span v-else class="dim">对局不足，暂无趋势</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 选手对比 -->
+      <div v-if="playerRatings.length > 1" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="compareSectionVisible = !compareSectionVisible">
+            <component :is="compareSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">选手对比</span>
+            <span class="stat-subtitle">A vs B</span>
+          </div>
+          <div v-show="compareSectionVisible" class="stat-section-body">
+            <div class="stat-header">
+              <select v-model="comparePuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;">
+                <option v-for="r in playerRatings" :key="r.puuid" :value="r.puuid">{{ r.gameName }}</option>
+              </select>
+              <span class="stat-subtitle">vs</span>
+              <select v-model="compareSecondPuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;">
+                <option v-for="r in playerRatings" :key="r.puuid" :value="r.puuid">{{ r.gameName }}</option>
+              </select>
+            </div>
+            <div v-if="comparePlayerA && comparePlayerB" class="compare-grid">
+              <div v-for="r in [comparePlayerA, comparePlayerB]" :key="r.puuid" class="compare-card">
+                <div class="compare-name">{{ r.gameName }}#{{ r.tagLine }}</div>
+                <div class="compare-row">场次 <b>{{ r.gamesPlayed }}</b></div>
+                <div class="compare-row">胜场 <b>{{ r.wins }}</b></div>
+                <div class="compare-row">胜率 <b :class="winRate(r) >= 50 ? 'sc-high' : 'sc-low'">{{ winRate(r).toFixed(0) }}%</b></div>
+                <div class="compare-row">均分 <b :class="scoreClass(r.profile.overallScore)">{{ r.profile.overallScore.toFixed(1) }}</b></div>
+                <div class="compare-row">KDA <b :class="kdaClass(r.overallKdaScore)">{{ r.overallKdaScore.toFixed(1) }}</b></div>
+                <div class="compare-row">输出/前排/辅助 <b>{{ r.profile.abilities.carry.averageScore.toFixed(0) }} / {{ r.profile.abilities.frontline.averageScore.toFixed(0) }} / {{ r.profile.abilities.support.averageScore.toFixed(0) }}</b></div>
+                <div class="compare-row">伤害占比 <b>{{ (avgChampProp(r.championProfiles, (cp) => cp.averageDamageShare) * 100).toFixed(0) }}%</b></div>
+                <div class="compare-tags"><span v-for="tag in r.profile.tags.slice(0, 3)" :key="tag" class="mini-tag">{{ tag }}</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 阵容与搭档 -->
+      <div v-if="playerRatings.length > 1" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="comboSectionVisible = !comboSectionVisible">
+            <component :is="comboSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">阵容与搭档</span>
+            <span class="stat-subtitle">固定五人 / 双人 / 三人</span>
+          </div>
+          <div v-show="comboSectionVisible" class="stat-section-body">
+            <div class="combo-tables">
+              <div class="combo-block">
+                <div class="stat-header" style="margin-bottom:8px">
+                  <div class="toggle-sub min-games-input" :class="{ active: comboTeamMinGames > 0 }" title="只统计场次≥该值的组合">
+                    <span style="font-size:13px">场次≥</span>
+                    <input v-model="comboTeamMinGamesText" type="number" min="1" step="1" placeholder="不限" class="min-games-input-box" @change="applyComboTeamMinGames" @keydown.enter="(e) => (e.target as HTMLInputElement).blur()" />
+                  </div>
+                  <div class="toggle-sub min-games-input" :class="{ active: comboTeamMinWinRate > 0 }" title="只统计胜率≥该值的组合">
+                    <span style="font-size:13px">胜率≥</span>
+                    <input v-model="comboTeamMinWinRateText" type="number" min="0" max="100" step="1" placeholder="不限" class="min-games-input-box" @change="applyComboTeamMinWinRate" @keydown.enter="(e) => (e.target as HTMLInputElement).blur()" />
+                    <span style="font-size:11px;color:var(--text-muted,#888)">%</span>
+                  </div>
+                </div>
+                <div class="combo-title">五人固定阵容</div>
+                <table class="stat-table combo-table">
+                  <thead>
+                    <tr>
+                      <th class="st-champ">组合</th>
+                      <th class="st-num sortable" @click="toggleComboTeamSort('games')">场次{{ comboTeamSortIcon('games') }}</th>
+                      <th class="st-num sortable" @click="toggleComboTeamSort('winRate')">胜率{{ comboTeamSortIcon('winRate') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="c in comboRows.teams" :key="c.members.join('|')">
+                      <td class="combo-members">{{ c.members.map(memberName).join(' / ') }}</td>
+                      <td class="st-num">{{ c.games }}</td>
+                      <td class="st-num"><span :class="winRateClass(c.winRate)">{{ c.winRate.toFixed(0) }}%</span></td>
+                    </tr>
+                    <tr v-if="!comboRows.teams.length"><td colspan="3" class="empty-table-row">暂无满足条件的五人组合</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="combo-block">
+                <div class="stat-header" style="margin-bottom:8px">
+                  <div class="toggle-sub min-games-input" :class="{ active: comboDuoMinGames > 0 }" title="只统计场次≥该值的组合">
+                    <span style="font-size:13px">场次≥</span>
+                    <input v-model="comboDuoMinGamesText" type="number" min="1" step="1" placeholder="不限" class="min-games-input-box" @change="applyComboDuoMinGames" @keydown.enter="(e) => (e.target as HTMLInputElement).blur()" />
+                  </div>
+                  <div class="toggle-sub min-games-input" :class="{ active: comboDuoMinWinRate > 0 }" title="只统计胜率≥该值的组合">
+                    <span style="font-size:13px">胜率≥</span>
+                    <input v-model="comboDuoMinWinRateText" type="number" min="0" max="100" step="1" placeholder="不限" class="min-games-input-box" @change="applyComboDuoMinWinRate" @keydown.enter="(e) => (e.target as HTMLInputElement).blur()" />
+                    <span style="font-size:11px;color:var(--text-muted,#888)">%</span>
+                  </div>
+                </div>
+                <div class="combo-title">双人搭档</div>
+                <table class="stat-table combo-table">
+                  <thead>
+                    <tr>
+                      <th class="st-champ">组合</th>
+                      <th class="st-num sortable" @click="toggleComboDuoSort('games')">场次{{ comboDuoSortIcon('games') }}</th>
+                      <th class="st-num sortable" @click="toggleComboDuoSort('winRate')">胜率{{ comboDuoSortIcon('winRate') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="c in comboRows.duos" :key="c.members.join('|')">
+                      <td class="combo-members">{{ c.members.map(memberName).join(' / ') }}</td>
+                      <td class="st-num">{{ c.games }}</td>
+                      <td class="st-num"><span :class="winRateClass(c.winRate)">{{ c.winRate.toFixed(0) }}%</span></td>
+                    </tr>
+                    <tr v-if="!comboRows.duos.length"><td colspan="3" class="empty-table-row">暂无满足条件的双人组合</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="combo-block">
+                <div class="stat-header" style="margin-bottom:8px">
+                  <div class="toggle-sub min-games-input" :class="{ active: comboTrioMinGames > 0 }" title="只统计场次≥该值的组合">
+                    <span style="font-size:13px">场次≥</span>
+                    <input v-model="comboTrioMinGamesText" type="number" min="1" step="1" placeholder="不限" class="min-games-input-box" @change="applyComboTrioMinGames" @keydown.enter="(e) => (e.target as HTMLInputElement).blur()" />
+                  </div>
+                  <div class="toggle-sub min-games-input" :class="{ active: comboTrioMinWinRate > 0 }" title="只统计胜率≥该值的组合">
+                    <span style="font-size:13px">胜率≥</span>
+                    <input v-model="comboTrioMinWinRateText" type="number" min="0" max="100" step="1" placeholder="不限" class="min-games-input-box" @change="applyComboTrioMinWinRate" @keydown.enter="(e) => (e.target as HTMLInputElement).blur()" />
+                    <span style="font-size:11px;color:var(--text-muted,#888)">%</span>
+                  </div>
+                </div>
+                <div class="combo-title">三人搭档</div>
+                <table class="stat-table combo-table">
+                  <thead>
+                    <tr>
+                      <th class="st-champ">组合</th>
+                      <th class="st-num sortable" @click="toggleComboTrioSort('games')">场次{{ comboTrioSortIcon('games') }}</th>
+                      <th class="st-num sortable" @click="toggleComboTrioSort('winRate')">胜率{{ comboTrioSortIcon('winRate') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="c in comboRows.trios" :key="c.members.join('|')">
+                      <td class="combo-members">{{ c.members.map(memberName).join(' / ') }}</td>
+                      <td class="st-num">{{ c.games }}</td>
+                      <td class="st-num"><span :class="winRateClass(c.winRate)">{{ c.winRate.toFixed(0) }}%</span></td>
+                    </tr>
+                    <tr v-if="!comboRows.trios.length"><td colspan="3" class="empty-table-row">暂无满足条件的三人组合</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- ═══════════════ 玩家组队搭档统计 ═══════════════ -->
       <div v-if="teamPlayers.length" class="stat-module">
         <div class="stat-section">
@@ -1344,7 +2025,22 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                   @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
                 />
               </div>
-              <span v-if="teamSampleInsufficient > 0" class="stat-subtitle" style="color:#f87171">样本场次不足{{ teamSampleInsufficient }}人，不计入排名</span>
+              <div class="toggle-sub min-games-input" :class="{ active: teamMinWinRate > 0 }" title="只统计胜率≥该值的玩家，留空为不限">
+                <span style="font-size:13px">胜率≥</span>
+                <input
+                  v-model="teamMinWinRateText"
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  placeholder="不限"
+                  class="min-games-input-box"
+                  @change="applyTeamMinWinRate"
+                  @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+                />
+                <span style="font-size:11px;color:var(--text-muted,#888)">%</span>
+              </div>
+              <span v-if="teamSampleInsufficient > 0" class="stat-subtitle" style="color:#f87171">样本/胜率不足{{ teamSampleInsufficient }}人，不计入排名</span>
             </div>
             <div v-if="targetStat" class="stat-header" style="margin-top:8px">
               <span class="stat-subtitle">
@@ -1352,20 +2048,21 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                 <b :class="winRateClass(targetStat.winRate)">{{ targetStat.winRate.toFixed(0) }}%</b>
               </span>
             </div>
-            <div class="stat-table-scroll" style="max-height: 320px">
+            <div class="stat-table-scroll">
               <table class="stat-table champion-table">
                 <thead>
                   <tr>
                     <th class="st-champ">{{ teamMode === 'teammate' ? '搭档' : '对手' }}</th>
-                    <th class="st-num" style="text-align:center">{{ teamMode === 'teammate' ? '共同场次' : '交手场次' }}</th>
-                    <th class="st-num" style="text-align:center">胜场</th>
-                    <th class="st-num" style="text-align:center">胜率</th>
+                    <th class="st-num sortable" style="text-align:center" @click="toggleTeamSort('games')">{{ teamMode === 'teammate' ? '共同场次' : '交手场次' }}{{ teamSortIcon('games') }}</th>
+                    <th class="st-num sortable" style="text-align:center" @click="toggleTeamSort('wins')">胜场{{ teamSortIcon('wins') }}</th>
+                    <th class="st-num sortable" style="text-align:center" @click="toggleTeamSort('winRate')">胜率{{ teamSortIcon('winRate') }}</th>
+                    <th class="st-num" style="text-align:center">近5场</th>
                     <th class="st-player">排名</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-if="teamQualifiedRows.length === 0">
-                    <td colspan="5" class="empty-table-row">没有满足条件的{{ teamMode === 'teammate' ? '搭档' : '对手' }}记录{{ teamSampleInsufficient > 0 ? '（样本场次不足，不计入排名）' : '' }}</td>
+                    <td colspan="6" class="empty-table-row">没有满足条件的{{ teamMode === 'teammate' ? '搭档' : '对手' }}记录{{ teamSampleInsufficient > 0 ? '（样本场次不足，不计入排名）' : '' }}</td>
                   </tr>
                   <template v-if="teamQualifiedRows.length">
                     <tr v-for="(r, i) in teamSortedRows" :key="r.puuid" @click="switchTeamTarget(r.puuid)">
@@ -1373,6 +2070,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
                       <td class="st-num" style="text-align:center">{{ r.games }}</td>
                       <td class="st-num" style="text-align:center">{{ r.wins }}</td>
                       <td class="st-num" style="text-align:center"><span :class="winRateClass(r.winRate)">{{ r.winRate.toFixed(0) }}%</span></td>
+                      <td class="st-num" style="text-align:center"><span class="recent-dots"><span v-for="(w, idx) in r.recent" :key="idx" class="recent-dot" :class="w ? 'win' : 'loss'"></span><span v-if="!r.recent.length" class="dim">-</span></span></td>
                       <td class="st-player">
                         <span class="st-pick" :class="{ 'sc-high': i === 0 }">全榜第 {{ i + 1 }}</span>
                       </td>
@@ -1543,6 +2241,71 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
           </div>
           </div>
         </div>
+
+        <div v-if="itemStat.length > 0" class="stat-section">
+          <div class="stat-title-line" @click="itemSectionVisible = !itemSectionVisible">
+            <component :is="itemSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">装备榜</span>
+            <span class="stat-subtitle">{{ itemStat.length }} 件装备 · {{ itemStat.reduce((s, e) => s + e.picks, 0) }} 次出现</span>
+          </div>
+          <div v-show="itemSectionVisible" class="stat-section-body">
+          <div class="stat-header">
+            <input v-model="itemSearch" placeholder="搜装备" class="stat-search" />
+            <div class="toggle-sub min-games-input" :class="{ active: itemMinPicks > 0 }" title="只显示次数≥该值的装备，留空为不限">
+              <span style="font-size:13px">次数≥</span>
+              <input
+                v-model="itemMinPicksText"
+                type="number"
+                min="1"
+                step="1"
+                placeholder="不限"
+                class="min-games-input-box"
+                @change="applyItemMinPicks"
+                @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+              />
+            </div>
+            <button class="toggle-sub" :class="{ active: onlyCompletedItems }" @click="onlyCompletedItems = !onlyCompletedItems">
+              <component :is="onlyCompletedItems ? Check : X" :size="14" />
+              <span style="font-size:13px">仅成装</span>
+            </button>
+          </div>
+          <div class="stat-table-scroll">
+            <table class="stat-table item-table">
+              <thead>
+                <tr>
+                  <th class="st-name">装备</th>
+                  <th class="st-num sortable" @click="toggleItemSort('picks')">次数{{ itemSortIcon('picks') }}</th>
+                  <th class="st-num sortable" @click="toggleItemSort('winRate')">胜率{{ itemSortIcon('winRate') }}</th>
+                  <th class="st-player">最喜欢出</th>
+                  <th class="st-players">出装玩家</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="sortedItemStat.length === 0">
+                  <td colspan="5" class="empty-table-row">
+                    {{ itemMinPicks > 0 ? `次数≥${itemMinPicks} 过滤后暂无装备，请调低次数限制` : itemSearch ? '搜索无匹配装备' : '该日期没有装备记录' }}
+                  </td>
+                </tr>
+                <tr v-for="a in sortedItemStat" :key="a.id">
+                  <td class="st-name">
+                    <AssetIcon :path="itemMap[a.id]?.iconPath" :label="itemMap[a.id]?.name" :fallback="String(a.id)" :size="20" />
+                    <span class="st-aug-name" :title="a.name">{{ a.name }}</span>
+                  </td>
+                  <td class="st-num">{{ a.picks }}</td>
+                  <td class="st-num"><span :class="winRateClass(a.winRate)">{{ a.winRate.toFixed(0) }}%</span></td>
+                  <td class="st-player">{{ a.topPlayer ? `${a.topPlayer.gameName}·${a.topPlayer.picks}次` : '-' }}</td>
+                  <td class="st-players">
+                    <template v-for="pl in a.players.slice(0, 5)" :key="pl.puuid">
+                      <span class="st-pick" :class="winRateClass(pl.winRate)" :title="`${pl.gameName} · ${pl.picks}次 · 胜率${pl.winRate.toFixed(0)}%`">{{ pl.gameName.slice(0, 6) }}<em>{{ pl.picks }}</em></span>
+                    </template>
+                    <span v-if="a.players.length > 5" class="st-more">+{{ a.players.length - 5 }}</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          </div>
+        </div>
       </div>
 
       <ChampionDetailDrawer
@@ -1567,6 +2330,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 /* ── header ── */
 .panel-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px; }
 .panel-header h2 { margin: 0; }
+.section-title { font-size: 14px; font-weight: 700; color: inherit; white-space: nowrap; }
 .eyebrow { font-size: 11px; color: var(--text-muted, #888); text-transform: uppercase; letter-spacing: 0.5px; }
 .header-actions { display: flex; align-items: center; gap: 8px; }
 .date-picker-wrap { display: flex; align-items: center; gap: 4px; background: var(--bg-tertiary, #2a2a2a); border: 1px solid var(--border, #444); border-radius: 6px; padding: 6px 10px; color: var(--text-muted, #888); }
@@ -1585,7 +2349,7 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 .sdl { font-size: 11px; font-weight: 600; color: var(--text-muted, #888); text-transform: uppercase; letter-spacing: 0.5px; }
 .position-bars { display: flex; flex-direction: column; gap: 4px; }
 .pbr { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.pbl { width: 44px; text-align: right; color: var(--text-muted, #aaa); flex-shrink: 0; }
+.pbl { width: 64px; text-align: right; color: var(--text-muted, #aaa); flex-shrink: 0; white-space: nowrap; }
 .pbt { flex: 1; height: 8px; background: var(--bg-secondary, #2a2a2a); border-radius: 4px; overflow: hidden; }
 .pbf { height: 100%; background: linear-gradient(90deg, #6366f1, #8b5cf6); border-radius: 4px; transition: width 0.3s; }
 .pbc { width: 20px; text-align: left; font-weight: 600; color: var(--text, #ddd); font-variant-numeric: tabular-nums; }
@@ -1601,8 +2365,9 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 
 /* ── game section ── */
 .game-section { display: flex; flex-direction: column; gap: 8px; }
-.game-section-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.game-section-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 6px 0; }
 .gsh-left { display: flex; align-items: center; gap: 8px; }
+.gsh-left .section-title { display: inline-flex; align-items: center; gap: 6px; }
 .gsh-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 .game-list { display: flex; flex-direction: column; gap: 6px; }
@@ -1722,6 +2487,14 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 .toggle-sub.active { background: var(--accent, #6366f1); border-color: var(--accent, #6366f1); color: #fff; }
 .toggle-sub.active:hover { opacity: 0.85; }
 .filter-count { font-size: 11px; color: var(--text-muted, #666); margin-left: auto; white-space: nowrap; }
+.export-menu-wrap { position: relative; display: inline-flex; align-items: center; gap: 6px; }
+.export-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 40; min-width: 190px; background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 6px; box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35); padding: 4px; display: flex; flex-direction: column; }
+.export-menu-item { display: flex; justify-content: space-between; gap: 12px; padding: 7px 9px; border: none; background: none; color: var(--text, #eee); font-size: 12px; text-align: left; cursor: pointer; border-radius: 4px; }
+.export-menu-item:hover { background: var(--accent, #6366f1); color: #fff; }
+.export-menu-desc { font-size: 11px; color: var(--text-muted, #888); }
+.export-menu-item:hover .export-menu-desc { color: rgba(255, 255, 255, 0.8); }
+.export-message { font-size: 11px; color: var(--accent, #a5b4fc); white-space: nowrap; }
+.toggle-sub:disabled { opacity: 0.6; cursor: not-allowed; }
 .empty-table-row { text-align: center; color: var(--text-muted, #888); font-size: 12px; padding: 24px 0 !important; }
 
 /* ── rating table ── */
@@ -1865,4 +2638,31 @@ function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mi
 .augment-dot.augment-bronze { background: #c68a4e; }
 .stat-search { padding: 5px 8px; background: var(--bg-tertiary, #2a2a2a); border: 1px solid var(--border, #444); border-radius: 4px; color: var(--text, #eee); font-size: 12px; outline: none; width: 150px; }
 .stat-search::placeholder { color: var(--text-muted, #888); }
+.honor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+.honor-card { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 8px 10px; }
+.honor-name { font-size: 12px; font-weight: 700; color: #a5b4fc; margin-bottom: 6px; }
+.honor-players { display: flex; flex-wrap: wrap; gap: 4px; }
+.honor-player { display: inline-flex; align-items: center; gap: 2px; padding: 1px 6px; border-radius: 3px; background: rgba(255,255,255,0.06); font-size: 11px; color: var(--text, #ddd); }
+.honor-player em { font-style: normal; font-weight: 700; color: #818cf8; }
+.honor-chip { display: inline-flex; align-items: center; gap: 2px; padding: 1px 5px; border-radius: 3px; background: rgba(165, 180, 252, 0.12); border: 1px solid rgba(165, 180, 252, 0.2); font-size: 10px; color: #a5b4fc; }
+.col-honors { min-width: 120px; }
+.trend-chart { margin-top: 10px; background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px; }
+.trend-svg { width: 100%; height: 120px; }
+.compare-grid { display: grid; grid-template-columns: repeat(2, minmax(240px, 1fr)); gap: 10px; margin-top: 10px; }
+.compare-card { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px 12px; }
+.compare-name { font-size: 14px; font-weight: 700; color: #e5e7eb; margin-bottom: 8px; }
+.compare-row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-muted, #aaa); padding: 2px 0; }
+.compare-row b { color: var(--text, #ddd); font-variant-numeric: tabular-nums; }
+.compare-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.combo-tables { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-top: 10px; }
+.combo-block { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px 12px; }
+.combo-title { font-size: 12px; font-weight: 700; color: #a5b4fc; margin-bottom: 6px; }
+.combo-row { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 12px; }
+.combo-row:last-child { border-bottom: none; }
+.combo-members { color: var(--text-muted, #ccc); line-height: 1.5; }
+.combo-stat { color: var(--text, #ddd); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.recent-dots { display: inline-flex; gap: 3px; align-items: center; }
+.recent-dot { width: 8px; height: 8px; border-radius: 50%; }
+.recent-dot.win { background: #4ade80; }
+.recent-dot.loss { background: #f87171; }
 </style>

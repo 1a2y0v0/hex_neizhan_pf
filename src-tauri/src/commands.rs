@@ -828,6 +828,11 @@ pub fn copy_png_to_clipboard(bytes: Vec<u8>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn save_export_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, bytes).map_err(|error| format!("保存失败：{error}"))
+}
+
+#[tauri::command]
 pub async fn load_match_detail(
     game_id: u64,
     sgp_server_id: Option<String>,
@@ -844,7 +849,7 @@ pub async fn load_match_detail(
 }
 
 #[tauri::command]
-pub async fn load_today_custom_games(day_start_ms: Option<i64>, day_end_ms: Option<i64>) -> Result<TodayCustomGamesResponse, String> {
+pub async fn load_today_custom_games(day_start_ms: Option<i64>, day_end_ms: Option<i64>, custom_only: Option<bool>) -> Result<TodayCustomGamesResponse, String> {
     let clients = create_clients().map_err(app_error)?;
     load_today_custom_games_service(
         &clients.lcu,
@@ -852,6 +857,7 @@ pub async fn load_today_custom_games(day_start_ms: Option<i64>, day_end_ms: Opti
         None,
         day_start_ms,
         day_end_ms,
+        custom_only,
     )
     .await
     .map_err(app_error)

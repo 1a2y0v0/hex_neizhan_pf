@@ -146,6 +146,10 @@ export function cancelStatsLoad(requestId: string) {
   return invoke<void>("cancel_stats_load", { requestId })
 }
 
+export function saveExportFile(path: string, bytes: number[]) {
+  return invoke<void>("save_export_file", { path, bytes })
+}
+
 export function copyPngToClipboard(bytes: number[]) {
   return invoke<void>("copy_png_to_clipboard", { bytes })
 }
@@ -154,8 +158,8 @@ export function loadMatchDetail(gameId: number, sgpServerId?: string) {
   return invoke<MatchDetailResponse>("load_match_detail", { gameId, sgpServerId })
 }
 
-export function loadTodayCustomGames(dayStartMs?: number, dayEndMs?: number) {
-  return invoke<TodayCustomGamesResponse>("load_today_custom_games", { dayStartMs, dayEndMs })
+export function loadTodayCustomGames(dayStartMs?: number, dayEndMs?: number, customOnly = false) {
+  return invoke<TodayCustomGamesResponse>("load_today_custom_games", { dayStartMs, dayEndMs, customOnly })
 }
 
 export function loadLiveGame(depth: number) {

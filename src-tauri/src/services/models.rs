@@ -629,6 +629,10 @@ pub struct GameAssetEntry {
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]
+    pub from: Vec<u32>,
+    #[serde(default)]
+    pub to: Vec<u32>,
+    #[serde(default)]
     pub price: u32,
     #[serde(default)]
     pub price_total: u32,

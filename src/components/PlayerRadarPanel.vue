@@ -303,7 +303,7 @@ const statusText = computed(() => {
   <div class="radar-section">
     <div class="radar-header" @click="radarVisible = !radarVisible">
       <component :is="radarVisible ? ChevronDown : ChevronRight" :size="14" />
-      <span>玩家能力雷达</span>
+      <span class="section-title">玩家能力雷达</span>
       <span class="radar-header-count" v-if="selectedPlayers.length">已选 {{ selectedPlayers.length }} 人</span>
     </div>
 
@@ -480,6 +480,7 @@ const statusText = computed(() => {
 <style scoped>
 .radar-section { border-top: 1px solid var(--border, #333); padding-top: 8px; }
 .radar-header { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 6px 0; }
+.radar-header .section-title { font-size: 14px; font-weight: 700; color: inherit; white-space: nowrap; }
 .radar-header:hover { color: var(--accent, #6366f1); }
 .radar-header-count { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--text-muted, #666); }
 .radar-body { display: flex; gap: 16px; padding: 12px 0; align-items: flex-start; }

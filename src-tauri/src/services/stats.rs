@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
+use futures::StreamExt;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -157,7 +158,15 @@ pub async fn load_match_detail(
         return Ok(match_detail_from_game(cached_game));
     }
 
-    let mut game = read_db_cached_game_by_id(game_id);
+    let cache_server_id = if let Some(auth) = auth {
+        resolve_sgp_server_id(auth, sgp_server_id)
+    } else {
+        sgp_server_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| "LCU_CURRENT".to_string())
+    };
+    let mut game = read_db_cached_game_by_id(&cache_server_id, game_id);
 
     if game.is_none() {
         if let Some(auth) = auth {
@@ -452,16 +461,57 @@ fn today_start_ms() -> i64 {
     now - ms_since_midnight
 }
 
+fn read_cached_games_in_range(sgp_server_id: &str, day_start: i64, day_end: i64) -> Vec<Game> {
+    let Some(conn) = open_cache_db() else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        r#"
+        SELECT game_json
+        FROM match_cache
+        WHERE sgp_server_id = ?1
+          AND game_creation >= ?2
+          AND game_creation < ?3
+        ORDER BY game_creation DESC
+        "#,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![sgp_server_id, day_start, day_end], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .filter_map(|json| serde_json::from_str::<Game>(&json).ok())
+        .collect()
+}
+
 pub async fn load_today_custom_games(
     lcu: &LcuClient,
     auth: Option<&ClientAuth>,
     sgp_server_id: Option<&str>,
     day_start_ms: Option<i64>,
     day_end_ms: Option<i64>,
+    custom_only: Option<bool>,
 ) -> AppResult<TodayCustomGamesResponse> {
     let puuid = lcu.current_summoner().await?.puuid;
     let day_start = day_start_ms.unwrap_or_else(today_start_ms);
     let day_end = day_end_ms.unwrap_or(day_start + 86_400_000);
+    let only_custom = custom_only.unwrap_or(false);
+
+    let server_id = if let Some(auth) = auth {
+        resolve_sgp_server_id(auth, sgp_server_id)
+    } else {
+        sgp_server_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| "LCU_CURRENT".to_string())
+    };
+
+    let cached_games = read_cached_games_in_range(&server_id, day_start, day_end);
+    let mut details: HashMap<u64, MatchDetailResponse> = HashMap::new();
+    for game in cached_games {
+        details.insert(game.game_id, match_detail_from_game(game));
+    }
 
     let raw_games = if let Some(auth) = auth {
         match SgpClient::new(lcu, auth, sgp_server_id).await {
@@ -469,26 +519,26 @@ pub async fn load_today_custom_games(
                 let mut games = Vec::new();
                 let mut seen = HashSet::new();
                 let mut start = 0usize;
-                // SGP 分页按时间倒序返回，翻页直到整页都早于起始日期为止，
-                // 上限 1000 局仅作兜底保护，避免日期跨度大时漏掉旧对局。
                 while games.len() < 1000 {
-                    let page = sgp.match_history(&puuid, start, 50).await?;
+                    let page = match sgp.match_history(&puuid, start, SGP_PAGE_SIZE).await {
+                        Ok(page) => page,
+                        Err(_) => break,
+                    };
                     if page.is_empty() {
                         break;
                     }
-                    let page_past_start = page
-                        .last()
-                        .map_or(false, |g| g.game_creation < day_start);
-                    let new: Vec<Game> = page
-                        .into_iter()
-                        .filter(|g| seen.insert(g.game_id))
-                        .collect();
-                    let count = new.len();
-                    games.extend(new);
-                    if count < 50 || page_past_start {
+                    let page_past_start = page.last().map_or(false, |g| g.game_creation < day_start);
+                    let before = games.len();
+                    for game in page {
+                        if seen.insert(game.game_id) {
+                            games.push(game);
+                        }
+                    }
+                    let added = games.len() - before;
+                    if added < SGP_PAGE_SIZE || page_past_start {
                         break;
                     }
-                    start += 50;
+                    start += SGP_PAGE_SIZE;
                 }
                 games
             }
@@ -498,34 +548,73 @@ pub async fn load_today_custom_games(
         Vec::new()
     };
 
-    let day_games: Vec<&Game> = raw_games
+    let day_ids: Vec<u64> = raw_games
         .iter()
         .filter(|g| g.game_creation >= day_start && g.game_creation < day_end)
+        .filter(|g| !only_custom || g.queue_id == 3270)
+        .map(|g| g.game_id)
         .collect();
 
-    let mut games = Vec::with_capacity(day_games.len());
-    for &game in &day_games {
-        if let Ok(detail) = load_match_detail(lcu, auth, sgp_server_id, game.game_id).await {
-            games.push(detail);
-        }
-    }
+    let missing_ids: Vec<u64> = day_ids
+        .iter()
+        .copied()
+        .filter(|id| !details.contains_key(id))
+        .collect();
 
-    if games.is_empty() {
-        if let Ok(page) = lcu.match_history(&puuid, 0, 49).await {
-            for game in page.games.games {
-                if game.game_creation >= day_start && game.game_creation < day_end {
-                    if let Ok(detail) = load_match_detail(lcu, auth, sgp_server_id, game.game_id).await {
-                        games.push(detail);
-                    }
-                }
+    if !missing_ids.is_empty() {
+        let fetched = futures::stream::iter(missing_ids.into_iter())
+            .map(|game_id| async move {
+                let detail = load_match_detail(lcu, auth, sgp_server_id, game_id).await;
+                (game_id, detail)
+            })
+            .buffered(8)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (game_id, detail) in fetched {
+            if let Ok(detail) = detail {
+                details.insert(game_id, detail);
             }
         }
     }
 
-    Ok(TodayCustomGamesResponse {
-        game_count: games.len(),
-        games,
-    })
+    if day_ids.is_empty() && details.is_empty() {
+        if let Ok(page) = lcu.match_history(&puuid, 0, 49).await {
+            let ids: Vec<u64> = page
+                .games
+                .games
+                .iter()
+                .filter(|g| g.game_creation >= day_start && g.game_creation < day_end)
+                .filter(|g| !only_custom || g.queue_id == 3270)
+                .map(|g| g.game_id)
+                .collect();
+
+            let fetched = futures::stream::iter(ids.clone().into_iter())
+                .map(|game_id| async move {
+                    let detail = load_match_detail(lcu, auth, sgp_server_id, game_id).await;
+                    (game_id, detail)
+                })
+                .buffered(8)
+                .collect::<Vec<_>>()
+                .await;
+
+            let mut fallback_details: HashMap<u64, MatchDetailResponse> = HashMap::new();
+            for (game_id, detail) in fetched {
+                if let Ok(detail) = detail {
+                    fallback_details.insert(game_id, detail);
+                }
+            }
+            let games: Vec<_> = ids.into_iter().filter_map(|id| fallback_details.remove(&id)).collect();
+            return Ok(TodayCustomGamesResponse { game_count: games.len(), games });
+        }
+    }
+
+    let games: Vec<_> = day_ids
+        .into_iter()
+        .filter_map(|id| details.remove(&id))
+        .collect();
+
+    Ok(TodayCustomGamesResponse { game_count: games.len(), games })
 }
 
 pub async fn load_player_stats_with_progress<F>(
@@ -818,6 +907,9 @@ fn initialize_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_player_match_recent
             ON player_match_index (sgp_server_id, puuid, game_creation DESC);
 
+        CREATE INDEX IF NOT EXISTS idx_match_cache_creation
+            ON match_cache (sgp_server_id, game_creation);
+
         CREATE TABLE IF NOT EXISTS cache_meta (
             key TEXT PRIMARY KEY,
             value INTEGER NOT NULL
@@ -1068,16 +1160,16 @@ fn read_db_cached_games(key: &StatsCacheKey, depth: usize) -> Option<Vec<Game>> 
     )
 }
 
-fn read_db_cached_game_by_id(game_id: u64) -> Option<Game> {
+fn read_db_cached_game_by_id(sgp_server_id: &str, game_id: u64) -> Option<Game> {
     let conn = open_cache_db()?;
     conn.query_row(
         r#"
         SELECT game_json
         FROM match_cache
-        WHERE game_id = ?1
+        WHERE sgp_server_id = ?1 AND game_id = ?2
         LIMIT 1
         "#,
-        params![game_id as i64],
+        params![sgp_server_id, game_id as i64],
         |row| row.get::<_, String>(0),
     )
     .ok()

@@ -299,6 +299,8 @@ export interface GameAssetEntry {
   iconPath: string
   rarity: string
   categories: string[]
+  from: number[]
+  to: number[]
   price: number
   priceTotal: number
   inStore: boolean
