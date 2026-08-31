@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, nextTick, onMounted, ref, watch } from "vue"
 import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, ChevronsUpDown, Crown, Download, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
 import { loadTodayCustomGames, saveExportFile } from "../api"
 import { save } from "@tauri-apps/plugin-dialog"
@@ -12,7 +12,11 @@ import { championName, fixed, mitigationValue, teamMitigationValue } from "../ut
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
 import ChampionDetailDrawer from "./ChampionDetailDrawer.vue"
+import PlayerCompareSection from "./PlayerCompareSection.vue"
+import PlayerDetailDrawer from "./PlayerDetailDrawer.vue"
 import PlayerRadarPanel from "./PlayerRadarPanel.vue"
+import PlayerTrendSection from "./PlayerTrendSection.vue"
+import RatingChartsSection from "./RatingChartsSection.vue"
 
 const props = defineProps<{
   champions: Record<number, ChampionSummaryItem>
@@ -50,6 +54,63 @@ const startDate = ref(todayDateStr())
 const endDate = ref(todayDateStr())
 const rangeStartMs = computed(() => dateToDayStart(startDate.value))
 const rangeEndMs = computed(() => dateToDayEnd(endDate.value))
+
+/* ── 快速时间范围 ── */
+const QUICK_RANGES = [
+  { key: "today", label: "今日" },
+  { key: "week", label: "本周" },
+  { key: "month", label: "本月" },
+  { key: "threeMonths", label: "三个月内" },
+  { key: "all", label: "全部对局（近5个月）" },
+] as const
+type QuickRangeKey = (typeof QUICK_RANGES)[number]["key"]
+
+function presetRange(key: QuickRangeKey): { start: string; end: string } {
+  const now = new Date()
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const end = toLocalDateStr(dayStart.getTime())
+  let start: Date
+  switch (key) {
+    case "today":
+      start = dayStart
+      break
+    case "week": {
+      // 周一作为一周起点
+      const offset = (dayStart.getDay() + 6) % 7
+      start = new Date(dayStart.getFullYear(), dayStart.getMonth(), dayStart.getDate() - offset)
+      break
+    }
+    case "month":
+      start = new Date(now.getFullYear(), now.getMonth(), 1)
+      break
+    case "threeMonths":
+      start = new Date(now.getFullYear(), now.getMonth() - 3, now.getDate())
+      break
+    case "all":
+      // 全部对局默认取最近 5 个月的数据
+      start = new Date(now.getFullYear(), now.getMonth() - 5, now.getDate())
+      break
+  }
+  return { start: toLocalDateStr(start.getTime()), end }
+}
+
+/** 当前日期区间命中的快捷项；手动修改日期且不匹配任何预设时为 "custom"。 */
+const activeQuickRange = computed<QuickRangeKey | "custom">(() => {
+  for (const r of QUICK_RANGES) {
+    const p = presetRange(r.key)
+    if (startDate.value === p.start && endDate.value === p.end) return r.key
+  }
+  return "custom"
+})
+
+function onQuickRangeChange(e: Event) {
+  const key = (e.target as HTMLSelectElement).value
+  if (key === "custom") return
+  const p = presetRange(key as QuickRangeKey)
+  startDate.value = p.start
+  endDate.value = p.end
+  load()
+}
 
 const queueNames: Record<number, string> = {
   0: "自定义", 3270: "自定义", 400: "匹配", 420: "单双排", 430: "匹配", 440: "灵活排", 450: "大乱斗",
@@ -117,6 +178,13 @@ function augmentRarityClass(augmentId: number) {
 }
 
 /* ── types ── */
+interface TrendPoint {
+  gameId: number; championId: number
+  kills: number; deaths: number; assists: number
+  win: boolean; gameDuration: number; gameCreation: number
+  score: number; kda: number; damageShare: number; dpm: number
+}
+
 interface PlayerRating {
   puuid: string; gameName: string; tagLine: string; summonerName: string
   gamesPlayed: number; wins: number; profile: PlayerProfile
@@ -125,7 +193,7 @@ interface PlayerRating {
   overallKdaScore: number; highlightGames: number; disasterGames: number
   avgGpm: number; avgDpm: number; avgCspm: number; avgKp: number; avgKillShare: number; avgMitigationPerDeath: number
   honors: Record<string, number>
-  trend: { score: number; win: boolean; gameCreation: number }[]
+  trend: TrendPoint[]
   damageLeaderCount: number; mitigationLeaderCount: number; assistLeaderCount: number
   leaderGameIds: { damage: number[]; mitigation: number[]; assist: number[] }
   gameRecords: PlayerGameRecord[]
@@ -234,9 +302,17 @@ const augmentSectionVisible = ref(false)
 const sortColumn = ref<string>("overallScore")
 const sortDirection = ref<"asc" | "desc">("desc")
 const filterText = ref("")
-const showSubColumns = ref(false)
-const showEfficiencyColumns = ref(false)
-const hoveredPlayer = ref<PlayerRating | null>(null)
+const showSubColumns = ref(true)
+const showEfficiencyColumns = ref(true)
+/* ── 玩家详情侧边栏：点击评分表行打开，点击空白处关闭 ── */
+const drawerPlayer = ref<PlayerRating | null>(null)
+
+function openPlayerDrawer(puuid: string) {
+  drawerPlayer.value = playerRatings.value.find((r) => r.puuid === puuid) || null
+}
+function closePlayerDrawer() {
+  drawerPlayer.value = null
+}
 
 // image export
 const ratingExportRef = ref<HTMLElement | null>(null)
@@ -403,6 +479,29 @@ function toggleGameExpand(gameId: number) {
   expandedGames.value = s
 }
 
+/* ── 跨模块联动：图表 → 评分表 / 对局列表 ── */
+function focusPlayer(puuid: string) {
+  ratingSectionVisible.value = true
+  openPlayerDrawer(puuid)
+  if (drawerPlayer.value) {
+    nextTick(() => {
+      document.querySelector(`[data-puuid="${puuid}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+    })
+  }
+}
+
+function focusGame(gameId: number) {
+  gameListVisible.value = true
+  if (!expandedGames.value.has(gameId)) {
+    const s = new Set(expandedGames.value)
+    s.add(gameId)
+    expandedGames.value = s
+  }
+  nextTick(() => {
+    document.querySelector(`[data-game-id="${gameId}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" })
+  })
+}
+
 /* ── summary ── */
 const summaryStats = computed(() => {
   const ratings = playerRatings.value
@@ -444,25 +543,6 @@ const summaryStats = computed(() => {
 
   return { totalGames, totalPlayers, avgWinRate, avgOverallScore, avgKdaScore, topPositions, topTags, blueWins, redWins, tiers, tierColors }
 })
-
-/* ── chart data ── */
-const chartScores = computed(() => {
-  return [...playerRatings.value].sort((a, b) => b.profile.overallScore - a.profile.overallScore)
-    .map((r) => ({ name: r.gameName, score: r.profile.overallScore }))
-})
-
-const chartTopChamps = computed(() => {
-  const counts = new Map<string, number>()
-  for (const r of playerRatings.value) {
-    for (const cp of r.championProfiles) {
-      const name = championName(props.champions, cp.championId)
-      counts.set(name, (counts.get(name) || 0) + cp.games)
-    }
-  }
-  return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10)
-})
-
-const chartsVisible = ref(false)
 
 /* ── table sort / filter ── */
 function sortBy(col: string) {
@@ -683,7 +763,18 @@ const playerRatings = computed<PlayerRating[]>(() => {
     const avgKp = avgValues(gameRecords.map((r) => r.kp))
     const avgKillShare = avgValues(gameRecords.map((r) => r.killShare))
     const avgMitigationPerDeath = avgValues(gameRecords.map((r) => r.mitigationPerDeath))
-    const trend = [...entry.records].sort((a, b) => a.gameCreation - b.gameCreation).map((r) => ({ score: calculateOutputRating(r, ctx).score, win: r.win, gameCreation: r.gameCreation }))
+    const trend: TrendPoint[] = [...entry.records].sort((a, b) => a.gameCreation - b.gameCreation).map((r) => {
+      const minutes = Math.max((r.gameDuration || 0) / 60, 1)
+      return {
+        gameId: r.gameId, championId: r.championId,
+        kills: r.kills, deaths: r.deaths, assists: r.assists,
+        win: r.win, gameDuration: r.gameDuration, gameCreation: r.gameCreation,
+        score: calculateOutputRating(r, ctx).score,
+        kda: kdaScore(r.kills, r.deaths, r.assists),
+        damageShare: (r.damageToChampions || 0) / Math.max(r.teamDamageToChampions || 0, 1),
+        dpm: (r.damageToChampions || 0) / minutes,
+      }
+    })
     ratings.push({
       puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine,
       summonerName: player.summonerName, gamesPlayed: n, wins: entry.wins,
@@ -1116,7 +1207,7 @@ const sortedItemStat = computed(() => {
 
 function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mid" : "sc-low" }
 
-/* ── 荣誉墙 / 趋势 / 对比 / 阵容搭档 ── */
+/* ── 荣誉墙 / 阵容搭档 ── */
 const honorWall = computed(() => {
   const rows: { honor: string; players: { gameName: string; puuid: string; count: number }[] }[] = []
   for (const honor of honorOrder) {
@@ -1128,42 +1219,6 @@ const honorWall = computed(() => {
   }
   return rows
 })
-
-const trendPuuid = ref("")
-watch(teamPlayers, () => {
-  if (!trendPuuid.value || !teamPlayers.value.some((p) => p.puuid === trendPuuid.value)) {
-    trendPuuid.value = teamPlayers.value[0]?.puuid || ""
-  }
-})
-const trendPlayer = computed(() => playerRatings.value.find((r) => r.puuid === trendPuuid.value) || playerRatings.value[0] || null)
-const trendPoints = computed(() => trendPlayer.value ? trendPlayer.value.trend : [])
-const trendViewBox = computed(() => "0 0 " + (Math.max(trendPoints.value.length, 1) * 30 + 10) + " 120")
-const trendRecentAvg = computed(() => {
-  const points = trendPoints.value.slice(-5)
-  return points.length ? avgValues(points.map((x) => x.score)) : 0
-})
-const trendStreak = computed(() => {
-  const points = trendPoints.value
-  if (!points.length) return 0
-  let streak = 0
-  const lastWin = points[points.length - 1].win
-  for (let i = points.length - 1; i >= 0; i--) {
-    if (points[i].win === lastWin) streak++
-    else break
-  }
-  return lastWin ? streak : -streak
-})
-function trendY(score: number) { return Math.max(10, Math.min(110, 110 - (score / 100) * 100)) }
-const trendLinePoints = computed(() => trendPoints.value.map((p, i) => String(i * 30 + 5) + "," + String(trendY(p.score))).join(" "))
-
-const comparePuuid = ref("")
-const compareSecondPuuid = ref("")
-watch(playerRatings, () => {
-  if (!playerRatings.value.some((r) => r.puuid === comparePuuid.value)) comparePuuid.value = playerRatings.value[0]?.puuid || ""
-  if (!playerRatings.value.some((r) => r.puuid === compareSecondPuuid.value)) compareSecondPuuid.value = playerRatings.value[1]?.puuid || ""
-})
-const comparePlayerA = computed(() => playerRatings.value.find((r) => r.puuid === comparePuuid.value) || null)
-const comparePlayerB = computed(() => playerRatings.value.find((r) => r.puuid === compareSecondPuuid.value) || null)
 
 function parseMinGamesText(text: string) {
   const v = parseInt(text, 10)
@@ -1272,8 +1327,6 @@ const comboRows = computed(() => {
 function memberName(puuid: string) { return teamPlayers.value.find((p) => p.puuid === puuid)?.gameName || puuid }
 
 const honorSectionVisible = ref(false)
-const trendSectionVisible = ref(false)
-const compareSectionVisible = ref(false)
 const comboSectionVisible = ref(false)
 </script>
 
@@ -1290,6 +1343,10 @@ const comboSectionVisible = ref(false)
           <input type="date" v-model="startDate" @change="load" class="date-input" />
           <span class="date-sep">—</span>
           <input type="date" v-model="endDate" @change="load" class="date-input" />
+          <select :value="activeQuickRange" @change="onQuickRangeChange" class="quick-range-select" title="快速切换时间范围">
+            <option v-for="r in QUICK_RANGES" :key="r.key" :value="r.key">{{ r.label }}</option>
+            <option v-if="activeQuickRange === 'custom'" value="custom">自定义</option>
+          </select>
         </div>
         <button class="toggle-sub" :class="{ active: customOnly }" @click="customOnly = !customOnly; load()" style="min-width:72px">
           <component :is="customOnly ? Check : X" :size="16" />
@@ -1372,7 +1429,7 @@ const comboSectionVisible = ref(false)
         </div>
 
         <div v-show="gameListVisible" class="game-list">
-          <div v-for="game in filteredGames" :key="game.gameId" class="game-card-outer">
+          <div v-for="game in filteredGames" :key="game.gameId" :data-game-id="game.gameId" class="game-card-outer">
             <div
               class="game-card"
               :class="{ 'game-has-expanded': expandedGames.has(game.gameId) }"
@@ -1665,8 +1722,6 @@ const comboSectionVisible = ref(false)
                 <th v-if="showEfficiencyColumns" class="col-detail sortable" @click="sortBy('kp')">参团率{{ sortIcon('kp') }}</th>
                 <th v-if="showEfficiencyColumns" class="col-detail sortable" @click="sortBy('killShare')">击杀占比{{ sortIcon('killShare') }}</th>
                 <th v-if="showEfficiencyColumns" class="col-detail sortable" @click="sortBy('mitigationPerDeath')">承伤每死{{ sortIcon('mitigationPerDeath') }}</th>
-                <th class="col-tags">标签</th>
-                <th class="col-honors">荣誉</th>
                 <th class="col-num sortable" @click="sortBy('highlightGames')">高光{{ sortIcon('highlightGames') }}</th>
                 <th class="col-num sortable" @click="sortBy('disasterGames')">战犯{{ sortIcon('disasterGames') }}</th>
                 <th v-if="showSubColumns" class="col-num-leader sortable" @click="sortBy('damageLeader')" style="color:#fb923c">伤害榜首{{ sortIcon('damageLeader') }}</th>
@@ -1685,9 +1740,9 @@ const comboSectionVisible = ref(false)
               <tr
                 v-for="(rating, index) in filteredAndSortedRatings"
                 :key="rating.puuid"
-                :class="['tr-body', hoveredPlayer?.puuid === rating.puuid ? 'row-hovered' : '', index % 2 === 1 ? 'row-zebra' : '']"
-                @mouseenter="hoveredPlayer = rating"
-                @mouseleave="hoveredPlayer = null"
+                :data-puuid="rating.puuid"
+                :class="['tr-body', index % 2 === 1 ? 'row-zebra' : '']"
+                @click="openPlayerDrawer(rating.puuid)"
               >
                 <td class="col-rank">{{ index + 1 }}</td>
                 <td class="col-player"><UserRound :size="14" /> {{ rating.gameName }}#{{ rating.tagLine }}</td>
@@ -1718,8 +1773,6 @@ const comboSectionVisible = ref(false)
                 <td v-if="showEfficiencyColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'kp')">{{ (rating.avgKp * 100).toFixed(0) }}%</td>
                 <td v-if="showEfficiencyColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'killShare')">{{ (rating.avgKillShare * 100).toFixed(0) }}%</td>
                 <td v-if="showEfficiencyColumns" class="col-detail" :class="cellExtreme(rating.puuid, 'mitigationPerDeath')">{{ rating.avgMitigationPerDeath.toFixed(1) }}</td>
-                <td class="col-tags"><div class="tag-list"><span v-for="tag in rating.profile.tags.slice(0, 3)" :key="tag" class="mini-tag">{{ tag }}</span></div></td>
-                <td class="col-honors"><div class="tag-list"><template v-for="honor in honorOrder" :key="honor"><span v-if="rating.honors[honor] > 0" class="honor-chip">{{ honor }}×{{ rating.honors[honor] }}</span></template></div></td>
                 <td class="col-num" :class="cellExtreme(rating.puuid, 'highlightGames')"><span :class="rating.highlightGames > 0 ? 'sc-high' : 'dim'">{{ rating.highlightGames }}</span></td>
                 <td class="col-num" :class="cellExtreme(rating.puuid, 'disasterGames')"><span :class="rating.disasterGames > 0 ? 'sc-low' : 'dim'">{{ rating.disasterGames }}</span></td>
                 <td v-if="showSubColumns" class="col-num-leader" :class="cellExtreme(rating.puuid, 'damageLeaderCount')" :title="rating.leaderGameIds.damage.length ? `对局: ${rating.leaderGameIds.damage.slice(0, 5).join(', ')}${rating.leaderGameIds.damage.length > 5 ? '...' : ''}` : ''"><span :class="rating.damageLeaderCount > 0 ? 'ld-damage' : 'dim'">{{ rating.damageLeaderCount }}</span></td>
@@ -1736,67 +1789,18 @@ const comboSectionVisible = ref(false)
           </table>
         </div>
 
-        <!-- row hover card -->
-        <div v-if="hoveredPlayer" class="row-hover-card" @mouseenter="hoveredPlayer = hoveredPlayer" @mouseleave="hoveredPlayer = null">
-          <div class="rhc-header">{{ hoveredPlayer.gameName }}#{{ hoveredPlayer.tagLine }}</div>
-          <div class="rhc-body">
-            <div class="rhc-row"><span class="rhc-l">综合评分</span><span class="rhc-v" :class="scoreClass(hoveredPlayer.profile.overallScore)">{{ hoveredPlayer.profile.overallScore.toFixed(1) }}</span><span class="rhc-l">中位数</span><span class="rhc-v">{{ hoveredPlayer.profile.medianScore.toFixed(1) }}</span></div>
-            <div class="rhc-row"><span class="rhc-l">波动率</span><span class="rhc-v">{{ hoveredPlayer.profile.volatility.toFixed(1) }}</span><span class="rhc-l">高光率</span><span class="rhc-v sc-high">{{ (hoveredPlayer.profile.highlightRate * 100).toFixed(0) }}%</span><span class="rhc-l">战犯率</span><span class="rhc-v sc-low">{{ (hoveredPlayer.profile.disasterRate * 100).toFixed(0) }}%</span></div>
-            <div class="rhc-divider"></div>
-            <div class="rhc-row"><span class="rhc-l">KDA</span><span class="rhc-v">{{ hoveredPlayer.avgKills.toFixed(1) }} / {{ hoveredPlayer.avgDeaths.toFixed(1) }} / {{ hoveredPlayer.avgAssists.toFixed(1) }}</span><span class="rhc-l">KDA</span><span class="rhc-v" :class="kdaClass(hoveredPlayer.overallKdaScore)">{{ hoveredPlayer.overallKdaScore }}</span></div>
-            <div class="rhc-row"><span class="rhc-l">场均击杀</span><span class="rhc-v">{{ hoveredPlayer.avgKills.toFixed(1) }}</span><span class="rhc-l">场均死亡</span><span class="rhc-v">{{ hoveredPlayer.avgDeaths.toFixed(1) }}</span></div>
-            <div class="rhc-row"><span class="rhc-l">分均经济</span><span class="rhc-v">{{ hoveredPlayer.avgGpm.toFixed(0) }}</span><span class="rhc-l">分均伤害</span><span class="rhc-v">{{ hoveredPlayer.avgDpm.toFixed(0) }}</span><span class="rhc-l">分均补刀</span><span class="rhc-v">{{ hoveredPlayer.avgCspm.toFixed(1) }}</span><span class="rhc-l">参团率</span><span class="rhc-v">{{ (hoveredPlayer.avgKp * 100).toFixed(0) }}%</span></div>
-            <div class="rhc-divider"></div>
-            <div class="rhc-row"><span class="rhc-l">标签</span><span class="rhc-tags"><span v-for="tag in hoveredPlayer.profile.tags" :key="tag" class="mini-tag">{{ tag }}</span></span></div>
-            <div class="rhc-divider"></div>
-            <div class="rhc-section-l">英雄详情</div>
-            <div v-for="cp in hoveredPlayer.championProfiles" :key="cp.championId" class="rhc-champ">
-              <ChampionAvatar :champion-id="cp.championId" :champions="props.champions" :size="24" />
-              <div class="rhc-cinfo"><span class="rhc-cn">{{ championName(champions, cp.championId) }}</span><span class="rhc-cs">{{ cp.games }}场 · 均分 <span :class="scoreClass(cp.averageScore)">{{ cp.averageScore.toFixed(0) }}</span> · 伤{{ (cp.averageDamageShare * 100).toFixed(0) }}%</span></div>
-            </div>
-          </div>
-        </div>
         </div>
       </div>
 
       <!-- ═══════════════ CHARTS ═══════════════ -->
-      <div v-if="playerRatings.length > 0" class="charts-section">
-        <div class="charts-header" @click="chartsVisible = !chartsVisible">
-          <component :is="chartsVisible ? ChevronDown : ChevronRight" :size="14" />
-          <span class="section-title">数据可视化</span>
-        </div>
-        <div v-show="chartsVisible" class="charts-body">
-          <!-- score bar chart -->
-          <div class="chart-block">
-            <div class="chart-title">玩家综合分</div>
-            <div class="bar-chart-h">
-              <div v-for="item in chartScores" :key="item.name" class="bar-row">
-                <span class="bar-label">{{ item.name.length > 8 ? item.name.slice(0, 8) + '..' : item.name }}</span>
-                <div class="bar-track">
-                  <div class="bar-fill" :style="{ width: Math.max(item.score / (chartScores[0]?.score || 100) * 100, 3) + '%', background: item.score >= 80 ? '#4ade80' : item.score >= 60 ? '#facc15' : '#f87171' }"></div>
-                </div>
-                <span class="bar-value" :class="scoreClass(item.score)">{{ item.score.toFixed(1) }}</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- champion TOP -->
-          <div class="chart-block">
-            <div class="chart-title">英雄出场 TOP</div>
-            <div class="bar-chart-h">
-              <div v-for="[name, count] in chartTopChamps" :key="name" class="bar-row">
-                <span class="bar-label">{{ name.length > 8 ? name.slice(0, 8) + '..' : name }}</span>
-                <div class="bar-track">
-                  <div class="bar-fill" :style="{ width: (count / (chartTopChamps[0]?.[1] || 1) * 100) + '%', background: '#818cf8' }"></div>
-                </div>
-                <span class="bar-value" style="color:#a5b4fc">{{ count }}</span>
-              </div>
-            </div>
-          </div>
-
-
-        </div>
-      </div>
+      <RatingChartsSection
+        v-if="playerRatings.length > 0"
+        :players="playerRatings"
+        :champions="props.champions"
+        :blue-wins="summaryStats?.blueWins ?? 0"
+        :red-wins="summaryStats?.redWins ?? 0"
+        @focus-player="focusPlayer"
+      />
 
       <!-- ═══════════════ PLAYER RADAR ═══════════════ -->
       <PlayerRadarPanel v-if="playerRatings.length > 0" :players="playerRatings" />
@@ -1824,64 +1828,20 @@ const comboSectionVisible = ref(false)
       </div>
 
       <!-- 玩家状态趋势 -->
-      <div v-if="playerRatings.length > 0" class="stat-module">
-        <div class="stat-section">
-          <div class="stat-title-line" @click="trendSectionVisible = !trendSectionVisible">
-            <component :is="trendSectionVisible ? ChevronDown : ChevronRight" :size="14" />
-            <span class="section-title">玩家状态趋势</span>
-            <span class="stat-subtitle">最近 5 局均分 {{ trendRecentAvg.toFixed(1) }} · 当前 {{ trendStreak > 0 ? trendStreak + ' 连胜' : trendStreak < 0 ? (-trendStreak) + ' 连败' : '无连态' }}</span>
-          </div>
-          <div v-show="trendSectionVisible" class="stat-section-body">
-            <div class="stat-header">
-              <select v-model="trendPuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;">
-                <option v-for="r in playerRatings" :key="r.puuid" :value="r.puuid">{{ r.gameName }}（{{ r.gamesPlayed }}场）</option>
-              </select>
-            </div>
-            <div class="trend-chart">
-              <svg v-if="trendPoints.length > 1" :viewBox="trendViewBox" class="trend-svg">
-                <polyline :points="trendLinePoints" fill="none" stroke="#a5b4fc" stroke-width="2" />
-                <circle v-for="(p, i) in trendPoints" :key="i" :cx="i * 30 + 5" :cy="trendY(p.score)" :r="4" :fill="p.win ? '#4ade80' : '#f87171'" />
-              </svg>
-              <span v-else class="dim">对局不足，暂无趋势</span>
-            </div>
-          </div>
-        </div>
-      </div>
+      <PlayerTrendSection
+        v-if="playerRatings.length > 0"
+        :players="playerRatings"
+        :champions="props.champions"
+        @focus-game="focusGame"
+      />
 
       <!-- 选手对比 -->
-      <div v-if="playerRatings.length > 1" class="stat-module">
-        <div class="stat-section">
-          <div class="stat-title-line" @click="compareSectionVisible = !compareSectionVisible">
-            <component :is="compareSectionVisible ? ChevronDown : ChevronRight" :size="14" />
-            <span class="section-title">选手对比</span>
-            <span class="stat-subtitle">A vs B</span>
-          </div>
-          <div v-show="compareSectionVisible" class="stat-section-body">
-            <div class="stat-header">
-              <select v-model="comparePuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;">
-                <option v-for="r in playerRatings" :key="r.puuid" :value="r.puuid">{{ r.gameName }}</option>
-              </select>
-              <span class="stat-subtitle">vs</span>
-              <select v-model="compareSecondPuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;">
-                <option v-for="r in playerRatings" :key="r.puuid" :value="r.puuid">{{ r.gameName }}</option>
-              </select>
-            </div>
-            <div v-if="comparePlayerA && comparePlayerB" class="compare-grid">
-              <div v-for="r in [comparePlayerA, comparePlayerB]" :key="r.puuid" class="compare-card">
-                <div class="compare-name">{{ r.gameName }}#{{ r.tagLine }}</div>
-                <div class="compare-row">场次 <b>{{ r.gamesPlayed }}</b></div>
-                <div class="compare-row">胜场 <b>{{ r.wins }}</b></div>
-                <div class="compare-row">胜率 <b :class="winRate(r) >= 50 ? 'sc-high' : 'sc-low'">{{ winRate(r).toFixed(0) }}%</b></div>
-                <div class="compare-row">均分 <b :class="scoreClass(r.profile.overallScore)">{{ r.profile.overallScore.toFixed(1) }}</b></div>
-                <div class="compare-row">KDA <b :class="kdaClass(r.overallKdaScore)">{{ r.overallKdaScore.toFixed(1) }}</b></div>
-                <div class="compare-row">输出/前排/辅助 <b>{{ r.profile.abilities.carry.averageScore.toFixed(0) }} / {{ r.profile.abilities.frontline.averageScore.toFixed(0) }} / {{ r.profile.abilities.support.averageScore.toFixed(0) }}</b></div>
-                <div class="compare-row">伤害占比 <b>{{ (avgChampProp(r.championProfiles, (cp) => cp.averageDamageShare) * 100).toFixed(0) }}%</b></div>
-                <div class="compare-tags"><span v-for="tag in r.profile.tags.slice(0, 3)" :key="tag" class="mini-tag">{{ tag }}</span></div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
+      <PlayerCompareSection
+        v-if="playerRatings.length > 1"
+        :players="playerRatings"
+        :champions="props.champions"
+        :games="enrichedGames"
+      />
 
       <!-- 阵容与搭档 -->
       <div v-if="playerRatings.length > 1" class="stat-module">
@@ -2316,9 +2276,19 @@ const comboSectionVisible = ref(false)
         :champions="props.champions"
         :item-map="itemMap"
         :spell-map="spellMap"
+        :augment-map="augmentMap"
+        :perk-map="perkMap"
         :champion-total-picks="drawerChampionMeta.picks"
         :champion-total-win-rate="drawerChampionMeta.winRate"
         @close="closeChampionDrawer"
+      />
+
+      <PlayerDetailDrawer
+        v-if="drawerPlayer"
+        :player="drawerPlayer"
+        :champions="props.champions"
+        :range-text="startDate === endDate ? startDate : `${startDate} 至 ${endDate}`"
+        @close="closePlayerDrawer"
       />
     </template>
   </div>
@@ -2337,6 +2307,8 @@ const comboSectionVisible = ref(false)
 .date-input { background: transparent; border: none; color: inherit; font-size: 13px; outline: none; font-family: inherit; width: 110px; }
 .date-input::-webkit-calendar-picker-indicator { filter: invert(0.7); cursor: pointer; }
 .date-sep { color: var(--text-muted, #555); font-size: 13px; user-select: none; }
+.quick-range-select { background: transparent; border: none; border-left: 1px solid var(--border, #444); margin-left: 4px; padding-left: 8px; color: inherit; font-size: 12px; outline: none; cursor: pointer; font-family: inherit; max-width: 150px; }
+.quick-range-select option { color: #333; background: #fff; }
 
 /* ── summary ── */
 .summary-card { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 10px; padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }
@@ -2508,8 +2480,8 @@ const comboSectionVisible = ref(false)
 
 /* zebra */
 .row-zebra { background: rgba(255,255,255,0.02); }
+.rating-table tbody tr { cursor: pointer; }
 .rating-table tbody tr:hover { background: rgba(99, 102, 241, 0.06); }
-.row-hovered { background: rgba(99, 102, 241, 0.1) !important; }
 
 .col-player { text-align: left; min-width: 100px; white-space: nowrap; }
 .col-player :deep(svg) { vertical-align: middle; margin-right: 4px; }
@@ -2523,7 +2495,6 @@ const comboSectionVisible = ref(false)
 .col-kda { font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .col-ability { width: 38px; font-size: 12px; }
 .col-detail { width: 48px; font-size: 11px; font-variant-numeric: tabular-nums; }
-.col-tags { max-width: 110px; }
 
 /* win rate column */
 .wr-cell { font-weight: 700; }
@@ -2552,42 +2523,11 @@ const comboSectionVisible = ref(false)
 .cell-worst { outline: 2px solid rgba(248, 113, 113, 0.6); outline-offset: -2px; border-radius: 3px; background: rgba(248, 113, 113, 0.08); }
 
 .pos-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; background: rgba(99, 102, 241, 0.1); color: #a5b4fc; }
-.tag-list { display: flex; flex-wrap: wrap; gap: 2px; justify-content: center; }
-.mini-tag { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; background: rgba(255,255,255,0.06); color: var(--text-muted, #aaa); white-space: nowrap; }
 .dim { color: var(--text-muted, #555); }
 .score-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; white-space: nowrap; }
 .score-high { background: #1a6b3c; color: #4ade80; }
 .score-mid { background: #6b5b1a; color: #facc15; }
 .score-low { background: #6b1a1a; color: #f87171; }
-
-/* ── row hover card ── */
-.row-hover-card { position: fixed; right: 20px; top: 50%; transform: translateY(-50%); width: 340px; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; padding: 14px; z-index: 200; box-shadow: 0 8px 32px rgba(0,0,0,0.6); max-height: 80vh; overflow-y: auto; }
-.rhc-header { font-size: 15px; font-weight: 700; color: var(--text, #eee); margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border, #333); }
-.rhc-body { display: flex; flex-direction: column; gap: 5px; }
-.rhc-row { display: flex; align-items: center; gap: 8px; font-size: 12px; flex-wrap: wrap; }
-.rhc-l { color: var(--text-muted, #888); flex-shrink: 0; }
-.rhc-v { font-weight: 600; font-variant-numeric: tabular-nums; }
-.rhc-tags { display: flex; flex-wrap: wrap; gap: 3px; }
-.rhc-divider { height: 1px; background: var(--border, #333); margin: 4px 0; }
-.rhc-section-l { font-size: 11px; font-weight: 600; color: var(--text-muted, #888); text-transform: uppercase; letter-spacing: 0.3px; margin-top: 2px; }
-.rhc-champ { display: flex; align-items: center; gap: 8px; padding: 3px 6px; background: rgba(255,255,255,0.04); border-radius: 5px; }
-.rhc-cinfo { display: flex; flex-direction: column; gap: 1px; }
-.rhc-cn { font-size: 12px; font-weight: 600; color: var(--text, #eee); }
-.rhc-cs { font-size: 11px; color: var(--text-muted, #888); }
-
-/* ── charts ── */
-.charts-section { border-top: 1px solid var(--border, #333); padding-top: 8px; }
-.charts-header { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 6px 0; }
-.charts-header:hover { color: var(--accent, #6366f1); }
-.charts-body { display: flex; gap: 20px; flex-wrap: wrap; padding: 12px 0; }
-.chart-block { flex: 1; min-width: 240px; max-width: 400px; }
-.chart-title { font-size: 12px; font-weight: 600; color: var(--text-muted, #aaa); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.3px; }
-.bar-chart-h { display: flex; flex-direction: column; gap: 5px; }
-.bar-row { display: flex; align-items: center; gap: 8px; }
-.bar-label { width: 64px; text-align: right; font-size: 11px; color: var(--text-muted, #aaa); flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bar-track { flex: 1; height: 14px; background: var(--bg-secondary, #2a2a2a); border-radius: 4px; overflow: hidden; }
-.bar-fill { height: 100%; border-radius: 4px; transition: width 0.4s; min-width: 2px; }
-.bar-value { width: 36px; text-align: left; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
 /* ── leader columns ── */
 .col-num-leader { width: 50px; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 700; }
@@ -2644,16 +2584,6 @@ const comboSectionVisible = ref(false)
 .honor-players { display: flex; flex-wrap: wrap; gap: 4px; }
 .honor-player { display: inline-flex; align-items: center; gap: 2px; padding: 1px 6px; border-radius: 3px; background: rgba(255,255,255,0.06); font-size: 11px; color: var(--text, #ddd); }
 .honor-player em { font-style: normal; font-weight: 700; color: #818cf8; }
-.honor-chip { display: inline-flex; align-items: center; gap: 2px; padding: 1px 5px; border-radius: 3px; background: rgba(165, 180, 252, 0.12); border: 1px solid rgba(165, 180, 252, 0.2); font-size: 10px; color: #a5b4fc; }
-.col-honors { min-width: 120px; }
-.trend-chart { margin-top: 10px; background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px; }
-.trend-svg { width: 100%; height: 120px; }
-.compare-grid { display: grid; grid-template-columns: repeat(2, minmax(240px, 1fr)); gap: 10px; margin-top: 10px; }
-.compare-card { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px 12px; }
-.compare-name { font-size: 14px; font-weight: 700; color: #e5e7eb; margin-bottom: 8px; }
-.compare-row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-muted, #aaa); padding: 2px 0; }
-.compare-row b { color: var(--text, #ddd); font-variant-numeric: tabular-nums; }
-.compare-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
 .combo-tables { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-top: 10px; }
 .combo-block { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px 12px; }
 .combo-title { font-size: 12px; font-weight: 700; color: #a5b4fc; margin-bottom: 6px; }

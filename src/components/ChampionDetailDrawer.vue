@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed } from "vue"
-import { X } from "lucide-vue-next"
+import { computed, ref } from "vue"
+import { ChevronRight, X } from "lucide-vue-next"
 import type { ChampionSummaryItem, GameAssetEntry, MatchDetailResponse } from "../types"
+import { calculateOutputRating } from "../scoring"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
+import GameDetailPopup from "./GameDetailPopup.vue"
 
 const props = defineProps<{
   championId: number
@@ -12,6 +14,8 @@ const props = defineProps<{
   champions: Record<number, ChampionSummaryItem>
   itemMap: Record<number, GameAssetEntry>
   spellMap: Record<number, GameAssetEntry>
+  augmentMap: Record<number, GameAssetEntry>
+  perkMap: Record<number, GameAssetEntry>
   championTotalPicks: number
   championTotalWinRate: number
 }>()
@@ -19,6 +23,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "close"): void
 }>()
+
+const ratingContext = computed(() => ({ items: props.itemMap, champions: props.champions }))
 
 interface DrawerRow {
   gameId: number
@@ -35,10 +41,6 @@ interface DrawerRow {
   itemIds: number[]
   gameName: string
   score: number
-}
-
-function kdaScore(k: number, d: number, a: number) {
-  return Math.round((k + a) / Math.max(d, 0.5) * 10) / 10
 }
 
 const rows = computed<DrawerRow[]>(() => {
@@ -63,13 +65,21 @@ const rows = computed<DrawerRow[]>(() => {
           spell2Id: p.spell2Id,
           itemIds: p.itemIds || [],
           gameName: p.gameName,
-          score: kdaScore(p.kills, p.deaths, p.assists),
+          score: calculateOutputRating(p, ratingContext.value).score,
         })
       }
     }
   }
   return out.sort((a, b) => b.dateStr.localeCompare(a.dateStr))
 })
+
+/* ── 对局详情弹层：保留侧边栏，点击明细行切换本局十人详情 ── */
+const selectedGameId = ref<number | null>(null)
+const selectedGame = computed(() => props.games.find((g) => g.gameId === selectedGameId.value) || null)
+
+function toggleGameDetail(gameId: number) {
+  selectedGameId.value = selectedGameId.value === gameId ? null : gameId
+}
 
 const picks = computed(() => rows.value.length)
 const wins = computed(() => rows.value.filter((r) => r.win).length)
@@ -102,12 +112,12 @@ const avgDamageShare = computed(() => {
 })
 
 const dateGroups = computed(() => {
-  const map = new Map<string, { date: string; count: number; wins: number; scores: number[] }>()
+  const map = new Map<string, { date: string; label: string; count: number; wins: number; scores: number[] }>()
   for (const r of rows.value) {
     const key = r.dateStr.slice(0, 10)
     let e = map.get(key)
     if (!e) {
-      e = { date: r.dateStr.slice(5), count: 0, wins: 0, scores: [] }
+      e = { date: key, label: dateDisplayLabel(key), count: 0, wins: 0, scores: [] }
       map.set(key, e)
     }
     e.count++
@@ -182,6 +192,11 @@ function dateStr(ts: number) {
 function formatDateStr(ts: number) {
   return `${dateStr(ts)} ${new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(ts))}`
 }
+/** "YYYY-MM-DD" → "YYYY/M/D"，例如 2026/8/31 */
+function dateDisplayLabel(dateKey: string) {
+  const [y, m, d] = dateKey.split("-").map(Number)
+  return `${y}/${m}/${d}`
+}
 </script>
 
 <template>
@@ -222,7 +237,7 @@ function formatDateStr(ts: number) {
             <div class="cdd-sec-title">出场日期</div>
             <div class="cdd-date-list">
               <div v-for="e in dateGroups.arr" :key="e.date" class="cdd-date-row">
-                <span class="cdd-date-label">{{ e.date.slice(5) }}</span>
+                <span class="cdd-date-label">{{ e.label }}</span>
                 <div class="cdd-date-bar">
                   <div class="cdd-date-fill" :style="{ width: (e.count / dateGroups.max * 100) + '%' }"></div>
                 </div>
@@ -267,23 +282,44 @@ function formatDateStr(ts: number) {
           </section>
 
           <section class="cdd-card">
-            <div class="cdd-sec-title">对局明细</div>
+            <div class="cdd-sec-title">对局明细 <span class="cdd-sec-hint">点击对局查看本局十人详情</span></div>
             <div v-if="!rows.length" class="cdd-empty">该英雄当前没有对局记录</div>
             <div v-else class="cdd-game-list">
-              <div v-for="(r, idx) in rows" :key="`${r.gameId}-${idx}`" class="cdd-game" :class="r.win ? 'win' : 'lose'">
+              <div
+                v-for="(r, idx) in rows"
+                :key="`${r.gameId}-${idx}`"
+                class="cdd-game clickable"
+                :class="[r.win ? 'win' : 'lose', selectedGameId === r.gameId ? 'selected' : '']"
+                :title="selectedGameId === r.gameId ? '点击收起对局详情' : '点击查看本局十人详情'"
+                @click="toggleGameDetail(r.gameId)"
+              >
                 <span class="cdd-game-side" :class="r.blue ? 'blue' : 'red'">{{ r.blue ? '蓝' : '红' }}</span>
                 <span class="cdd-game-result">{{ r.win ? '胜' : '负' }}</span>
-                <span class="cdd-game-date">{{ r.dateStr.slice(5) }}</span>
+                <span class="cdd-game-name" :title="r.gameName">{{ r.gameName }}</span>
                 <span class="cdd-game-kda">{{ r.kills }}/{{ r.deaths }}/{{ r.assists }}</span>
+                <span class="cdd-game-date">{{ r.dateStr.slice(5, 10) }}</span>
                 <span class="cdd-game-dur">{{ (r.duration / 60).toFixed(0) }}分</span>
-                <span class="cdd-game-score" :class="scoreClass(r.score)">{{ r.score }}</span>
                 <span class="cdd-game-dmg">{{ (r.damageShare * 100).toFixed(0) }}%</span>
+                <span class="cdd-game-score" :class="scoreClass(r.score)">{{ r.score.toFixed(0) }}</span>
+                <ChevronRight :size="12" class="cdd-game-chev" :class="{ open: selectedGameId === r.gameId }" />
               </div>
             </div>
           </section>
         </div>
       </aside>
     </div>
+
+    <GameDetailPopup
+      v-if="selectedGame"
+      :game="selectedGame"
+      :champions="champions"
+      :item-map="itemMap"
+      :spell-map="spellMap"
+      :augment-map="augmentMap"
+      :perk-map="perkMap"
+      :highlight-champion-id="championId"
+      @close="selectedGameId = null"
+    />
   </Teleport>
 </template>
 
@@ -356,10 +392,11 @@ function formatDateStr(ts: number) {
 .cdd-kpi-l { font-size: 11px; color: var(--text-muted, #888); }
 .cdd-kpi-v { font-size: 14px; font-weight: 800; color: #f0f5f4; }
 
-.cdd-sec-title { font-size: 13px; font-weight: 800; color: #dbe7e4; margin-bottom: 10px; }
+.cdd-sec-title { font-size: 13px; font-weight: 800; color: #dbe7e4; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; }
+.cdd-sec-hint { margin-left: auto; font-size: 10px; font-weight: 400; color: var(--text-muted, #666); }
 
 .cdd-date-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.cdd-date-label { width: 52px; font-size: 12px; color: #9fb3ae; }
+.cdd-date-label { width: 68px; font-size: 11px; color: #9fb3ae; flex-shrink: 0; }
 .cdd-date-bar { flex: 1; height: 8px; border-radius: 4px; background: #262a33; overflow: hidden; }
 .cdd-date-fill { height: 100%; background: #6366f1; border-radius: 4px; }
 .cdd-date-meta { width: 82px; text-align: right; font-size: 11px; color: var(--text-muted, #777); }
@@ -381,19 +418,26 @@ function formatDateStr(ts: number) {
 .cdd-item-num { position: absolute; right: -4px; bottom: -4px; min-width: 18px; height: 18px; padding: 0 3px; display: grid; place-items: center; border-radius: 8px; background: #6366f1; color: #fff; font-size: 10px; font-weight: 800; }
 
 .cdd-game-list { display: flex; flex-direction: column; gap: 5px; }
-.cdd-game { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 8px; }
+.cdd-game { display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 8px; }
 .cdd-game.win { background: rgba(34, 197, 94, 0.12); }
 .cdd-game.lose { background: rgba(239, 68, 68, 0.12); }
-.cdd-game-side { width: 22px; font-size: 11px; font-weight: 800; text-align: center; }
+.cdd-game.clickable { cursor: pointer; transition: filter 0.15s, box-shadow 0.15s; }
+.cdd-game.clickable:hover { filter: brightness(1.2); }
+.cdd-game.selected { box-shadow: 0 0 0 2px var(--accent, #818cf8); }
+.cdd-game-side { width: 18px; font-size: 11px; font-weight: 800; text-align: center; flex-shrink: 0; }
 .cdd-game-side.blue { color: #60a5fa; }
 .cdd-game-side.red { color: #f87171; }
-.cdd-game-result { width: 20px; font-size: 12px; font-weight: 800; }
+.cdd-game-result { width: 18px; font-size: 12px; font-weight: 800; flex-shrink: 0; }
 .cdd-game.win .cdd-game-result { color: #4ade80; }
 .cdd-game.lose .cdd-game-result { color: #f87171; }
-.cdd-game-date { flex: 1; font-size: 12px; color: #9fb3ae; }
-.cdd-game-kda { font-size: 12px; font-weight: 800; color: #e0e9e7; }
-.cdd-game-dur { font-size: 11px; color: var(--text-muted, #888); }
-.cdd-game-dmg { font-size: 11px; color: var(--text-muted, #888); text-align: right; }
+.cdd-game-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 800; color: #d6e2df; }
+.cdd-game-date { width: 30px; font-size: 11px; color: #9fb3ae; flex-shrink: 0; }
+.cdd-game-kda { font-size: 12px; font-weight: 800; color: #e0e9e7; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.cdd-game-dur { width: 27px; font-size: 11px; color: var(--text-muted, #888); flex-shrink: 0; }
+.cdd-game-dmg { width: 30px; font-size: 11px; color: var(--text-muted, #888); text-align: right; flex-shrink: 0; }
+.cdd-game-score { width: 26px; font-size: 12px; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.cdd-game-chev { color: var(--text-muted, #777); flex-shrink: 0; transition: transform 0.15s, color 0.15s; }
+.cdd-game-chev.open { transform: rotate(90deg); color: var(--accent, #a5b4fc); }
 
 .cdd-empty { padding: 18px 0; text-align: center; font-size: 13px; color: var(--text-muted, #666); }
 .sc-high { color: #4ade80; }
