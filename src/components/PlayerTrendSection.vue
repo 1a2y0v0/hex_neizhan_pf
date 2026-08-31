@@ -48,10 +48,10 @@ const points = computed(() => player.value?.trend || [])
 
 /* ── 指标 ── */
 const METRICS = [
-  { key: "score", label: "评分", max: 100, fmt: (v: number) => v.toFixed(0), tick: (v: number) => v.toFixed(0) },
-  { key: "kda", label: "KDA", max: 10, fmt: (v: number) => v.toFixed(1), tick: (v: number) => v.toFixed(1) },
-  { key: "damageShare", label: "伤害占比", max: 50, fmt: (v: number) => v.toFixed(1) + "%", tick: (v: number) => v.toFixed(0) + "%" },
-  { key: "dpm", label: "分均伤害", max: 1500, fmt: (v: number) => v.toFixed(0), tick: (v: number) => v.toFixed(0) },
+  { key: "score", label: "评分", minMax: 100, fmt: (v: number) => v.toFixed(0), tick: (v: number) => v.toFixed(0) },
+  { key: "kda", label: "KDA", minMax: 10, fmt: (v: number) => v.toFixed(1), tick: (v: number) => v.toFixed(1) },
+  { key: "damageShare", label: "伤害占比", minMax: 50, fmt: (v: number) => v.toFixed(1) + "%", tick: (v: number) => v.toFixed(0) + "%" },
+  { key: "dpm", label: "分均伤害", minMax: 1000, fmt: (v: number) => v.toFixed(0), tick: (v: number) => v.toFixed(0) },
 ] as const
 type MetricKey = (typeof METRICS)[number]["key"]
 const metricKey = ref<MetricKey>("score")
@@ -60,6 +60,16 @@ const metric = computed(() => METRICS.find((m) => m.key === metricKey.value)!)
 function valueOf(p: TrendPoint, key: MetricKey) {
   return key === "score" ? p.score : key === "kda" ? p.kda : key === "damageShare" ? p.damageShare * 100 : p.dpm
 }
+
+/** 纵轴上限：取当前玩家该指标最大值，按 1/2/5×10ⁿ 向上取整，保证刻度整洁且不被数据顶格。 */
+const metricMax = computed(() => {
+  const m = metric.value
+  const maxVal = points.value.reduce((acc: number, p) => Math.max(acc, valueOf(p, metricKey.value)), m.minMax as number)
+  const mag = Math.pow(10, Math.floor(Math.log10(maxVal)))
+  const norm = maxVal / mag
+  const nice = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10
+  return nice * mag
+})
 
 /* ── 图表几何 ── */
 const W = 780, H = 250
@@ -71,9 +81,9 @@ function xAt(i: number, n: number) {
   return n > 1 ? PAD_L + (i / (n - 1)) * PLOT_W : PAD_L + PLOT_W / 2
 }
 function yAt(v: number) {
-  return PAD_T + PLOT_H - Math.min(Math.max(v / metric.value.max, 0), 1) * PLOT_H
+  return PAD_T + PLOT_H - Math.min(Math.max(v / metricMax.value, 0), 1) * PLOT_H
 }
-const TICKS = computed(() => [0, 1, 2, 3, 4, 5].map((t) => (metric.value.max / 5) * t))
+const TICKS = computed(() => [0, 1, 2, 3, 4, 5].map((t) => (metricMax.value / 5) * t))
 const xLabels = computed(() => {
   const n = points.value.length
   const step = Math.max(1, Math.ceil(n / 10))

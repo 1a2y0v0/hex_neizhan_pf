@@ -1,18 +1,21 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from "vue"
-import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, ChevronsUpDown, Crown, Download, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
+import { computed, createApp, nextTick, onMounted, ref, watch } from "vue"
+import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, Crown, Download, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
 import { loadTodayCustomGames, saveExportFile } from "../api"
 import { save } from "@tauri-apps/plugin-dialog"
 import { toBlob } from "html-to-image"
 import { matchTeamSummary } from "../matchTeamSummary"
 import { buildChampionProfiles, buildPlayerProfile, profileScoreLevel, type ChampionProfile, type PlayerProfile } from "../playerProfile"
 import { calculateOutputRating, outputRatingTitle, scoreEvaluationLabel } from "../scoring"
+import { buildStoreZip, type ZipFileEntry } from "../zipStore"
+import { buildWhiteExportRoot, ensureExportExtension, EXPORT_PRESETS, sanitizeFilename, waitForImages, type ExportPreset } from "../exportUtil"
 import type { ChampionSummaryItem, GameAssetBundle, GameAssetEntry, MatchDetailPlayer, MatchDetailResponse, RecentGame, TodayCustomGamesResponse } from "../types"
 import { championName, fixed, mitigationValue, teamMitigationValue } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
 import ChampionDetailDrawer from "./ChampionDetailDrawer.vue"
 import PlayerCompareSection from "./PlayerCompareSection.vue"
+import PlayerDetailCards from "./PlayerDetailCards.vue"
 import PlayerDetailDrawer from "./PlayerDetailDrawer.vue"
 import PlayerRadarPanel from "./PlayerRadarPanel.vue"
 import PlayerTrendSection from "./PlayerTrendSection.vue"
@@ -94,8 +97,15 @@ function presetRange(key: QuickRangeKey): { start: string; end: string } {
   return { start: toLocalDateStr(start.getTime()), end }
 }
 
-/** 当前日期区间命中的快捷项；手动修改日期且不匹配任何预设时为 "custom"。 */
+/** 用户最近一次在下拉框里选中的快捷项；手动改日期时置为 "custom"。 */
+const quickRangePreference = ref<QuickRangeKey | "custom">("today")
+
+/** 当前日期区间命中的快捷项；优先匹配用户最近选择，其次按预设顺序匹配。 */
 const activeQuickRange = computed<QuickRangeKey | "custom">(() => {
+  if (quickRangePreference.value !== "custom") {
+    const p = presetRange(quickRangePreference.value)
+    if (startDate.value === p.start && endDate.value === p.end) return quickRangePreference.value
+  }
   for (const r of QUICK_RANGES) {
     const p = presetRange(r.key)
     if (startDate.value === p.start && endDate.value === p.end) return r.key
@@ -107,8 +117,14 @@ function onQuickRangeChange(e: Event) {
   const key = (e.target as HTMLSelectElement).value
   if (key === "custom") return
   const p = presetRange(key as QuickRangeKey)
+  quickRangePreference.value = key as QuickRangeKey
   startDate.value = p.start
   endDate.value = p.end
+  load()
+}
+
+function onManualDateChange() {
+  quickRangePreference.value = "custom"
   load()
 }
 
@@ -289,7 +305,6 @@ function rawGame(gameId: number): MatchDetailResponse | undefined {
 
 // game list
 const gameListVisible = ref(false)
-const filteredGames = computed(() => enrichedGames.value)
 const expandedGames = ref<Set<number>>(new Set())
 const hoveredGameId = ref<number | null>(null)
 
@@ -318,33 +333,12 @@ function closePlayerDrawer() {
 const ratingExportRef = ref<HTMLElement | null>(null)
 const exportMenuOpen = ref(false)
 const exporting = ref(false)
+const batchExporting = ref(false)
 const exportMessage = ref("")
-
-type ExportPreset = {
-  key: string
-  label: string
-  ext: string
-  type: string
-  ratio: number
-  quality?: number
-}
-
-const exportPresets: ExportPreset[] = [
-  { key: "png2x", label: "PNG · 2x（无损）", ext: "png", type: "image/png", ratio: 2 },
-  { key: "png3x", label: "PNG · 3x（超清）", ext: "png", type: "image/png", ratio: 3 },
-  { key: "jpeg2x", label: "JPEG · 2x（体积小）", ext: "jpg", type: "image/jpeg", ratio: 2, quality: 0.92 },
-  { key: "jpeg3x", label: "JPEG · 3x（清晰）", ext: "jpg", type: "image/jpeg", ratio: 3, quality: 0.9 },
-  { key: "webp2x", label: "WebP · 2x（平衡）", ext: "webp", type: "image/webp", ratio: 2, quality: 0.92 },
-  { key: "webp3x", label: "WebP · 3x（清晰）", ext: "webp", type: "image/webp", ratio: 3, quality: 0.9 },
-]
 
 function exportFileName(preset: ExportPreset) {
   const range = startDate.value === endDate.value ? startDate.value : `${startDate.value}_${endDate.value}`
   return `内战玩家评分_${range}_${preset.ratio}x.${preset.ext}`
-}
-
-function ensureExportExtension(path: string, ext: string) {
-  return path.toLowerCase().endsWith(`.${ext}`) ? path : `${path}.${ext}`
 }
 
 function buildExportRoot(): HTMLElement | null {
@@ -440,6 +434,75 @@ async function exportRatingImage(preset: ExportPreset) {
     exporting.value = false
   }
 }
+
+/** 批量导出：把当前列表里每个玩家的详情页渲染成 PNG，再打包成一个 ZIP。 */
+async function exportAllPlayerDetails(ratio: number) {
+  exportMenuOpen.value = false
+  if (exporting.value || batchExporting.value) return
+  const list = filteredAndSortedRatings.value
+  if (!list.length) return
+  batchExporting.value = true
+  const range = startDate.value === endDate.value ? startDate.value : `${startDate.value} 至 ${endDate.value}`
+  try {
+    const files: ZipFileEntry[] = []
+    for (let i = 0; i < list.length; i++) {
+      const rating = list[i]
+      exportMessage.value = `正在生成玩家详情 ${i + 1}/${list.length}...`
+      const container = document.createElement("div")
+      container.style.cssText = "position:absolute;left:-99999px;top:0;width:460px;"
+      document.body.appendChild(container)
+      const app = createApp(PlayerDetailCards, { player: rating, champions: props.champions })
+      app.mount(container)
+      try {
+        await nextTick()
+        await document.fonts?.ready
+        await waitForImages(container)
+        const root = buildWhiteExportRoot(
+          container.firstElementChild as HTMLElement,
+          `玩家详情 · ${rating.gameName}#${rating.tagLine} · ${range}`,
+        )
+        document.body.appendChild(root)
+        try {
+          const blob = await toBlob(root, {
+            type: "image/png",
+            pixelRatio: ratio,
+            backgroundColor: "#ffffff",
+            cacheBust: true,
+          })
+          if (!blob) throw new Error("图片生成失败")
+          const data = new Uint8Array(await blob.arrayBuffer())
+          files.push({
+            name: `${String(i + 1).padStart(2, "0")}_${sanitizeFilename(rating.gameName)}_${sanitizeFilename(rating.tagLine)}.png`,
+            data,
+          })
+        } finally {
+          root.remove()
+        }
+      } finally {
+        app.unmount()
+        container.remove()
+      }
+    }
+    exportMessage.value = "正在打包..."
+    const zipBytes = buildStoreZip(files)
+    const path = await save({
+      title: "导出全部玩家详情压缩包",
+      defaultPath: `玩家详情_${sanitizeFilename(range)}_${list.length}人.zip`,
+      filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
+    })
+    if (!path) {
+      exportMessage.value = ""
+      return
+    }
+    await saveExportFile(ensureExportExtension(path, "zip"), Array.from(zipBytes))
+    exportMessage.value = "已导出"
+    window.setTimeout(() => { if (exportMessage.value === "已导出") exportMessage.value = "" }, 3000)
+  } catch (err) {
+    exportMessage.value = `导出失败：${err instanceof Error ? err.message : String(err)}`
+  } finally {
+    batchExporting.value = false
+  }
+}
 /* ── enriched games ── */
 const enrichedGames = computed<GameEnriched[]>(() => {
   return visibleGames.value.map((game) => {
@@ -481,13 +544,8 @@ function toggleGameExpand(gameId: number) {
 
 /* ── 跨模块联动：图表 → 评分表 / 对局列表 ── */
 function focusPlayer(puuid: string) {
-  ratingSectionVisible.value = true
+  // 只弹出玩家详情侧边栏，保持当前视图与滚动位置不变
   openPlayerDrawer(puuid)
-  if (drawerPlayer.value) {
-    nextTick(() => {
-      document.querySelector(`[data-puuid="${puuid}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" })
-    })
-  }
 }
 
 function focusGame(gameId: number) {
@@ -791,6 +849,14 @@ const playerRatings = computed<PlayerRating[]>(() => {
     })
   }
   return ratings.sort((a, b) => b.profile.overallScore - a.profile.overallScore)
+})
+
+// 数据刷新后同步玩家详情抽屉内容，避免展示旧数据
+watch(playerRatings, (list) => {
+  if (!drawerPlayer.value) return
+  const fresh = list.find((r) => r.puuid === drawerPlayer.value!.puuid)
+  if (fresh) drawerPlayer.value = fresh
+  else drawerPlayer.value = null
 })
 
 /* ── load ── */
@@ -1340,26 +1406,39 @@ const comboSectionVisible = ref(false)
       <div class="header-actions">
         <div class="date-picker-wrap">
           <Calendar :size="14" />
-          <input type="date" v-model="startDate" @change="load" class="date-input" />
+          <input type="date" v-model="startDate" @change="onManualDateChange" class="date-input" />
           <span class="date-sep">—</span>
-          <input type="date" v-model="endDate" @change="load" class="date-input" />
+          <input type="date" v-model="endDate" @change="onManualDateChange" class="date-input" />
           <select :value="activeQuickRange" @change="onQuickRangeChange" class="quick-range-select" title="快速切换时间范围">
             <option v-for="r in QUICK_RANGES" :key="r.key" :value="r.key">{{ r.label }}</option>
             <option v-if="activeQuickRange === 'custom'" value="custom">自定义</option>
           </select>
         </div>
-        <button class="toggle-sub" :class="{ active: customOnly }" @click="customOnly = !customOnly; load()" style="min-width:72px">
+        <button class="toggle-sub" :class="{ active: customOnly }" @click="customOnly = !customOnly; load()" style="min-width:72px" title="开启时仅统计自定义模式（队列 3270）的内战对局；关闭后包含当天全部对局">
           <component :is="customOnly ? Check : X" :size="16" />
           <span style="font-size:13px">{{ customOnly ? '仅显示内战' : '全部对局' }}</span>
         </button>
-        <button class="toggle-sub" :class="{ active: fiveV5Only }" @click="fiveV5Only = !fiveV5Only" style="min-width:72px">
+        <button class="toggle-sub" :class="{ active: fiveV5Only }" @click="fiveV5Only = !fiveV5Only" style="min-width:72px" title="开启时仅统计双方各 5 名玩家的完整 5V5 对局；关闭后包含其它人数的对局">
           <component :is="fiveV5Only ? Check : X" :size="16" />
           <span style="font-size:13px">5V5</span>
         </button>
-        <button class="toggle-sub" :class="{ active: minDuration8 }" @click="minDuration8 = !minDuration8" style="min-width:72px">
+        <button class="toggle-sub" :class="{ active: minDuration8 }" @click="minDuration8 = !minDuration8" style="min-width:72px" title="开启时过滤游戏时长不足 8 分钟的对局（避免速投/重开污染统计）；关闭后包含所有时长的对局">
           <component :is="minDuration8 ? Check : X" :size="16" />
           <span style="font-size:13px">>8min</span>
         </button>
+        <div class="toggle-sub min-games-input" :class="{ active: minGameCount > 0 }" title="全局玩家样本门槛：仅统计场数≥该值的玩家，影响汇总、图表、雷达、荣誉墙、趋势与对比；对局列表、阵容/搭档、英雄/装备榜仍按全部对局统计。留空为不限">
+          <span style="font-size:13px">场数≥</span>
+          <input
+            v-model="minGameCountText"
+            type="number"
+            min="1"
+            step="1"
+            placeholder="不限"
+            class="min-games-input-box"
+            @change="applyMinGameCount"
+            @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+          />
+        </div>
         <button v-if="deletedGameIds.size > 0" class="toggle-sub" @click="restoreDeletedGames" title="恢复已删除的对局" style="min-width:72px">
           <X :size="14" />
           <span style="font-size:13px">已删除 {{ deletedGameIds.size }} 局 · 恢复</span>
@@ -1419,17 +1498,17 @@ const comboSectionVisible = ref(false)
 
       <!-- ═══════════════ GAME LIST ═══════════════ -->
       <div class="game-section" v-if="enrichedGames.length > 0">
-        <div class="game-section-header">
+        <div class="game-section-header" @click="gameListVisible = !gameListVisible">
           <div class="gsh-left">
-            <span class="section-title" @click="gameListVisible = !gameListVisible" style="cursor:pointer">
+            <span class="section-title">
               <component :is="gameListVisible ? ChevronDown : ChevronRight" :size="14" />
-              对局列表 ({{ filteredGames.length }})
+              对局列表 ({{ enrichedGames.length }})
             </span>
           </div>
         </div>
 
         <div v-show="gameListVisible" class="game-list">
-          <div v-for="game in filteredGames" :key="game.gameId" :data-game-id="game.gameId" class="game-card-outer">
+          <div v-for="game in enrichedGames" :key="game.gameId" :data-game-id="game.gameId" class="game-card-outer">
             <div
               class="game-card"
               :class="{ 'game-has-expanded': expandedGames.has(game.gameId) }"
@@ -1644,52 +1723,47 @@ const comboSectionVisible = ref(false)
 
       <!-- ═══════════════ RATING TABLE ═══════════════ -->
       <div v-else class="rating-table-wrap" ref="ratingExportRef">
-        <div class="section-title" style="display:flex;align-items:center;gap:6px;padding:6px 0;margin-bottom:0;cursor:pointer" @click="ratingSectionVisible = !ratingSectionVisible">
+        <div class="section-title rating-title-line" @click="ratingSectionVisible = !ratingSectionVisible">
           <component :is="ratingSectionVisible ? ChevronDown : ChevronRight" :size="14" />
           玩家评分
-          <button class="toggle-sub" :class="{ active: gameListVisible }" @click.stop="gameListVisible = !gameListVisible" style="margin-left:8px;font-size:11px">
-            <ChevronsUpDown :size="12" /> {{ gameListVisible ? '隐藏对局' : '显示对局' }}
-          </button>
         </div>
 
         <div v-show="ratingSectionVisible">
         <div class="filter-bar">
           <input v-model="filterText" placeholder="搜索玩家..." class="filter-input" />
           <button class="toggle-sub" :class="{ active: showExtremes }" @click="showExtremes = !showExtremes" style="min-width:52px">
-            <component :is="showExtremes ? ChevronDown : ChevronUp" :size="14" />
+            <component :is="showExtremes ? ChevronUp : ChevronDown" :size="14" />
             极值
           </button>
-          <button class="toggle-sub" @click="showSubColumns = !showSubColumns">
+          <button class="toggle-sub" :class="{ active: showSubColumns }" @click="showSubColumns = !showSubColumns">
             <component :is="showSubColumns ? ChevronUp : ChevronDown" :size="14" />
             {{ showSubColumns ? '收起' : '展开' }}详细
           </button>
-          <button class="toggle-sub" @click="showEfficiencyColumns = !showEfficiencyColumns">
+          <button class="toggle-sub" :class="{ active: showEfficiencyColumns }" @click="showEfficiencyColumns = !showEfficiencyColumns">
             <component :is="showEfficiencyColumns ? ChevronUp : ChevronDown" :size="14" />
             {{ showEfficiencyColumns ? '收起' : '展开' }}效率
           </button>
-          <div class="toggle-sub min-games-input" :class="{ active: minGameCount > 0 }" title="仅统计场数≥该值的玩家，留空为不限">
-            <span style="font-size:13px">场数≥</span>
-            <input
-              v-model="minGameCountText"
-              type="number"
-              min="1"
-              step="1"
-              placeholder="不限"
-              class="min-games-input-box"
-              @change="applyMinGameCount"
-              @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
-            />
-          </div>
           <span class="filter-count">{{ filteredAndSortedRatings.length }} / {{ playerRatings.length }}</span>
           <div class="export-menu-wrap">
-            <button class="toggle-sub" :class="{ active: exportMenuOpen }" @click="exportMenuOpen = !exportMenuOpen" :disabled="exporting || filteredAndSortedRatings.length === 0" style="min-width:86px">
+            <button class="toggle-sub" :class="{ active: exportMenuOpen }" @click="exportMenuOpen = !exportMenuOpen" :disabled="exporting || batchExporting || filteredAndSortedRatings.length === 0" style="min-width:86px">
               <Download :size="14" />
-              <span style="font-size:13px">{{ exporting ? "导出中..." : "导出图片" }}</span>
+              <span style="font-size:13px">{{ exporting || batchExporting ? "导出中..." : "导出图片" }}</span>
             </button>
             <div v-if="exportMenuOpen" class="export-menu">
-              <button v-for="p in exportPresets" :key="p.key" class="export-menu-item" @click="exportRatingImage(p)">
+              <div class="export-menu-group">评分面板（全部玩家）</div>
+              <button v-for="p in EXPORT_PRESETS" :key="p.key" class="export-menu-item" @click="exportRatingImage(p)">
                 <span>{{ p.label }}</span>
                 <span class="export-menu-desc">{{ p.type === "image/png" ? "无损" : p.type === "image/jpeg" ? "体积小" : "平衡" }}</span>
+              </button>
+              <div class="export-menu-divider"></div>
+              <div class="export-menu-group">玩家详情页（每人一张，打包 ZIP）</div>
+              <button class="export-menu-item" :disabled="batchExporting" @click="exportAllPlayerDetails(2)">
+                <span>ZIP · PNG 2x（推荐）</span>
+                <span class="export-menu-desc">{{ filteredAndSortedRatings.length }} 人</span>
+              </button>
+              <button class="export-menu-item" :disabled="batchExporting" @click="exportAllPlayerDetails(3)">
+                <span>ZIP · PNG 3x（超清）</span>
+                <span class="export-menu-desc">{{ filteredAndSortedRatings.length }} 人</span>
               </button>
             </div>
           </div>
@@ -1702,7 +1776,6 @@ const comboSectionVisible = ref(false)
               <tr>
                 <th class="col-rank">#</th>
                 <th class="col-player sortable" @click="sortBy('gameName')">玩家{{ sortIcon('gameName') }}</th>
-                <th class="col-champs">英雄</th>
                 <th class="col-num sortable" @click="sortBy('gamesPlayed')">场{{ sortIcon('gamesPlayed') }}</th>
                 <th class="col-num sortable" @click="sortBy('wins')">胜{{ sortIcon('wins') }}</th>
                 <th class="col-num-sortable sortable" @click="sortBy('winRate')">胜率{{ sortIcon('winRate') }}</th>
@@ -1734,7 +1807,7 @@ const comboSectionVisible = ref(false)
             <tbody>
               <tr v-if="filteredAndSortedRatings.length === 0">
                 <td colspan="19" class="empty-table-row">
-                  {{ minGameCount > 0 ? `场数≥${minGameCount} 过滤后暂无玩家，请调低场数限制` : '该日期没有对局记录' }}
+                  {{ minGameCount > 0 ? `场数≥${minGameCount} 过滤后暂无玩家，请调低顶部场数限制` : '该日期没有对局记录' }}
                 </td>
               </tr>
               <tr
@@ -1746,14 +1819,6 @@ const comboSectionVisible = ref(false)
               >
                 <td class="col-rank">{{ index + 1 }}</td>
                 <td class="col-player"><UserRound :size="14" /> {{ rating.gameName }}#{{ rating.tagLine }}</td>
-                <td class="col-champs">
-                  <div class="champ-icons">
-                    <div v-for="cp in rating.championProfiles.slice(0, 3)" :key="cp.championId" class="champ-with-score">
-                      <ChampionAvatar :champion-id="cp.championId" :champions="props.champions" :size="28" />
-                      <span class="champ-score" :class="scoreClass(cp.averageScore)">{{ cp.averageScore.toFixed(0) }}</span>
-                    </div>
-                  </div>
-                </td>
                 <td class="col-num">{{ rating.gamesPlayed }}</td>
                 <td class="col-num">{{ rating.wins }}</td>
                 <td class="col-num wr-cell" :class="winRate(rating) >= 50 ? 'wr-high' : 'wr-low'">{{ winRate(rating).toFixed(0) }}%</td>
@@ -2301,8 +2366,10 @@ const comboSectionVisible = ref(false)
 .panel-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px; }
 .panel-header h2 { margin: 0; }
 .section-title { font-size: 14px; font-weight: 700; color: inherit; white-space: nowrap; }
+.rating-title-line { display: flex; align-items: center; gap: 6px; padding: 6px 0; margin-bottom: 0; cursor: pointer; }
+.rating-title-line:hover { color: var(--accent, #6366f1); }
 .eyebrow { font-size: 11px; color: var(--text-muted, #888); text-transform: uppercase; letter-spacing: 0.5px; }
-.header-actions { display: flex; align-items: center; gap: 8px; }
+.header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .date-picker-wrap { display: flex; align-items: center; gap: 4px; background: var(--bg-tertiary, #2a2a2a); border: 1px solid var(--border, #444); border-radius: 6px; padding: 6px 10px; color: var(--text-muted, #888); }
 .date-input { background: transparent; border: none; color: inherit; font-size: 13px; outline: none; font-family: inherit; width: 110px; }
 .date-input::-webkit-calendar-picker-indicator { filter: invert(0.7); cursor: pointer; }
@@ -2337,7 +2404,8 @@ const comboSectionVisible = ref(false)
 
 /* ── game section ── */
 .game-section { display: flex; flex-direction: column; gap: 8px; }
-.game-section-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 6px 0; }
+.game-section-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 6px 0; cursor: pointer; user-select: none; }
+.game-section-header:hover { color: var(--accent, #6366f1); }
 .gsh-left { display: flex; align-items: center; gap: 8px; }
 .gsh-left .section-title { display: inline-flex; align-items: center; gap: 6px; }
 .gsh-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -2463,14 +2531,17 @@ const comboSectionVisible = ref(false)
 .export-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 40; min-width: 190px; background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 6px; box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35); padding: 4px; display: flex; flex-direction: column; }
 .export-menu-item { display: flex; justify-content: space-between; gap: 12px; padding: 7px 9px; border: none; background: none; color: var(--text, #eee); font-size: 12px; text-align: left; cursor: pointer; border-radius: 4px; }
 .export-menu-item:hover { background: var(--accent, #6366f1); color: #fff; }
+.export-menu-item:disabled { opacity: 0.5; cursor: not-allowed; }
 .export-menu-desc { font-size: 11px; color: var(--text-muted, #888); }
 .export-menu-item:hover .export-menu-desc { color: rgba(255, 255, 255, 0.8); }
+.export-menu-group { padding: 6px 9px 3px; font-size: 11px; font-weight: 700; color: var(--text-muted, #888); white-space: nowrap; }
+.export-menu-divider { height: 1px; margin: 4px 6px; background: var(--border, #333); }
 .export-message { font-size: 11px; color: var(--accent, #a5b4fc); white-space: nowrap; }
 .toggle-sub:disabled { opacity: 0.6; cursor: not-allowed; }
 .empty-table-row { text-align: center; color: var(--text-muted, #888); font-size: 12px; padding: 24px 0 !important; }
 
 /* ── rating table ── */
-.rating-table-wrap { overflow-x: auto; position: relative; }
+.rating-table-wrap { overflow-x: auto; position: relative; border-top: 1px solid var(--border, #333); padding-top: 8px; }
 .table-scroll { overflow-x: auto; }
 .rating-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .rating-table th, .rating-table td { padding: 7px 8px; text-align: center; border-bottom: 1px solid var(--border, #333); vertical-align: middle; }
@@ -2481,12 +2552,11 @@ const comboSectionVisible = ref(false)
 /* zebra */
 .row-zebra { background: rgba(255,255,255,0.02); }
 .rating-table tbody tr { cursor: pointer; }
-.rating-table tbody tr:hover { background: rgba(99, 102, 241, 0.06); }
+.rating-table tbody tr:hover { background: rgba(99, 102, 241, 0.14) !important; }
 
 .col-player { text-align: left; min-width: 100px; white-space: nowrap; }
 .col-player :deep(svg) { vertical-align: middle; margin-right: 4px; }
 .col-rank { width: 28px; }
-.col-champs { min-width: 90px; }
 
 .col-num { width: 36px; font-variant-numeric: tabular-nums; }
 .col-num-sortable { width: 40px; font-variant-numeric: tabular-nums; }
@@ -2505,10 +2575,6 @@ const comboSectionVisible = ref(false)
 .col-score.sc-high { color: #4ade80; }
 .col-score.sc-mid { color: #60a5fa; background: rgba(96, 165, 250, 0.18); }
 .col-score.sc-low { color: #f87171; }
-
-.champ-icons { display: flex; gap: 4px; justify-content: center; }
-.champ-with-score { display: flex; flex-direction: column; align-items: center; gap: 2px; }
-.champ-score { font-size: 10px; font-weight: 700; line-height: 1; padding: 1px 3px; border-radius: 3px; font-variant-numeric: tabular-nums; }
 .sc-high { color: #4ade80; background: rgba(74, 222, 128, 0.15); }
 .sc-mid { color: #60a5fa; background: rgba(96, 165, 250, 0.18); }
 .sc-low { color: #f87171; background: rgba(248, 113, 113, 0.15); }

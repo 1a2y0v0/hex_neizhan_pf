@@ -98,7 +98,7 @@ const scatterPoints = computed<ScatterPoint[]>(() =>
       p,
       x: PAD_L + ((s - X_MIN) / (X_MAX - X_MIN)) * PLOT_W,
       y: PAD_T + PLOT_H - (wr / Y_MAX) * PLOT_H,
-      r: Math.min(14, 4 + Math.sqrt(Math.max(p.gamesPlayed, 1)) * 1.4),
+      r: Math.min(8, 3 + Math.sqrt(Math.max(p.gamesPlayed, 1)) * 0.55),
       wr,
     }
   }),
@@ -122,7 +122,7 @@ function onScatterMove(e: MouseEvent) {
     const d = Math.hypot(pt.x - mx, pt.y - my)
     if (d < bestD) { bestD = d; best = i }
   })
-  scatterHover.value = bestD <= 16 ? best : null
+  scatterHover.value = bestD <= 12 ? best : null
   if (scatterHover.value != null) {
     const wrect = wrap.getBoundingClientRect()
     const left = Math.max(0, Math.min(e.clientX - wrect.left + 14, wrect.width - 220))
@@ -176,7 +176,7 @@ const redPct = computed(() => Math.round((props.redWins / sideTotal.value) * 100
           </div>
           <div v-if="!scoreRanking.length" class="chart-empty">暂无玩家数据</div>
         </div>
-        <div class="chart-caption">点击条可定位评分表中的该玩家</div>
+        <div class="chart-caption">点击条可查看该玩家详情</div>
       </div>
 
       <!-- 玩家胜率榜 -->
@@ -202,7 +202,7 @@ const redPct = computed(() => Math.round((props.redWins / sideTotal.value) * 100
           </div>
           <div v-if="!winRateRanking.length" class="chart-empty">暂无玩家数据</div>
         </div>
-        <div class="chart-caption">点击条可定位评分表中的该玩家</div>
+        <div class="chart-caption">点击条可查看该玩家详情</div>
       </div>
 
       <!-- 英雄出场 TOP -->
@@ -248,9 +248,9 @@ const redPct = computed(() => Math.round((props.redWins / sideTotal.value) * 100
               :cy="pt.y"
               :r="scatterHover === i ? pt.r + 2 : pt.r"
               :fill="scoreColor(pt.p.profile.overallScore)"
-              fill-opacity="0.78"
+              fill-opacity="0.72"
               :stroke="scatterHover === i ? '#ffffff' : 'rgba(255,255,255,0.35)'"
-              :stroke-width="scatterHover === i ? 1.5 : 0.6"
+              :stroke-width="scatterHover === i ? 1.5 : 0.5"
               style="cursor: pointer"
             />
           </svg>
@@ -261,7 +261,7 @@ const redPct = computed(() => Math.round((props.redWins / sideTotal.value) * 100
           </div>
           <div v-if="!scatterPoints.length" class="scatter-empty">暂无玩家数据</div>
         </div>
-        <div class="chart-caption">横轴综合分 · 纵轴胜率 · 气泡大小=场次 · 点击可定位玩家</div>
+        <div class="chart-caption">横轴综合分 · 纵轴胜率 · 气泡大小=场次 · 点击可查看玩家详情</div>
       </div>
 
       <!-- 蓝红方胜场 -->
