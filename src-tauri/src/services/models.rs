@@ -282,6 +282,9 @@ pub struct Participant {
     /// 对敌方C位击杀的助攻数，来自 timeline 事件解析。
     #[serde(default)]
     pub carry_assists: u32,
+    /// 对每位受害者的击杀/助攻明细，来自 timeline CHAMPION_KILL 事件解析。
+    #[serde(default)]
+    pub kill_relations: Vec<KillRelationEntry>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -451,6 +454,18 @@ pub struct RatingCompositionEntry {
     pub item_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillRelationEntry {
+    pub victim_participant_id: u32,
+    #[serde(default)]
+    pub victim_puuid: String,
+    #[serde(default)]
+    pub kills: u32,
+    #[serde(default)]
+    pub assists: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecentGame {
@@ -560,6 +575,9 @@ pub struct RecentGame {
     /// 本队对敌方C位的总击杀数（用于算切C参与率）。
     #[serde(default)]
     pub team_carry_kills: u32,
+    /// 对每位受害者的击杀/助攻明细（来自 timeline CHAMPION_KILL 事件）。
+    #[serde(default)]
+    pub kill_relations: Vec<KillRelationEntry>,
     pub game_creation: i64,
     pub game_duration: i64,
 }

@@ -692,6 +692,7 @@ fn sgp_game_json_to_lcu_game(game: SgpGameJson) -> Game {
                 },
                 carry_kills: 0,
                 carry_assists: 0,
+                kill_relations: Vec::new(),
             }
         })
         .collect();

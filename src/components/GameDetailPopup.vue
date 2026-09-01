@@ -70,6 +70,17 @@ const teams = computed<EnrichedTeam[]>(() => {
 const allPlayers = computed(() => teams.value.flatMap((t) => t.players))
 const mvp = computed(() => allPlayers.value.reduce((best, x) => (x.score > best.score ? x : best), allPlayers.value[0]))
 
+const playerNames = computed(() => {
+  const map = new Map<string, string>()
+  for (const team of props.game.teams) {
+    for (const p of team.players) map.set(p.puuid, p.gameName)
+  }
+  return map
+})
+function victimName(puuid: string) {
+  return playerNames.value.get(puuid) || puuid
+}
+
 /* ── 格式化 ── */
 function kNumber(value: number) {
   return `${(value / 1000).toFixed(1)}k`
@@ -232,6 +243,28 @@ function formatDateTime(ts: number) {
             </div>
           </div>
         </section>
+
+        <!-- 击杀关系 -->
+        <section class="gdp-kills-card">
+          <div class="gdp-sec-title">击杀关系（谁杀了谁）</div>
+          <div class="gdp-kill-list">
+            <div v-for="x in allPlayers" :key="x.p.puuid" class="gdp-kill-row">
+              <ChampionAvatar :champion-id="x.p.championId" :champions="champions" :size="20" />
+              <span class="gdp-kill-name">{{ x.p.gameName }}</span>
+              <div class="gdp-kill-chips">
+                <span
+                  v-for="kr in x.p.killRelations || []"
+                  :key="kr.victimPuuid"
+                  class="gdp-kill-chip"
+                  :title="`${victimName(kr.victimPuuid)} · 击杀 ${kr.kills} 次${kr.assists ? ` · 助攻 ${kr.assists} 次` : ''}`"
+                >
+                  {{ victimName(kr.victimPuuid) }} ×{{ kr.kills }}<em v-if="kr.assists">+{{ kr.assists }}助</em>
+                </span>
+                <span v-if="!(x.p.killRelations || []).length" class="gdp-kill-none">本局无击杀</span>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   </Teleport>
@@ -383,6 +416,18 @@ function formatDateTime(ts: number) {
 .gdp-score { height: 40px; flex-direction: column; gap: 2px; border-radius: 7px; background: rgba(255, 255, 255, 0.06); padding: 3px; text-align: center; }
 .gdp-score strong { position: relative; z-index: 1; color: inherit; font-size: 16px; font-weight: 950; line-height: 1; white-space: nowrap; }
 .gdp-score span { position: relative; z-index: 1; max-width: 100%; color: inherit; font-size: 9.5px; font-weight: 900; line-height: 1; white-space: nowrap; }
+
+/* 击杀关系 */
+.gdp-kills-card { border: 1px solid var(--border, #444); border-radius: 10px; background: #12121a; padding: 12px; }
+.gdp-sec-title { font-size: 13px; font-weight: 800; color: #dbe7e4; margin-bottom: 10px; }
+.gdp-kill-list { display: flex; flex-direction: column; gap: 6px; }
+.gdp-kill-row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 6px; background: rgba(255, 255, 255, 0.04); }
+.gdp-kill-name { width: 110px; flex-shrink: 0; font-size: 12px; font-weight: 700; color: #d8d8e0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gdp-kill-chips { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.gdp-kill-chip { display: inline-flex; align-items: center; gap: 2px; padding: 1px 7px; border-radius: 4px; background: rgba(248, 113, 113, 0.12); border: 1px solid rgba(248, 113, 113, 0.35); color: #fca5a5; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.gdp-kill-chip em { font-style: normal; font-weight: 600; color: #9ca3af; }
+.gdp-kill-none { font-size: 11px; color: var(--text-muted, #666); }
+
 .sc-high { color: #4ade80; }
 .sc-mid { color: #60a5fa; }
 .sc-low { color: #f87171; }

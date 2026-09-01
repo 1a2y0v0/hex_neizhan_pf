@@ -130,6 +130,13 @@ export interface RatingCompositionEntry {
   itemIds: number[]
 }
 
+export interface KillRelationEntry {
+  victimParticipantId: number
+  victimPuuid: string
+  kills: number
+  assists: number
+}
+
 export interface RecentGame {
   gameId: number
   championId: number
@@ -185,6 +192,8 @@ export interface RecentGame {
   carryKills: number
   carryAssists: number
   teamCarryKills: number
+  /** 对每位受害者的击杀/助攻明细（来自对局时间线 CHAMPION_KILL 事件）。 */
+  killRelations?: KillRelationEntry[]
   gameCreation: number
   gameDuration: number
 }

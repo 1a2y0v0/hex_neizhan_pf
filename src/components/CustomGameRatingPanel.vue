@@ -9,7 +9,7 @@ import { buildChampionProfiles, buildPlayerProfile, profileScoreLevel, type Cham
 import { calculateOutputRating, outputRatingTitle, scoreEvaluationLabel } from "../scoring"
 import { buildStoreZip, type ZipFileEntry } from "../zipStore"
 import { buildWhiteExportRoot, ensureExportExtension, EXPORT_PRESETS, sanitizeFilename, waitForImages, type ExportPreset } from "../exportUtil"
-import type { ChampionSummaryItem, GameAssetBundle, GameAssetEntry, MatchDetailPlayer, MatchDetailResponse, RecentGame, TodayCustomGamesResponse } from "../types"
+import type { ChampionSummaryItem, GameAssetBundle, GameAssetEntry, KillRelationEntry, MatchDetailPlayer, MatchDetailResponse, RecentGame, TodayCustomGamesResponse } from "../types"
 import { championName, fixed, mitigationValue, teamMitigationValue } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
@@ -201,6 +201,10 @@ interface TrendPoint {
   score: number; kda: number; damageShare: number; dpm: number
 }
 
+interface PlayerKillMapEntry {
+  puuid: string; name: string; kills: number; assists: number; games: number; avgKills: number
+}
+
 interface PlayerRating {
   puuid: string; gameName: string; tagLine: string; summonerName: string
   gamesPlayed: number; wins: number; profile: PlayerProfile
@@ -210,6 +214,7 @@ interface PlayerRating {
   avgGpm: number; avgDpm: number; avgCspm: number; avgKp: number; avgKillShare: number; avgMitigationPerDeath: number
   honors: Record<string, number>
   trend: TrendPoint[]
+  killMap: PlayerKillMapEntry[]
   damageLeaderCount: number; mitigationLeaderCount: number; assistLeaderCount: number
   leaderGameIds: { damage: number[]; mitigation: number[]; assist: number[] }
   gameRecords: PlayerGameRecord[]
@@ -228,6 +233,7 @@ interface GamePlayerEnriched {
   gameScore: number; win: boolean
   damageDealtToChampions: number; totalDamageTaken: number; totalHeal: number
   teamDamageToChampions: number; teamTotalDamageTaken: number; teamDamageSelfMitigated: number
+  killRelations: KillRelationEntry[]
 }
 
 interface GameEnriched {
@@ -518,6 +524,7 @@ const enrichedGames = computed<GameEnriched[]>(() => {
         teamDamageToChampions: p.teamDamageToChampions || 0,
         teamTotalDamageTaken: p.teamTotalDamageTaken || 0,
         teamDamageSelfMitigated: p.damageSelfMitigated || 0,
+        killRelations: p.killRelations || [],
       }))
       const avgScore = players.reduce((s, p) => s + p.gameScore, 0) / players.length
       return { teamId: team.teamId, win: team.win, players, avgScore }
@@ -734,6 +741,28 @@ const playerRatings = computed<PlayerRating[]>(() => {
   const games = visibleGames.value
   if (!games.length) return []
 
+  const nameOf = new Map<string, string>()
+  const coOpponentGames = new Map<string, number>()
+  for (const game of games) {
+    const teamOf = new Map<string, number>()
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        nameOf.set(p.puuid, p.gameName)
+        teamOf.set(p.puuid, team.teamId)
+      }
+    }
+    const players = [...teamOf.keys()]
+    for (let i = 0; i < players.length; i++) {
+      for (let j = i + 1; j < players.length; j++) {
+        const a = players[i]
+        const b = players[j]
+        if (teamOf.get(a) === teamOf.get(b)) continue
+        const key = a < b ? `${a}|${b}` : `${b}|${a}`
+        coOpponentGames.set(key, (coOpponentGames.get(key) || 0) + 1)
+      }
+    }
+  }
+
   const leaderCounts = new Map<string, ReturnType<typeof leaderInit>>()
   const honorCounts = new Map<string, Record<string, number>>()
   for (const game of games) {
@@ -833,6 +862,29 @@ const playerRatings = computed<PlayerRating[]>(() => {
         dpm: (r.damageToChampions || 0) / minutes,
       }
     })
+    const victimAgg = new Map<string, { kills: number; assists: number }>()
+    for (const r of entry.records) {
+      for (const kr of r.killRelations || []) {
+        const e = victimAgg.get(kr.victimPuuid) || { kills: 0, assists: 0 }
+        e.kills += kr.kills
+        e.assists += kr.assists
+        victimAgg.set(kr.victimPuuid, e)
+      }
+    }
+    const killMap: PlayerKillMapEntry[] = [...victimAgg.entries()]
+      .map(([puuid, v]) => {
+        const pair = player.puuid < puuid ? `${player.puuid}|${puuid}` : `${puuid}|${player.puuid}`
+        const games = coOpponentGames.get(pair) || 0
+        return {
+          puuid,
+          name: nameOf.get(puuid) || puuid,
+          kills: v.kills,
+          assists: v.assists,
+          games,
+          avgKills: games > 0 ? v.kills / games : 0,
+        }
+      })
+      .sort((a, b) => b.kills - a.kills || b.avgKills - a.avgKills || b.assists - a.assists)
     ratings.push({
       puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine,
       summonerName: player.summonerName, gamesPlayed: n, wins: entry.wins,
@@ -842,6 +894,7 @@ const playerRatings = computed<PlayerRating[]>(() => {
       avgGpm, avgDpm, avgCspm, avgKp, avgKillShare, avgMitigationPerDeath,
       honors: honorCounts.get(player.puuid) || honorInit(),
       trend,
+      killMap,
       highlightGames: gameRecords.filter((r) => r.score >= 80).length,
       disasterGames: gameRecords.filter((r) => r.score < 60).length,
       damageLeaderCount: lead.damage, mitigationLeaderCount: lead.mitigation, assistLeaderCount: lead.assist,
@@ -1285,6 +1338,146 @@ const honorWall = computed(() => {
   }
   return rows
 })
+
+/* ── 击杀与被击杀榜：按选定玩家展示双向击杀关系 ── */
+interface VendettaSideRow {
+  puuid: string
+  name: string
+  kills: number
+  assists: number
+  /** 双方同场且互为对手的对局数 */
+  games: number
+  /** 对位场次内的场均击杀数 */
+  avgKills: number
+}
+const vendettaSectionVisible = ref(false)
+const vendettaPuuid = ref("")
+
+/** 出现过击杀关系（作为杀手或受害者）的玩家列表，按下拉菜单展示。 */
+const vendettaPlayers = computed(() => {
+  const gamesMap = new Map<string, { puuid: string; name: string; games: number }>()
+  const killerSet = new Set<string>()
+  const victimSet = new Set<string>()
+  for (const game of visibleGames.value) {
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        let e = gamesMap.get(p.puuid)
+        if (!e) {
+          e = { puuid: p.puuid, name: p.gameName, games: 0 }
+          gamesMap.set(p.puuid, e)
+        }
+        e.games++
+        for (const kr of p.killRelations || []) {
+          killerSet.add(p.puuid)
+          victimSet.add(kr.victimPuuid)
+        }
+      }
+    }
+  }
+  return [...gamesMap.values()]
+    .filter((e) => killerSet.has(e.puuid) || victimSet.has(e.puuid))
+    .sort((a, b) => b.games - a.games || a.name.localeCompare(b.name))
+})
+
+watch(vendettaPlayers, (list) => {
+  if (!list.some((p) => p.puuid === vendettaPuuid.value)) vendettaPuuid.value = list[0]?.puuid || ""
+})
+
+/** 选定玩家的击杀榜（我杀谁）与被击杀榜（谁杀我）。 */
+const vendettaTarget = computed(() => {
+  const target = vendettaPuuid.value
+  const nameOf = new Map<string, string>()
+  for (const game of visibleGames.value) {
+    for (const team of game.teams) {
+      for (const p of team.players) nameOf.set(p.puuid, p.gameName)
+    }
+  }
+  const killsMap = new Map<string, { kills: number; assists: number }>()
+  const deathsMap = new Map<string, { kills: number; assists: number }>()
+  // 双方同场且互为对手的对局数（对位场次，作为场均击杀的分母）
+  const coOpponentGames = new Map<string, number>()
+  for (const game of visibleGames.value) {
+    const teamOf = new Map<string, number>()
+    for (const team of game.teams) {
+      for (const p of team.players) teamOf.set(p.puuid, team.teamId)
+    }
+    const players = [...teamOf.keys()]
+    for (let i = 0; i < players.length; i++) {
+      for (let j = i + 1; j < players.length; j++) {
+        const a = players[i]
+        const b = players[j]
+        if (teamOf.get(a) === teamOf.get(b)) continue
+        const key = a < b ? `${a}|${b}` : `${b}|${a}`
+        coOpponentGames.set(key, (coOpponentGames.get(key) || 0) + 1)
+      }
+    }
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        for (const kr of p.killRelations || []) {
+          if (p.puuid === target) {
+            const e = killsMap.get(kr.victimPuuid) || { kills: 0, assists: 0 }
+            e.kills += kr.kills
+            e.assists += kr.assists
+            killsMap.set(kr.victimPuuid, e)
+          }
+          if (kr.victimPuuid === target) {
+            const e = deathsMap.get(p.puuid) || { kills: 0, assists: 0 }
+            e.kills += kr.kills
+            e.assists += kr.assists
+            deathsMap.set(p.puuid, e)
+          }
+        }
+      }
+    }
+  }
+  const pairKey = (other: string) => (target < other ? `${target}|${other}` : `${other}|${target}`)
+  const toRows = (map: Map<string, { kills: number; assists: number }>): VendettaSideRow[] =>
+    [...map.entries()].map(([puuid, v]) => {
+      const games = coOpponentGames.get(pairKey(puuid)) || 0
+      return {
+        puuid,
+        name: nameOf.get(puuid) || puuid,
+        kills: v.kills,
+        assists: v.assists,
+        games,
+        avgKills: games > 0 ? v.kills / games : 0,
+      }
+    })
+  const kills = sortVendettaRows(toRows(killsMap).filter((r) => r.games >= vendettaMinGames.value))
+  const deaths = sortVendettaRows(toRows(deathsMap).filter((r) => r.games >= vendettaMinGames.value))
+  return {
+    kills,
+    deaths,
+    totalKills: kills.reduce((s, r) => s + r.kills, 0),
+    totalDeaths: deaths.reduce((s, r) => s + r.kills, 0),
+  }
+})
+
+/** 击杀/被击杀榜排序：默认按击杀数（并列按助攻），可切换为按场均击杀。 */
+const vendettaSort = ref<"kills" | "avg">("kills")
+const vendettaSortDir = ref<"asc" | "desc">("desc")
+const vendettaMinGames = ref(0)
+const vendettaMinGamesText = ref("")
+function applyVendettaMinGames() {
+  const v = parseInt(vendettaMinGamesText.value, 10)
+  vendettaMinGames.value = Number.isFinite(v) && v > 0 ? v : 0
+}
+function toggleVendettaSort(col: "kills" | "avg") {
+  if (vendettaSort.value === col) vendettaSortDir.value = vendettaSortDir.value === "asc" ? "desc" : "asc"
+  else { vendettaSort.value = col; vendettaSortDir.value = "desc" }
+}
+function vendettaSortIcon(col: "kills" | "avg") {
+  if (vendettaSort.value !== col) return ""
+  return vendettaSortDir.value === "asc" ? " ▲" : " ▼"
+}
+function sortVendettaRows(rows: VendettaSideRow[]): VendettaSideRow[] {
+  const m = vendettaSortDir.value === "asc" ? 1 : -1
+  return [...rows].sort((a, b) => {
+    const av = vendettaSort.value === "avg" ? a.avgKills : a.kills
+    const bv = vendettaSort.value === "avg" ? b.avgKills : b.kills
+    return (av - bv) * m || b.kills - a.kills || b.assists - a.assists
+  })
+}
 
 function parseMinGamesText(text: string) {
   const v = parseInt(text, 10)
@@ -1899,6 +2092,97 @@ const comboSectionVisible = ref(false)
         :champions="props.champions"
         @focus-game="focusGame"
       />
+
+      <!-- 击杀与被击杀榜 -->
+      <div v-if="vendettaPlayers.length" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="vendettaSectionVisible = !vendettaSectionVisible">
+            <component :is="vendettaSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">击杀与被击杀榜</span>
+            <span class="stat-subtitle">选择玩家，看 TA 杀谁最多 / 被谁杀最多</span>
+          </div>
+          <div v-show="vendettaSectionVisible" class="stat-section-body">
+            <div class="stat-header">
+              <select v-model="vendettaPuuid" class="stat-search" style="width: 180px; cursor: pointer" title="选择要分析的玩家">
+                <option v-for="p in vendettaPlayers" :key="p.puuid" :value="p.puuid">{{ p.name }}（{{ p.games }}场）</option>
+              </select>
+              <div class="toggle-sub min-games-input" :class="{ active: vendettaMinGames > 0 }" title="只显示对位场次≥该值的对手，留空为不限；样本太少时场均击杀不准确">
+                <span style="font-size:13px">对位场≥</span>
+                <input
+                  v-model="vendettaMinGamesText"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="不限"
+                  class="min-games-input-box"
+                  @change="applyVendettaMinGames"
+                  @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+                />
+              </div>
+              <span class="stat-subtitle">
+                总击杀 <b style="color:#f87171">{{ vendettaTarget.totalKills }}</b> · 总被击杀 <b style="color:#fb923c">{{ vendettaTarget.totalDeaths }}</b>
+              </span>
+            </div>
+            <div class="vendetta-grid">
+              <div class="vendetta-block">
+                <div class="vendetta-block-title">击杀榜 · 我杀谁最多</div>
+                <div class="stat-table-scroll vendetta-scroll">
+                  <table class="stat-table champion-table">
+                    <thead>
+                      <tr>
+                        <th class="st-champ">受害者</th>
+                        <th class="st-num sortable" style="text-align:center" @click="toggleVendettaSort('kills')">击杀{{ vendettaSortIcon('kills') }}</th>
+                        <th class="st-num sortable" style="text-align:center" title="对位场次内的场均击杀数（击杀数 ÷ 对位场次），点击按此排序" @click="toggleVendettaSort('avg')">场均击杀{{ vendettaSortIcon('avg') }}</th>
+                        <th class="st-num" style="text-align:center" title="双方同场且互为对手的对局数">对位场</th>
+                        <th class="st-num" style="text-align:center" title="队友助攻次数">助攻</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="r in vendettaTarget.kills" :key="r.puuid" @click="openPlayerDrawer(r.puuid)">
+                        <td class="st-champ"><span class="st-champ-name">{{ r.name }}</span></td>
+                        <td class="st-num" style="text-align:center"><b style="color:#f87171">{{ r.kills }}</b></td>
+                        <td class="st-num" style="text-align:center"><b style="color:#fca5a5">{{ r.avgKills.toFixed(2) }}</b></td>
+                        <td class="st-num" style="text-align:center">{{ r.games }}</td>
+                        <td class="st-num" style="text-align:center">{{ r.assists }}</td>
+                      </tr>
+                      <tr v-if="!vendettaTarget.kills.length"><td colspan="5" class="empty-table-row">暂无击杀记录</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="vendetta-block">
+                <div class="vendetta-block-title">被击杀榜 · 谁杀我最多</div>
+                <div class="stat-table-scroll vendetta-scroll">
+                  <table class="stat-table champion-table">
+                    <thead>
+                      <tr>
+                        <th class="st-champ">杀手</th>
+                        <th class="st-num sortable" style="text-align:center" @click="toggleVendettaSort('kills')">击杀{{ vendettaSortIcon('kills') }}</th>
+                        <th class="st-num sortable" style="text-align:center" title="对位场次内的场均击杀数（击杀数 ÷ 对位场次），点击按此排序" @click="toggleVendettaSort('avg')">场均击杀{{ vendettaSortIcon('avg') }}</th>
+                        <th class="st-num" style="text-align:center" title="双方同场且互为对手的对局数">对位场</th>
+                        <th class="st-num" style="text-align:center" title="对方队友助攻次数">助攻</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="r in vendettaTarget.deaths" :key="r.puuid" @click="openPlayerDrawer(r.puuid)">
+                        <td class="st-champ"><span class="st-champ-name">{{ r.name }}</span></td>
+                        <td class="st-num" style="text-align:center"><b style="color:#fb923c">{{ r.kills }}</b></td>
+                        <td class="st-num" style="text-align:center"><b style="color:#fdba74">{{ r.avgKills.toFixed(2) }}</b></td>
+                        <td class="st-num" style="text-align:center">{{ r.games }}</td>
+                        <td class="st-num" style="text-align:center">{{ r.assists }}</td>
+                      </tr>
+                      <tr v-if="!vendettaTarget.deaths.length"><td colspan="5" class="empty-table-row">暂无被击杀记录</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            <div class="stat-header" style="margin-top:6px">
+              <span class="stat-subtitle">点击行可查看对应玩家详情</span>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <!-- 选手对比 -->
       <PlayerCompareSection
@@ -2634,6 +2918,10 @@ const comboSectionVisible = ref(false)
 .st-players { min-width: 240px; }
 .st-pick { display: inline-block; margin: 2px 3px 0 0; padding: 1px 5px; border-radius: 3px; background: rgba(255,255,255,0.06); white-space: nowrap; }
 .st-pick em { font-style: normal; font-weight: 700; margin-left: 2px; opacity: 0.75; background: rgba(0,0,0,0.25); border-radius: 2px; padding: 0 3px; }
+.vendetta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 10px; }
+.vendetta-block { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px 12px; }
+.vendetta-block-title { font-size: 12px; font-weight: 700; color: #a5b4fc; margin-bottom: 8px; }
+.vendetta-scroll { max-height: 320px; }
 .st-more { color: var(--text-muted, #666); font-size: 11px; margin-left: 3px; }
 .st-name { min-width: 200px; }
 .st-aug-name { margin-left: 4px; color: var(--text-muted, #ccc); }

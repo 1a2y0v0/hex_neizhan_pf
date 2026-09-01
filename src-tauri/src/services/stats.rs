@@ -10,10 +10,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::error::{AppError, AppResult};
 use super::lcu::LcuClient;
 use super::models::{
-    ChampionStat, ClientAuth, Game, GameTeam, IdentityPlayer, MatchDetailPlayer,
-    MatchDetailResponse, MatchDetailTeam, Participant, ParticipantIdentity, ParticipantStats,
-    ParticipantTimeline, PlayerStatsResponse, PlayerSummary, RatingCompositionEntry, RecentGame,
-    SummonerInfo, TodayCustomGamesResponse,
+    ChampionStat, ClientAuth, Game, GameTeam, IdentityPlayer, KillRelationEntry,
+    MatchDetailPlayer, MatchDetailResponse, MatchDetailTeam, Participant, ParticipantIdentity,
+    ParticipantStats, ParticipantTimeline, PlayerStatsResponse, PlayerSummary,
+    RatingCompositionEntry, RecentGame, SummonerInfo, TodayCustomGamesResponse,
 };
 use super::sgp::{resolve_sgp_server_id, SgpClient};
 
@@ -27,7 +27,7 @@ const MAX_DEPTH: usize = 1000;
 const MIN_VALID_GAME_DURATION_SECONDS: i64 = 8 * 60;
 const STATS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DATABASE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const CACHE_SCHEMA_VERSION: i64 = 14;
+const CACHE_SCHEMA_VERSION: i64 = 15;
 const DATABASE_FILE_NAME: &str = "lol-stats.sqlite3";
 
 static STATS_CACHE: LazyLock<Mutex<HashMap<StatsCacheKey, StatsCacheEntry>>> =
@@ -38,6 +38,10 @@ static GAME_CACHE: LazyLock<Mutex<HashMap<u64, Game>>> =
 
 /// 已执行过 attach_carry_stats 的对局，避免缓存命中时重复拉取详情时间线。
 static CARRY_ATTACHED: LazyLock<Mutex<HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 本会话内已重试过击杀矩阵补拉的对局（时间线拉取失败过的对局，每会话最多再试一次）。
+static CARRY_RETRIED: LazyLock<Mutex<HashSet<u64>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -136,7 +140,7 @@ pub async fn load_match_detail(
     sgp_server_id: Option<&str>,
     game_id: u64,
 ) -> AppResult<MatchDetailResponse> {
-    let needs_carry_attach = {
+    let mut needs_carry_attach = {
         let attached = CARRY_ATTACHED.lock().map(|set| set.contains(&game_id));
         !attached.unwrap_or(false)
     };
@@ -145,6 +149,19 @@ pub async fn load_match_detail(
         .ok()
         .and_then(|cache| cache.get(&game_id).cloned());
     if let Some(mut cached_game) = game {
+        // 曾经 attach 过但击杀矩阵为空的（时间线当时拉取失败），每会话补拉一次
+        if !needs_carry_attach && !game_has_kill_data(&cached_game) {
+            let retried = CARRY_RETRIED
+                .lock()
+                .map(|set| set.contains(&game_id))
+                .unwrap_or(false);
+            if !retried {
+                if let Ok(mut set) = CARRY_RETRIED.lock() {
+                    set.insert(game_id);
+                }
+                needs_carry_attach = true;
+            }
+        }
         if needs_carry_attach {
             attach_carry_stats(&mut cached_game, lcu, auth, sgp_server_id).await;
             if let Ok(mut attached) = CARRY_ATTACHED.lock() {
@@ -191,7 +208,9 @@ pub async fn load_match_detail(
     };
 
     attach_carry_stats(&mut game, lcu, auth, sgp_server_id).await;
-
+    if let Ok(mut attached) = CARRY_ATTACHED.lock() {
+        attached.insert(game_id);
+    }
     if let Ok(mut cache) = GAME_CACHE.lock() {
         cache.insert(game_id, game.clone());
     }
@@ -279,49 +298,59 @@ async fn carry_champion_ids(lcu: &LcuClient) -> HashSet<u32> {
     ids
 }
 
-/// 用对局 timeline 的 CHAMPION_KILL 事件统计每位参与者对敌方C位的击杀/助攻。
+/// 用对局 timeline 的 CHAMPION_KILL 事件统计：
+/// - 每位参与者对敌方C位的击杀/助攻（carry_kills / carry_assists）；
+/// - 每位参与者对每个受害者的击杀/助攻明细（kill_relations，供击杀关系展示）。
 ///
 /// timeline 结构：frames[].events[]，事件 type 为 CHAMPION_KILL 时携带
-/// killerId / victimId / assistingParticipantIds。受害者是脆皮C位时，
-/// 击杀者计 carry_kills，助攻者计 carry_assists。
+/// killerId / victimId / assistingParticipantIds。
 async fn attach_carry_stats(
     game: &mut Game,
     lcu: &LcuClient,
     auth: Option<&ClientAuth>,
     sgp_server_id: Option<&str>,
-) {
+) -> bool {
     let carry_ids = carry_champion_ids(lcu).await;
-    if carry_ids.is_empty() {
-        return;
-    }
 
     let participant_champion: HashMap<u32, u32> = game
         .participants
         .iter()
         .map(|participant| (participant.participant_id, participant.champion_id))
         .collect();
+    let participant_puuid: HashMap<u32, String> = game
+        .participants
+        .iter()
+        .map(|participant| {
+            (
+                participant.participant_id,
+                identity_for_participant(game, participant.participant_id).puuid,
+            )
+        })
+        .collect();
 
     let timeline = match lcu.match_timeline(game.game_id).await {
         Ok(timeline) => timeline,
         Err(_) => {
             let Some(auth) = auth else {
-                return;
+                return false;
             };
             let Ok(sgp) = SgpClient::new(lcu, auth, sgp_server_id).await else {
-                return;
+                return false;
             };
             let Ok(timeline) = sgp.match_timeline(game.game_id).await else {
-                return;
+                return false;
             };
             timeline
         }
     };
     let Some(frames) = timeline.get("frames").and_then(|frames| frames.as_array()) else {
-        return;
+        return false;
     };
 
     let mut carry_kills: HashMap<u32, u32> = HashMap::new();
     let mut carry_assists: HashMap<u32, u32> = HashMap::new();
+    // (killer_id, victim_id) -> (kills, assists)
+    let mut kill_matrix: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
 
     for frame in frames {
         let Some(events) = frame.get("events").and_then(|events| events.as_array()) else {
@@ -331,31 +360,54 @@ async fn attach_carry_stats(
             if event.get("type").and_then(|t| t.as_str()) != Some("CHAMPION_KILL") {
                 continue;
             }
-            let Some(victim_id) = event.get("victimId").and_then(|v| v.as_u64()) else {
+            let Some(victim_u64) = event.get("victimId").and_then(|v| v.as_u64()) else {
                 continue;
             };
-            let Some(&victim_champion) = participant_champion.get(&(victim_id as u32)) else {
+            let victim_id = victim_u64 as u32;
+            if !participant_champion.contains_key(&victim_id) {
+                continue;
+            }
+            let killer_id = event
+                .get("killerId")
+                .and_then(|k| k.as_u64())
+                .map(|k| k as u32)
+                .filter(|k| *k > 0 && *k <= u32::MAX);
+            let assist_ids: Vec<u32> = event
+                .get("assistingParticipantIds")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|v| v as u32)
+                        .filter(|v| *v > 0 && *v <= u32::MAX)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // 击杀关系矩阵：对所有玩家受害者统计（排除防御塔/野怪击杀，排除自伤）
+            if let Some(killer) = killer_id {
+                if killer != victim_id {
+                    let entry = kill_matrix.entry((killer, victim_id)).or_default();
+                    entry.0 += 1;
+                    entry.1 += assist_ids.len() as u32;
+                }
+            }
+
+            // 切C统计：受害者是脆皮C位
+            if carry_ids.is_empty() {
+                continue;
+            }
+            let Some(&victim_champion) = participant_champion.get(&victim_id) else {
                 continue;
             };
             if !carry_ids.contains(&victim_champion) {
                 continue;
             }
-            if let Some(killer_id) = event.get("killerId").and_then(|k| k.as_u64()) {
-                if killer_id > 0 && killer_id <= u32::MAX as u64 {
-                    *carry_kills.entry(killer_id as u32).or_default() += 1;
-                }
+            if let Some(killer) = killer_id {
+                *carry_kills.entry(killer).or_default() += 1;
             }
-            if let Some(assists) = event
-                .get("assistingParticipantIds")
-                .and_then(|a| a.as_array())
-            {
-                for assist in assists {
-                    if let Some(assist_id) = assist.as_u64() {
-                        if assist_id > 0 && assist_id <= u32::MAX as u64 {
-                            *carry_assists.entry(assist_id as u32).or_default() += 1;
-                        }
-                    }
-                }
+            for assist_id in &assist_ids {
+                *carry_assists.entry(*assist_id).or_default() += 1;
             }
         }
     }
@@ -366,7 +418,24 @@ async fn attach_carry_stats(
             .get(&participant.participant_id)
             .copied()
             .unwrap_or(0);
+        let mut relations: Vec<KillRelationEntry> = kill_matrix
+            .iter()
+            .filter(|((killer, _), _)| *killer == participant.participant_id)
+            .map(|((_, victim), (kills, assists))| KillRelationEntry {
+                victim_participant_id: *victim,
+                victim_puuid: participant_puuid.get(victim).cloned().unwrap_or_default(),
+                kills: *kills,
+                assists: *assists,
+            })
+            .collect();
+        relations.sort_by(|a, b| b.kills.cmp(&a.kills).then(b.assists.cmp(&a.assists)));
+        participant.kill_relations = relations;
     }
+    true
+}
+
+fn game_has_kill_data(game: &Game) -> bool {
+    game.participants.iter().any(|p| !p.kill_relations.is_empty())
 }
 
 /// 对列表数据中最近若干局批量补切C数据。
@@ -509,8 +578,41 @@ pub async fn load_today_custom_games(
 
     let cached_games = read_cached_games_in_range(&server_id, day_start, day_end);
     let mut details: HashMap<u64, MatchDetailResponse> = HashMap::new();
+    let mut missing_kill_games: Vec<Game> = Vec::new();
     for game in cached_games {
-        details.insert(game.game_id, match_detail_from_game(game));
+        if game_has_kill_data(&game) {
+            details.insert(game.game_id, match_detail_from_game(game));
+        } else {
+            missing_kill_games.push(game);
+        }
+    }
+
+    // 缓存中缺少击杀矩阵的对局（首次加载时时间线拉取失败），每会话补拉一次
+    if !missing_kill_games.is_empty() {
+        let retried: HashSet<u64> = CARRY_RETRIED
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let to_attach: Vec<Game> = missing_kill_games
+            .into_iter()
+            .filter(|g| !retried.contains(&g.game_id))
+            .collect();
+        if !to_attach.is_empty() {
+            let fetched = futures::stream::iter(to_attach.into_iter().map(|mut game| async {
+                attach_carry_stats(&mut game, lcu, auth, sgp_server_id).await;
+                game
+            }))
+            .buffered(8)
+            .collect::<Vec<_>>()
+            .await;
+            for game in fetched {
+                if let Ok(mut set) = CARRY_RETRIED.lock() {
+                    set.insert(game.game_id);
+                }
+                persist_game_carry_backfill(&game, auth, sgp_server_id);
+                details.insert(game.game_id, match_detail_from_game(game));
+            }
+        }
     }
 
     let raw_games = if let Some(auth) = auth {
@@ -1667,6 +1769,7 @@ fn eog_to_game(eog: serde_json::Value) -> Option<Game> {
                     timeline,
                     carry_kills: 0,
                     carry_assists: 0,
+                    kill_relations: Vec::new(),
                 });
             }
         }
@@ -1834,6 +1937,7 @@ fn participant_to_recent_game(game: &Game, participant: &Participant) -> RecentG
             .filter(|candidate| same_stat_team(game, participant, candidate))
             .map(|candidate| candidate.carry_kills)
             .sum(),
+        kill_relations: participant.kill_relations.clone(),
         game_creation: game.game_creation,
         game_duration: game.game_duration,
     }

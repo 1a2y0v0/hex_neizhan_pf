@@ -133,6 +133,16 @@ const recentGames = computed(() =>
       </div>
     </section>
 
+    <section v-if="player.killMap.length" class="pdd-card">
+      <div class="pdd-sec-title">击杀分布</div>
+      <div class="pdd-kv">
+        <div v-for="v in player.killMap" :key="v.puuid" class="pdd-kv-row" :title="`对位 ${v.games} 场 · 场均击杀 = 击杀数 ÷ 对位场次`">
+          <span class="pdd-k">{{ v.name }}</span>
+          <span class="pdd-v"><b class="sc-high">{{ v.kills }}</b> 杀 · 场均 <b>{{ v.avgKills.toFixed(2) }}</b><template v-if="v.assists"> · <b>{{ v.assists }}</b> 助</template></span>
+        </div>
+      </div>
+    </section>
+
     <section v-if="player.profile.tags.length" class="pdd-card">
       <div class="pdd-sec-title">标签</div>
       <div class="pdd-chips">

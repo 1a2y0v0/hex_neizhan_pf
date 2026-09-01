@@ -32,6 +32,7 @@ export interface DrawerPlayer {
   damageLeaderCount: number
   mitigationLeaderCount: number
   assistLeaderCount: number
+  killMap: { puuid: string; name: string; kills: number; assists: number; games: number; avgKills: number }[]
   profile: {
     overallScore: number
     medianScore: number

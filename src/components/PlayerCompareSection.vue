@@ -43,6 +43,7 @@ interface CompareGamePlayer {
   assists: number
   gameScore: number
   win: boolean
+  killRelations?: { victimPuuid: string; kills: number; assists: number }[]
 }
 interface CompareGame {
   gameId: number
@@ -220,6 +221,8 @@ interface H2HRow {
   a: CompareGamePlayer
   b: CompareGamePlayer
   aWin: boolean
+  aKillsB: number
+  bKillsA: number
 }
 const headToHead = computed(() => {
   const a = playerA.value
@@ -233,7 +236,9 @@ const headToHead = computed(() => {
     if (!pa || !pb) continue
     const teamA = g.teams.find((t) => t.players.some((p) => p.puuid === a.puuid))
     const sameTeam = !!teamA && teamA.players.some((p) => p.puuid === b.puuid)
-    rows.push({ gameId: g.gameId, gameCreation: g.gameCreation, gameDuration: g.gameDuration, sameTeam, a: pa, b: pb, aWin: pa.win })
+    const aKillsB = pa.killRelations?.find((kr) => kr.victimPuuid === b.puuid)?.kills || 0
+    const bKillsA = pb.killRelations?.find((kr) => kr.victimPuuid === a.puuid)?.kills || 0
+    rows.push({ gameId: g.gameId, gameCreation: g.gameCreation, gameDuration: g.gameDuration, sameTeam, a: pa, b: pb, aWin: pa.win, aKillsB, bKillsA })
   }
   rows.sort((x, y) => y.gameCreation - x.gameCreation)
   const mate = rows.filter((r) => r.sameTeam)
@@ -245,8 +250,20 @@ const headToHead = computed(() => {
     mateRate: pct(mate.length, mate.filter((r) => r.aWin).length),
     oppGames: opp.length,
     oppRate: pct(opp.length, opp.filter((r) => r.aWin).length),
-    recent: rows.slice(0, 10),
+    aKillsBTotal: rows.reduce((s, r) => s + r.aKillsB, 0),
+    bKillsATotal: rows.reduce((s, r) => s + r.bKillsA, 0),
+    recent: rows,
   }
+})
+
+/* ── 交手记录筛选：全部 / 对位 / 同队 ── */
+const h2hFilter = ref<"all" | "mate" | "opp">("all")
+const h2hFiltered = computed(() => {
+  const h = headToHead.value
+  if (!h) return []
+  if (h2hFilter.value === "mate") return h.recent.filter((r) => r.sameTeam)
+  if (h2hFilter.value === "opp") return h.recent.filter((r) => !r.sameTeam)
+  return h.recent
 })
 
 function formatTime(ts: number) {
@@ -355,11 +372,25 @@ function formatTime(ts: number) {
           <div v-if="headToHead && headToHead.total > 0" class="h2h-summary">
             <span>同队 <b>{{ headToHead.mateGames }}</b> 场 · 胜率 <b>{{ headToHead.mateRate }}</b>（共同胜负）</span>
             <span>对位 <b>{{ headToHead.oppGames }}</b> 场 · {{ playerA.gameName }} 胜率 <b>{{ headToHead.oppRate }}</b></span>
+            <span class="h2h-kill-sum">对位击杀：{{ playerA.gameName }} → {{ playerB.gameName }} <b>{{ headToHead.aKillsBTotal }}</b> 次 · 反向 <b>{{ headToHead.bKillsATotal }}</b> 次</span>
             <span class="h2h-total">共同场 {{ headToHead.total }} 局</span>
           </div>
           <div v-else class="dim h2h-empty">两人未在同一局中出现</div>
-          <div v-if="headToHead && headToHead.recent.length" class="h2h-list">
-            <div v-for="r in headToHead.recent" :key="r.gameId" class="h2h-row">
+
+          <div v-if="headToHead && headToHead.total > 0" class="h2h-filters">
+            <button class="toggle-sub" :class="{ active: h2hFilter === 'all' }" @click="h2hFilter = 'all'">
+              <span>全部（{{ headToHead.total }}）</span>
+            </button>
+            <button class="toggle-sub" :class="{ active: h2hFilter === 'opp' }" @click="h2hFilter = 'opp'">
+              <span>对位（{{ headToHead.oppGames }}）</span>
+            </button>
+            <button class="toggle-sub" :class="{ active: h2hFilter === 'mate' }" @click="h2hFilter = 'mate'">
+              <span>同队（{{ headToHead.mateGames }}）</span>
+            </button>
+          </div>
+
+          <div v-if="h2hFiltered.length" class="h2h-list">
+            <div v-for="r in h2hFiltered" :key="r.gameId" class="h2h-row">
               <span class="h2h-date">{{ formatTime(r.gameCreation) }}</span>
               <span class="h2h-rel" :class="r.sameTeam ? 'mate' : 'opp'">{{ r.sameTeam ? '同队' : '对位' }}</span>
               <ChampionAvatar :champion-id="r.a.championId" :champions="champions" :size="20" />
@@ -370,10 +401,12 @@ function formatTime(ts: number) {
               <span class="h2h-kda">{{ r.b.kills }}/{{ r.b.deaths }}/{{ r.b.assists }}</span>
               <ChampionAvatar :champion-id="r.b.championId" :champions="champions" :size="20" />
               <span class="h2h-result" :class="r.aWin ? 'win' : 'loss'">{{ r.aWin ? '胜' : '负' }}</span>
+              <span v-if="!r.sameTeam" class="h2h-kills" :title="`${playerA.gameName} 击杀 ${playerB.gameName} ${r.aKillsB} 次 / ${playerB.gameName} 击杀 ${playerA.gameName} ${r.bKillsA} 次`">杀 {{ r.aKillsB }}/{{ r.bKillsA }}</span>
               <span class="h2h-dur">{{ Math.round(r.gameDuration / 60) }}min</span>
             </div>
           </div>
-          <div v-if="headToHead && headToHead.recent.length" class="panel-note">最近 10 局 · 结果为 {{ playerA.gameName }} 视角</div>
+          <div v-else-if="headToHead && headToHead.total > 0" class="dim h2h-empty">该筛选下无对局</div>
+          <div v-if="headToHead && headToHead.total > 0" class="panel-note">共 {{ headToHead.total }} 局 · 结果为 {{ playerA.gameName }} 视角</div>
         </div>
       </template>
 
@@ -442,7 +475,13 @@ function formatTime(ts: number) {
 .h2h-summary b { color: #e5e7eb; }
 .h2h-total { margin-left: auto; }
 .h2h-empty { padding: 10px 0; font-size: 12px; }
-.h2h-list { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.h2h-filters { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.toggle-sub { display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 5px 10px; background: #fff; border: 1px solid #d0d0d0; border-radius: 4px; color: #333; font-size: 11px; cursor: pointer; }
+.toggle-sub:hover { border-color: var(--accent, #6366f1); color: var(--accent, #6366f1); }
+.toggle-sub.active { background: var(--accent, #6366f1); border-color: var(--accent, #6366f1); color: #fff; }
+.h2h-list { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; max-height: 420px; overflow-y: auto; padding-right: 4px; }
+.h2h-list::-webkit-scrollbar { width: 8px; }
+.h2h-list::-webkit-scrollbar-thumb { background: #2e3742; border-radius: 4px; }
 .h2h-row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; font-size: 12px; flex-wrap: wrap; }
 .h2h-date { color: var(--text-muted, #888); font-size: 11px; min-width: 86px; }
 .h2h-rel { padding: 0 6px; border-radius: 3px; font-size: 10px; font-weight: 700; }
@@ -454,6 +493,8 @@ function formatTime(ts: number) {
 .h2h-result { font-weight: 800; }
 .h2h-result.win { color: #4ade80; }
 .h2h-result.loss { color: #f87171; }
+.h2h-kills { font-size: 11px; font-weight: 700; color: #fca5a5; font-variant-numeric: tabular-nums; }
+.h2h-kill-sum b { color: #fca5a5; }
 .h2h-dur { color: var(--text-muted, #777); font-size: 11px; margin-left: auto; }
 .dim { color: var(--text-muted, #666); }
 </style>
