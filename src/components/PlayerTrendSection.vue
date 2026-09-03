@@ -33,6 +33,12 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: "focus-game", gameId: number): void }>()
 
 const visible = ref(false)
+/* 首次展开才挂载内容，避免大数据量加载时立即渲染 */
+const openedOnce = ref(false)
+function toggleVisible() {
+  visible.value = !visible.value
+  if (visible.value) openedOnce.value = true
+}
 
 /* ── 选择状态 ── */
 const selPuuid = ref("")
@@ -168,13 +174,13 @@ function formatTime(ts: number) {
 
 <template>
   <div class="trend-section">
-    <div class="trend-title-line" @click="visible = !visible">
+    <div class="trend-title-line" @click="toggleVisible">
       <component :is="visible ? ChevronDown : ChevronRight" :size="14" />
       <span class="section-title">玩家状态趋势</span>
       <span class="stat-subtitle">最近 5 局均分 {{ recentAvg.toFixed(1) }} · 当前 {{ streakText }}</span>
     </div>
 
-    <div v-show="visible" class="trend-body">
+    <div v-if="openedOnce" v-show="visible" class="trend-body">
       <div class="stat-header">
         <select v-model="selPuuid" class="stat-search" style="width: 180px; cursor: pointer">
           <option v-for="r in players" :key="r.puuid" :value="r.puuid">{{ r.gameName }}（{{ r.gamesPlayed }}场）</option>

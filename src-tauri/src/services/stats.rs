@@ -579,7 +579,10 @@ pub async fn load_today_custom_games(
     let cached_games = read_cached_games_in_range(&server_id, day_start, day_end);
     let mut details: HashMap<u64, MatchDetailResponse> = HashMap::new();
     let mut missing_kill_games: Vec<Game> = Vec::new();
+    // 记录缓存区间内的 (creation, game_id, queue_id)，供最终合并避免 SGP 拉取上限漏统计
+    let mut cache_meta: Vec<(i64, u64, u32)> = Vec::with_capacity(cached_games.len());
     for game in cached_games {
+        cache_meta.push((game.game_creation, game.game_id, game.queue_id));
         if game_has_kill_data(&game) {
             details.insert(game.game_id, match_detail_from_game(game));
         } else {
@@ -711,10 +714,23 @@ pub async fn load_today_custom_games(
         }
     }
 
-    let games: Vec<_> = day_ids
+    // 合并缓存中的区间对局：避免长区间（SGP 有拉取上限/中断）漏统计；
+    // 新鲜拉取作为权威的新窗口，缓存补齐更早的对局，最后按时间倒序返回
+    let mut ids: Vec<u64> = day_ids;
+    let mut seen_ids: HashSet<u64> = ids.iter().copied().collect();
+    for (_, id, queue) in cache_meta {
+        if only_custom && queue != 3270 {
+            continue;
+        }
+        if seen_ids.insert(id) {
+            ids.push(id);
+        }
+    }
+    let mut games: Vec<MatchDetailResponse> = ids
         .into_iter()
         .filter_map(|id| details.remove(&id))
         .collect();
+    games.sort_by_key(|g| std::cmp::Reverse(g.game_creation));
 
     Ok(TodayCustomGamesResponse { game_count: games.len(), games })
 }

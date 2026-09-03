@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { computed, createApp, nextTick, onMounted, ref, watch } from "vue"
-import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, Crown, Download, LoaderCircle, RefreshCw, Swords, UserRound, X } from "lucide-vue-next"
+import { computed, createApp, nextTick, onMounted, reactive, ref, watch, type Ref } from "vue"
+import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, Crown, Download, LoaderCircle, RefreshCw, Search, Swords, UserRound, X } from "lucide-vue-next"
 import { loadTodayCustomGames, saveExportFile } from "../api"
 import { save } from "@tauri-apps/plugin-dialog"
 import { toBlob } from "html-to-image"
 import { matchTeamSummary } from "../matchTeamSummary"
 import { buildChampionProfiles, buildPlayerProfile, profileScoreLevel, type ChampionProfile, type PlayerProfile } from "../playerProfile"
-import { calculateOutputRating, outputRatingTitle, scoreEvaluationLabel } from "../scoring"
+import { calculateOutputRating, outputRatingTitle, scoreEvaluationLabel, type OutputRating } from "../scoring"
 import { buildStoreZip, type ZipFileEntry } from "../zipStore"
 import { buildWhiteExportRoot, ensureExportExtension, EXPORT_PRESETS, sanitizeFilename, waitForImages, type ExportPreset } from "../exportUtil"
 import type { ChampionSummaryItem, GameAssetBundle, GameAssetEntry, KillRelationEntry, MatchDetailPlayer, MatchDetailResponse, RecentGame, TodayCustomGamesResponse } from "../types"
@@ -39,6 +39,16 @@ const spellMap = computed(() => indexAssets(props.gameAssets?.summonerSpells))
 const perkMap = computed(() => indexAssets(props.gameAssets?.perks))
 const augmentMap = computed(() => indexAssets(props.gameAssets?.augments))
 const ratingContext = computed(() => ({ items: itemMap.value, champions: props.champions }))
+
+/* ── 单局评分缓存：同一对局对象全程只计算一次（大区间显著降低 CPU） ── */
+const ratingCache = new WeakMap<RecentGame, OutputRating>()
+function rateGame(game: RecentGame): OutputRating {
+  const cached = ratingCache.get(game)
+  if (cached) return cached
+  const rating = calculateOutputRating(game, ratingContext.value)
+  ratingCache.set(game, rating)
+  return rating
+}
 
 /* ── helpers ── */
 const loading = ref(false)
@@ -169,7 +179,7 @@ function detailStatLeader(game: RecentGame, kind: "damage" | "gold" | "mitigatio
   }
 }
 function outputRating(game: RecentGame) {
-  return calculateOutputRating(game, ratingContext.value)
+  return rateGame(game)
 }
 function outputRatingHint(game: RecentGame) {
   return outputRatingTitle(game, ratingContext.value)
@@ -313,6 +323,24 @@ function rawGame(gameId: number): MatchDetailResponse | undefined {
 const gameListVisible = ref(false)
 const expandedGames = ref<Set<number>>(new Set())
 const hoveredGameId = ref<number | null>(null)
+
+/* ── 对局列表分批增量渲染：大区间只渲染前若干张卡片，避免 DOM 过大卡顿 ── */
+const GAME_LIST_INITIAL = 60
+const GAME_LIST_STEP = 200
+const gameListLimit = ref(GAME_LIST_INITIAL)
+/** 当前实际渲染的对局（前 N 张，基于搜索过滤结果） */
+const shownGames = computed(() => filteredGameList.value.slice(0, gameListLimit.value))
+function showMoreGames() {
+  gameListLimit.value = Math.min(filteredGameList.value.length, gameListLimit.value + GAME_LIST_STEP)
+}
+function showAllGames() {
+  gameListLimit.value = filteredGameList.value.length
+}
+// 数据重新加载后回到初始批次，避免一次性渲染巨量卡片
+watch(data, () => {
+  gameListLimit.value = GAME_LIST_INITIAL
+  resetGameListGrouping()
+})
 
 // collapsible sections
 const ratingSectionVisible = ref(true)
@@ -516,7 +544,7 @@ const enrichedGames = computed<GameEnriched[]>(() => {
       const players = team.players.map((p) => ({
         puuid: p.puuid, gameName: p.gameName, championId: p.championId,
         kills: p.kills, deaths: p.deaths, assists: p.assists,
-        gameScore: calculateOutputRating(p, ratingContext.value).score,
+        gameScore: rateGame(p).score,
         win: p.win,
         damageDealtToChampions: p.damageToChampions || 0,
         totalDamageTaken: p.totalDamageTaken || 0,
@@ -543,6 +571,57 @@ const enrichedGames = computed<GameEnriched[]>(() => {
   })
 })
 
+/* ── 对局列表 关键字搜索：只过滤对局列表本身（玩家/海克斯/日期/装备/英雄等），不影响评分等统计 ── */
+const gameSearchQuery = ref("")
+/** 该局的可搜索文本：玩家名+副名、英雄、海克斯、符文、装备、日期多种写法、MVP、标签 */
+function buildGameSearchText(g: GameEnriched): string {
+  const parts: string[] = []
+  const ts = g.gameCreation
+  const d = new Date(ts)
+  const y = d.getFullYear()
+  const m = d.getMonth() + 1
+  const day = d.getDate()
+  const pad = (n: number) => String(n).padStart(2, "0")
+  // 日期多种写法：2026-09-03 / 2026/9/3 / 2026年9月3日 / 9月3日 / 09-03 / 2026-09 / 2026年9月 / 周X
+  parts.push(
+    `${y}-${pad(m)}-${pad(day)}`, `${y}/${m}/${day}`, `${y}年${m}月${day}日`,
+    `${m}月${day}日`, `${pad(m)}-${pad(day)}`, `${y}-${pad(m)}`, `${y}年${m}月`,
+    `周${"日一二三四五六"[d.getDay()]}`,
+  )
+  const raw = rawGame(g.gameId)
+  if (raw) {
+    for (const team of raw.teams) {
+      for (const p of team.players) {
+        parts.push(p.gameName, p.tagLine || "", p.summonerName || "")
+        parts.push(championName(props.champions, p.championId))
+        for (const id of p.augmentIds || []) parts.push(augmentName(id))
+        for (const id of p.perkIds || []) parts.push(augmentName(id))
+        for (const id of p.itemIds || []) parts.push(itemMap.value[id]?.name || `装备${id}`)
+      }
+    }
+  }
+  parts.push(g.mvpName)
+  parts.push(...g.tags)
+  return parts.join(" ").toLowerCase()
+}
+/** 每局搜索文本索引（仅随数据/资产变化重建） */
+const gameSearchIndex = computed(() => {
+  const map = new Map<number, string>()
+  for (const g of enrichedGames.value) map.set(g.gameId, buildGameSearchText(g))
+  return map
+})
+/** 空格分词，全部命中才算符合（如“亚索 8月”） */
+const filteredGameList = computed<GameEnriched[]>(() => {
+  const terms = gameSearchQuery.value.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  if (!terms.length) return enrichedGames.value
+  const idx = gameSearchIndex.value
+  return enrichedGames.value.filter((g) => {
+    const text = idx.get(g.gameId)
+    if (!text) return false
+    return terms.every((t) => text.includes(t))
+  })
+})
+
 function toggleGameExpand(gameId: number) {
   const s = new Set(expandedGames.value)
   if (s.has(gameId)) s.delete(gameId); else s.add(gameId)
@@ -557,6 +636,26 @@ function focusPlayer(puuid: string) {
 
 function focusGame(gameId: number) {
   gameListVisible.value = true
+  if (!openedOnce.gameList) openedOnce.gameList = true
+  // 若当前搜索过滤掉了目标局，先清空搜索词，确保能定位到
+  if (gameSearchQuery.value.trim() && !filteredGameList.value.some((g) => g.gameId === gameId)) {
+    gameSearchQuery.value = ""
+  }
+  if (gameListViewMode.value === "flat") {
+    // 目标对局若尚未渲染（超出当前批次），先扩展渲染范围再滚动定位
+    const idx = filteredGameList.value.findIndex((g) => g.gameId === gameId)
+    if (idx >= gameListLimit.value) gameListLimit.value = idx + 1
+  } else {
+    // 分组视图：自动展开目标对局所在月份，并确保该局在月内渲染范围内
+    const mk = monthKeyOfGame(gameId)
+    if (mk) {
+      const s = new Set(openMonths.value)
+      s.add(mk)
+      openMonths.value = s
+      const pos = monthPosOfGame(mk, gameId)
+      if (pos >= 0) monthLimits[mk] = Math.max(monthLimits[mk] ?? 0, pos + 1)
+    }
+  }
   if (!expandedGames.value.has(gameId)) {
     const s = new Set(expandedGames.value)
     s.add(gameId)
@@ -566,6 +665,158 @@ function focusGame(gameId: number) {
     document.querySelector(`[data-game-id="${gameId}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" })
   })
 }
+
+/* ── 对局列表 · 时间分栏视图（年/月 → 日期 分组，旧月份展开时才渲染该月对局） ── */
+type GameListViewMode = "grouped" | "flat"
+const gameListViewMode = ref<GameListViewMode>("grouped")
+const MONTH_GAME_INITIAL = 80
+const MONTH_GAME_STEP = 200
+
+interface GameMonthGroup {
+  key: string
+  label: string
+  count: number
+  dates: { key: string; label: string; games: GameEnriched[] }[]
+}
+type GameListRow =
+  | { kind: "month"; key: string; monthKey: string; label: string; count: number; open: boolean }
+  | { kind: "date"; key: string; label: string; total: number; shown: number }
+  | { kind: "game"; key: string; game: GameEnriched }
+  | { kind: "more"; key: string; monthKey?: string; shown: number; total: number; moreStep: number }
+
+function monthLabelOf(monthKey: string) {
+  const [y, m] = monthKey.split("-").map(Number)
+  return `${y}年${m}月`
+}
+function dateLabelOf(dayKey: string) {
+  const [y, m, d] = dayKey.split("-").map(Number)
+  return `${m}月${d}日 周${"日一二三四五六"[new Date(y, m - 1, d).getDay()]}`
+}
+
+/* 对局按 年月→日期 降序聚合（基于搜索过滤结果） */
+const gameMonthGroups = computed<GameMonthGroup[]>(() => {
+  const map = new Map<string, GameMonthGroup>()
+  for (const g of filteredGameList.value) {
+    const dayKey = toLocalDateStr(g.gameCreation)
+    const mKey = dayKey.slice(0, 7)
+    let month = map.get(mKey)
+    if (!month) {
+      month = { key: mKey, label: monthLabelOf(mKey), count: 0, dates: [] }
+      map.set(mKey, month)
+    }
+    month.count++
+    let date = month.dates.find((d) => d.key === dayKey)
+    if (!date) {
+      date = { key: dayKey, label: dateLabelOf(dayKey), games: [] }
+      month.dates.push(date)
+    }
+    date.games.push(g)
+  }
+  const months = [...map.values()]
+  months.sort((a, b) => b.key.localeCompare(a.key))
+  for (const m of months) {
+    m.dates.sort((a, b) => b.key.localeCompare(a.key))
+    for (const d of m.dates) d.games.sort((a, b) => b.gameCreation - a.gameCreation)
+  }
+  return months
+})
+
+/* 已展开的月份（默认只展开最近一个月） */
+const openMonths = ref<Set<string>>(new Set())
+/* 每个已展开月份当前渲染的对局数上限（默认 80，超出时月内出现“加载更多”） */
+const monthLimits = reactive<Record<string, number>>({})
+
+function resetGameListGrouping() {
+  openMonths.value = new Set<string>()
+  for (const k of Object.keys(monthLimits)) delete monthLimits[k]
+  const newest = gameMonthGroups.value[0]
+  if (newest) openMonths.value.add(newest.key)
+}
+function toggleMonthOpen(monthKey: string) {
+  const s = new Set(openMonths.value)
+  if (s.has(monthKey)) s.delete(monthKey)
+  else {
+    s.add(monthKey)
+    // 每次展开都回到初始 80 场，保证懒加载语义；已加载进度保留在 monthLimits 中由“显示全部”清除
+    if (monthLimits[monthKey] === undefined || monthLimits[monthKey] > MONTH_GAME_INITIAL) monthLimits[monthKey] = MONTH_GAME_INITIAL
+  }
+  openMonths.value = s
+}
+function loadMoreMonth(monthKey: string) {
+  const month = gameMonthGroups.value.find((m) => m.key === monthKey)
+  if (!month) return
+  monthLimits[monthKey] = Math.min(month.count, (monthLimits[monthKey] ?? MONTH_GAME_INITIAL) + MONTH_GAME_STEP)
+}
+function showAllMonth(monthKey: string) {
+  const month = gameMonthGroups.value.find((m) => m.key === monthKey)
+  if (month) monthLimits[monthKey] = month.count
+}
+function monthKeyOfGame(gameId: number): string | null {
+  const g = enrichedGames.value.find((x) => x.gameId === gameId)
+  return g ? toLocalDateStr(g.gameCreation).slice(0, 7) : null
+}
+function monthPosOfGame(monthKey: string, gameId: number): number {
+  const month = gameMonthGroups.value.find((m) => m.key === monthKey)
+  if (!month) return -1
+  let pos = 0
+  for (const date of month.dates) {
+    for (const g of date.games) {
+      if (g.gameId === gameId) return pos
+      pos++
+    }
+  }
+  return -1
+}
+
+function isMonthRow(row: GameListRow): row is GameListRow & { kind: "month" } { return row.kind === "month" }
+function isDateRow(row: GameListRow): row is GameListRow & { kind: "date" } { return row.kind === "date" }
+function isGameRow(row: GameListRow): row is GameListRow & { kind: "game" } { return row.kind === "game" }
+function isMoreRow(row: GameListRow): row is GameListRow & { kind: "more" } { return row.kind === "more" }
+
+/* 当前展示行序列：平铺 = 直接切片；分组 = 展开月份的 月份头/日期头/对局卡 + 月内“加载更多” */
+const gameListDisplay = computed<GameListRow[]>(() => {
+  if (gameListViewMode.value === "flat") {
+    const rows: GameListRow[] = []
+    for (const g of shownGames.value) rows.push({ kind: "game", key: `g${g.gameId}`, game: g })
+    const total = filteredGameList.value.length
+    if (total > gameListLimit.value) {
+      rows.push({
+        kind: "more", key: "moreFlat", shown: gameListLimit.value, total,
+        moreStep: Math.min(GAME_LIST_STEP, total - gameListLimit.value),
+      })
+    }
+    return rows
+  }
+  const rows: GameListRow[] = []
+  for (const month of gameMonthGroups.value) {
+    const open = openMonths.value.has(month.key)
+    rows.push({ kind: "month", key: `m${month.key}`, monthKey: month.key, label: month.label, count: month.count, open })
+    if (!open) continue
+    const limit = monthLimits[month.key] ?? MONTH_GAME_INITIAL
+    let remaining = limit
+    let shownCount = 0
+    for (const date of month.dates) {
+      if (remaining <= 0) break
+      const take = Math.min(date.games.length, remaining)
+      remaining -= take
+      shownCount += take
+      rows.push({ kind: "date", key: `d${date.key}`, label: date.label, total: date.games.length, shown: take })
+      for (let i = 0; i < take; i++) {
+        const g = date.games[i]
+        rows.push({ kind: "game", key: `g${g.gameId}`, game: g })
+      }
+      if (take < date.games.length) break
+    }
+    if (shownCount < month.count) {
+      rows.push({
+        kind: "more", key: `more${month.key}`, monthKey: month.key,
+        shown: shownCount, total: month.count,
+        moreStep: Math.min(MONTH_GAME_STEP, month.count - shownCount),
+      })
+    }
+  }
+  return rows
+})
 
 /* ── summary ── */
 const summaryStats = computed(() => {
@@ -776,7 +1027,7 @@ const playerRatings = computed<PlayerRating[]>(() => {
       const goldShare = (p.goldEarned || 0) / Math.max(p.teamGoldEarned || 0, 1)
       const kda = kdaScore(p.kills, p.deaths, p.assists)
       const control = p.enemyChampionImmobilizations || 0
-      const mvpScore = calculateOutputRating(p, ratingContext.value).score
+      const mvpScore = rateGame(p).score
       if (damageShare > topDamage) { topDamage = damageShare; topDamagePuuid = p.puuid }
       if (mitShare > topMitigation) { topMitigation = mitShare; topMitigationPuuid = p.puuid }
       if ((p.assists || 0) > topAssist) { topAssist = p.assists || 0; topAssistPuuid = p.puuid }
@@ -825,8 +1076,8 @@ const playerRatings = computed<PlayerRating[]>(() => {
   const ratings: PlayerRating[] = []
   for (const [, entry] of playerGames) {
     const ctx = { items: itemMap.value, champions: props.champions }
-    const profile = buildPlayerProfile(entry.records, ctx)
-    const championProfiles = buildChampionProfiles(entry.records, ctx)
+    const profile = buildPlayerProfile(entry.records, ctx, ratingCache)
+    const championProfiles = buildChampionProfiles(entry.records, ctx, ratingCache)
     const player = entry.records[0]
     const n = entry.records.length
     if (n < minGameCount.value) continue
@@ -840,7 +1091,7 @@ const playerRatings = computed<PlayerRating[]>(() => {
       const mitVal = (r.totalDamageTaken || 0) + (r.damageSelfMitigated || 0)
       const mitShare = mitVal / Math.max((r.teamTotalDamageTaken || 0) + (r.teamDamageSelfMitigated || 0), 1)
       const minutes = Math.max((r.gameDuration || 0) / 60, 1)
-      const score = calculateOutputRating(r, ctx).score
+      const score = rateGame(r).score
       const goldShare = (r.goldEarned || 0) / Math.max(r.teamGoldEarned || 0, 1)
       return { gameId: r.gameId, championId: r.championId, kills: r.kills, deaths: r.deaths, assists: r.assists, win: r.win, gameDuration: r.gameDuration, damageShare: dmgShare, mitigationShare: mitShare, score, gpm: (r.goldEarned || 0) / minutes, dpm: (r.damageToChampions || 0) / minutes, cspm: (r.cs || 0) / minutes, kp: ((r.kills || 0) + (r.assists || 0)) / Math.max(r.teamKills || 0, 1), killShare: (r.kills || 0) / Math.max(r.teamKills || 0, 1), goldShare, mitigationPerDeath: mitVal / Math.max(r.deaths || 0, 1) }
     })
@@ -856,7 +1107,7 @@ const playerRatings = computed<PlayerRating[]>(() => {
         gameId: r.gameId, championId: r.championId,
         kills: r.kills, deaths: r.deaths, assists: r.assists,
         win: r.win, gameDuration: r.gameDuration, gameCreation: r.gameCreation,
-        score: calculateOutputRating(r, ctx).score,
+        score: rateGame(r).score,
         kda: kdaScore(r.kills, r.deaths, r.assists),
         damageShare: (r.damageToChampions || 0) / Math.max(r.teamDamageToChampions || 0, 1),
         dpm: (r.damageToChampions || 0) / minutes,
@@ -1479,6 +1730,145 @@ function sortVendettaRows(rows: VendettaSideRow[]): VendettaSideRow[] {
   })
 }
 
+/* ── 海克斯级别与刷新统计 ── */
+interface AugTierComboRow {
+  key: string
+  parts: string[]
+  count: number
+}
+const augmentTierSectionVisible = ref(false)
+const augComboSortDir = ref<"asc" | "desc">("desc")
+
+function toggleAugComboSort() {
+  augComboSortDir.value = augComboSortDir.value === "asc" ? "desc" : "asc"
+}
+function augComboSortIcon() {
+  return augComboSortDir.value === "asc" ? " ▲" : " ▼"
+}
+
+function augmentTierOf(id: number): string {
+  const rarity = augmentMap.value[id]?.rarity || ""
+  if (rarity === "kPrismatic") return "彩"
+  if (rarity === "kGold") return "金"
+  if (rarity === "kSilver") return "银"
+  // 海克斯大乱斗仅存在 银/金/彩 三档；其余按未知处理（不参与三档概率）
+  return "未知"
+}
+
+interface AugTierPosStat {
+  total: number
+  prismatic: number
+  gold: number
+  silver: number
+}
+function emptyPosStat(): AugTierPosStat {
+  return { total: 0, prismatic: 0, gold: 0, silver: 0 }
+}
+
+const augmentTierStats = computed(() => {
+  const games = visibleGames.value
+  const posAgg = [emptyPosStat(), emptyPosStat(), emptyPosStat(), emptyPosStat()]
+  const comboMap = new Map<string, AugTierComboRow>()
+  const tierTotals: Record<string, number> = { 彩: 0, 金: 0, 银: 0, 未知: 0 }
+  let totalPicks = 0
+  let goldSlotPicks = 0
+  let refreshCount = 0
+  const refreshGames = new Set<number>()
+  let silverSlotPicks = 0
+  let goldRefreshCount = 0
+  const goldRefreshGames = new Set<number>()
+
+  for (const game of games) {
+    const gamePos = [emptyPosStat(), emptyPosStat(), emptyPosStat(), emptyPosStat()]
+    const seqs: string[][] = []
+    for (const team of game.teams) {
+      for (const p of team.players) {
+        // augmentIds 按选择顺序排列；对局提前结束则第 2/3/4 个缺失
+        const tiers = (p.augmentIds || []).slice(0, 4).map(augmentTierOf)
+        if (!tiers.length) continue
+        seqs.push(tiers)
+        tiers.forEach((t, i) => {
+          gamePos[i].total++
+          if (t === "彩") gamePos[i].prismatic++
+          else if (t === "金") gamePos[i].gold++
+          else if (t === "银") gamePos[i].silver++
+        })
+        const key = tiers.join("")
+        let c = comboMap.get(key)
+        if (!c) {
+          c = { key, parts: [...tiers], count: 0 }
+          comboMap.set(key, c)
+        }
+        c.count++
+      }
+    }
+    // 该局每个位置多数为金时，即"金槽"（存在棱彩刷新机会）；多数为银时即"银槽"（存在金色刷新机会）
+    const majorityGold = gamePos.map((pos) => {
+      if (!pos.total) return false
+      return pos.gold >= pos.prismatic && pos.gold >= pos.silver
+    })
+    const majoritySilver = gamePos.map((pos) => {
+      if (!pos.total) return false
+      return pos.silver > pos.gold && pos.silver >= pos.prismatic
+    })
+    let gameRefresh = false
+    let gameGoldRefresh = false
+    for (const tiers of seqs) {
+      tiers.forEach((t, i) => {
+        posAgg[i].total++
+        if (t === "彩") posAgg[i].prismatic++
+        else if (t === "金") posAgg[i].gold++
+        else if (t === "银") posAgg[i].silver++
+        totalPicks++
+        tierTotals[t] = (tierTotals[t] || 0) + 1
+        if (majorityGold[i]) {
+          goldSlotPicks++
+          if (t === "彩") {
+            refreshCount++
+            gameRefresh = true
+          }
+        }
+        if (majoritySilver[i]) {
+          silverSlotPicks++
+          if (t === "金") {
+            goldRefreshCount++
+            gameGoldRefresh = true
+          }
+        }
+      })
+    }
+    if (gameRefresh) refreshGames.add(game.gameId)
+    if (gameGoldRefresh) goldRefreshGames.add(game.gameId)
+  }
+
+  const combos = [...comboMap.values()].sort((a, b) => b.count - a.count)
+  return {
+    posAgg,
+    combos,
+    tierTotals,
+    totalPicks,
+    totalCombos: combos.reduce((s, c) => s + c.count, 0),
+    goldSlotPicks,
+    refreshCount,
+    refreshGames: refreshGames.size,
+    totalGames: games.length,
+    refreshRate: goldSlotPicks > 0 ? refreshCount / goldSlotPicks : 0,
+    silverSlotPicks,
+    goldRefreshCount,
+    goldRefreshGames: goldRefreshGames.size,
+    goldRefreshRate: silverSlotPicks > 0 ? goldRefreshCount / silverSlotPicks : 0,
+  }
+})
+
+const sortedAugCombos = computed(() => {
+  const m = augComboSortDir.value === "asc" ? 1 : -1
+  return [...augmentTierStats.value.combos].sort((a, b) => (a.count - b.count) * m)
+})
+
+function tierPctStr(part: number, total: number) {
+  return total > 0 ? `${((part / total) * 100).toFixed(1)}%` : "-"
+}
+
 function parseMinGamesText(text: string) {
   const v = parseInt(text, 10)
   return Number.isFinite(v) && v > 0 ? v : 0
@@ -1587,6 +1977,55 @@ function memberName(puuid: string) { return teamPlayers.value.find((p) => p.puui
 
 const honorSectionVisible = ref(false)
 const comboSectionVisible = ref(false)
+
+/* ── 模块懒渲染：未展开的模块先不渲染，首次展开才真正挂载/计算（大数据量加载更流畅） ── */
+const openedOnce = reactive<Record<string, boolean>>({
+  gameList: false,
+  honor: false,
+  vendetta: false,
+  combo: false,
+  team: false,
+  champion: false,
+  augment: false,
+  item: false,
+  augTier: false,
+})
+const lazySectionRefs: Record<string, Ref<boolean>> = {
+  gameList: gameListVisible,
+  honor: honorSectionVisible,
+  vendetta: vendettaSectionVisible,
+  combo: comboSectionVisible,
+  team: teamSectionVisible,
+  champion: championSectionVisible,
+  augment: augmentSectionVisible,
+  item: itemSectionVisible,
+  augTier: augmentTierSectionVisible,
+}
+function toggleSection(key: keyof typeof lazySectionRefs) {
+  const vis = lazySectionRefs[key]
+  vis.value = !vis.value
+  if (vis.value) openedOnce[key] = true
+}
+
+/* ── 大表格分批渲染（组队搭档 / 阵容与搭档），效果同对局列表 ── */
+const TABLE_INITIAL = 100
+const TABLE_STEP = 200
+const teamShown = ref(TABLE_INITIAL)
+const comboTeamShown = ref(TABLE_INITIAL)
+const comboDuoShown = ref(TABLE_INITIAL)
+const comboTrioShown = ref(TABLE_INITIAL)
+function loadMoreTeam() {
+  teamShown.value = Math.min(teamSortedRows.value.length, teamShown.value + TABLE_STEP)
+}
+function loadMoreComboTeam() {
+  comboTeamShown.value = Math.min(comboRows.value.teams.length, comboTeamShown.value + TABLE_STEP)
+}
+function loadMoreComboDuo() {
+  comboDuoShown.value = Math.min(comboRows.value.duos.length, comboDuoShown.value + TABLE_STEP)
+}
+function loadMoreComboTrio() {
+  comboTrioShown.value = Math.min(comboRows.value.trios.length, comboTrioShown.value + TABLE_STEP)
+}
 </script>
 
 <template>
@@ -1691,17 +2130,56 @@ const comboSectionVisible = ref(false)
 
       <!-- ═══════════════ GAME LIST ═══════════════ -->
       <div class="game-section" v-if="enrichedGames.length > 0">
-        <div class="game-section-header" @click="gameListVisible = !gameListVisible">
+        <div class="game-section-header" @click="toggleSection('gameList')">
           <div class="gsh-left">
             <span class="section-title">
               <component :is="gameListVisible ? ChevronDown : ChevronRight" :size="14" />
-              对局列表 ({{ enrichedGames.length }})
+              对局列表 ({{ filteredGameList.length }})<template v-if="gameSearchQuery.trim()"> / {{ enrichedGames.length }} 匹配</template>
             </span>
+          </div>
+          <div class="gsh-right" @click.stop>
+            <div class="game-search-box">
+              <Search :size="13" class="game-search-icon" />
+              <input
+                v-model="gameSearchQuery"
+                type="text"
+                class="game-search-input"
+                placeholder="搜玩家 / 海克斯 / 日期 / 装备 / 英雄…"
+                title="关键字过滤对局列表：可搜玩家名、海克斯/装备名、日期（如 2026-09-03、9月3日）、英雄等；多个词用空格分隔（全部命中才显示）"
+              />
+              <X v-if="gameSearchQuery" :size="13" class="game-search-clear" @click="gameSearchQuery = ''" />
+            </div>
           </div>
         </div>
 
-        <div v-show="gameListVisible" class="game-list">
-          <div v-for="game in enrichedGames" :key="game.gameId" :data-game-id="game.gameId" class="game-card-outer">
+        <div v-if="openedOnce.gameList" v-show="gameListVisible" class="game-list">
+          <div class="game-list-toolbar">
+            <span class="stat-subtitle">时间分栏</span>
+            <select v-model="gameListViewMode" class="game-view-select" title="切换对局列表展示方式">
+              <option value="grouped">按时间分组（年/月 → 日期）</option>
+              <option value="flat">平铺列表</option>
+            </select>
+            <span v-if="gameListViewMode === 'grouped'" class="stat-subtitle">默认展开最近一个月；更早月份点击标题后才加载该月对局</span>
+            <span v-else class="stat-subtitle">按时间倒序平铺，超出分批加载</span>
+          </div>
+          <div v-if="filteredGameList.length === 0" class="game-search-empty">
+            <span>没有符合「{{ gameSearchQuery.trim() }}」的对局，试试其他关键字</span>
+          </div>
+          <template v-else>
+            <template v-for="row in gameListDisplay">
+              <div v-if="isMonthRow(row)" :key="row.key" class="game-month-header" @click="toggleMonthOpen(row.monthKey)">
+              <component :is="row.open ? ChevronDown : ChevronRight" :size="14" />
+              <span class="gm-label">{{ row.label }}</span>
+              <span class="gm-count">{{ row.count }} 场</span>
+              <span v-if="!row.open && row.count > 0" class="gm-hint">展开查看</span>
+            </div>
+            <div v-else-if="isDateRow(row)" :key="row.key" class="game-date-header">
+              <span class="gd-label">{{ row.label }}</span>
+              <span v-if="row.shown < row.total" class="gd-count">已显示 {{ row.shown }}/{{ row.total }} 场</span>
+              <span v-else class="gd-count">{{ row.total }} 场</span>
+            </div>
+            <template v-else-if="isGameRow(row)">
+              <div v-for="game in [row.game]" :key="game.gameId" :data-game-id="game.gameId" class="game-card-outer">
             <div
               class="game-card"
               :class="{ 'game-has-expanded': expandedGames.has(game.gameId) }"
@@ -1907,7 +2385,17 @@ const comboSectionVisible = ref(false)
                 </div>
               </div>
             </div>
-          </div>
+              </div>
+            </template>
+            <div v-else-if="isMoreRow(row)" :key="row.key" class="game-more-bar">
+              <span class="stat-subtitle">已显示 {{ row.shown }} / {{ row.total }} 局</span>
+              <button v-if="row.monthKey" class="toggle-sub" @click="loadMoreMonth(row.monthKey)">加载更多（{{ row.moreStep }} 局）</button>
+              <button v-else class="toggle-sub" @click="showMoreGames">加载更多（{{ row.moreStep }} 局）</button>
+              <button v-if="row.monthKey" class="toggle-sub" @click="showAllMonth(row.monthKey)">显示全部 {{ row.total }} 局</button>
+              <button v-else class="toggle-sub" @click="showAllGames">显示全部 {{ row.total }} 局</button>
+            </div>
+            </template>
+          </template>
         </div>
       </div>
 
@@ -2066,12 +2554,12 @@ const comboSectionVisible = ref(false)
       <!-- 荣誉墙 -->
       <div v-if="playerRatings.length > 0" class="stat-module">
         <div class="stat-section">
-          <div class="stat-title-line" @click="honorSectionVisible = !honorSectionVisible">
+          <div class="stat-title-line" @click="toggleSection('honor')">
             <component :is="honorSectionVisible ? ChevronDown : ChevronRight" :size="14" />
             <span class="section-title">荣誉墙</span>
             <span class="stat-subtitle">每局全场 10 人评选</span>
           </div>
-          <div v-show="honorSectionVisible" class="stat-section-body">
+          <div v-if="openedOnce.honor" v-show="honorSectionVisible" class="stat-section-body">
             <div class="honor-grid">
               <div v-for="row in honorWall" :key="row.honor" class="honor-card">
                 <div class="honor-name">{{ row.honor }}</div>
@@ -2096,12 +2584,12 @@ const comboSectionVisible = ref(false)
       <!-- 击杀与被击杀榜 -->
       <div v-if="vendettaPlayers.length" class="stat-module">
         <div class="stat-section">
-          <div class="stat-title-line" @click="vendettaSectionVisible = !vendettaSectionVisible">
+          <div class="stat-title-line" @click="toggleSection('vendetta')">
             <component :is="vendettaSectionVisible ? ChevronDown : ChevronRight" :size="14" />
             <span class="section-title">击杀与被击杀榜</span>
             <span class="stat-subtitle">选择玩家，看 TA 杀谁最多 / 被谁杀最多</span>
           </div>
-          <div v-show="vendettaSectionVisible" class="stat-section-body">
+          <div v-if="openedOnce.vendetta" v-show="vendettaSectionVisible" class="stat-section-body">
             <div class="stat-header">
               <select v-model="vendettaPuuid" class="stat-search" style="width: 180px; cursor: pointer" title="选择要分析的玩家">
                 <option v-for="p in vendettaPlayers" :key="p.puuid" :value="p.puuid">{{ p.name }}（{{ p.games }}场）</option>
@@ -2195,12 +2683,12 @@ const comboSectionVisible = ref(false)
       <!-- 阵容与搭档 -->
       <div v-if="playerRatings.length > 1" class="stat-module">
         <div class="stat-section">
-          <div class="stat-title-line" @click="comboSectionVisible = !comboSectionVisible">
+          <div class="stat-title-line" @click="toggleSection('combo')">
             <component :is="comboSectionVisible ? ChevronDown : ChevronRight" :size="14" />
             <span class="section-title">阵容与搭档</span>
             <span class="stat-subtitle">固定五人 / 双人 / 三人</span>
           </div>
-          <div v-show="comboSectionVisible" class="stat-section-body">
+          <div v-if="openedOnce.combo" v-show="comboSectionVisible" class="stat-section-body">
             <div class="combo-tables">
               <div class="combo-block">
                 <div class="stat-header" style="margin-bottom:8px">
@@ -2224,7 +2712,7 @@ const comboSectionVisible = ref(false)
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="c in comboRows.teams" :key="c.members.join('|')">
+                    <tr v-for="c in comboRows.teams.slice(0, comboTeamShown)" :key="c.members.join('|')">
                       <td class="combo-members">{{ c.members.map(memberName).join(' / ') }}</td>
                       <td class="st-num">{{ c.games }}</td>
                       <td class="st-num"><span :class="winRateClass(c.winRate)">{{ c.winRate.toFixed(0) }}%</span></td>
@@ -2232,6 +2720,10 @@ const comboSectionVisible = ref(false)
                     <tr v-if="!comboRows.teams.length"><td colspan="3" class="empty-table-row">暂无满足条件的五人组合</td></tr>
                   </tbody>
                 </table>
+                <div v-if="comboRows.teams.length > comboTeamShown" class="table-more-bar">
+                  <button class="toggle-sub" @click="loadMoreComboTeam">加载更多（{{ Math.min(TABLE_STEP, comboRows.teams.length - comboTeamShown) }} 组）</button>
+                  <button class="toggle-sub" @click="comboTeamShown = comboRows.teams.length">显示全部 {{ comboRows.teams.length }} 组</button>
+                </div>
               </div>
               <div class="combo-block">
                 <div class="stat-header" style="margin-bottom:8px">
@@ -2255,7 +2747,7 @@ const comboSectionVisible = ref(false)
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="c in comboRows.duos" :key="c.members.join('|')">
+                    <tr v-for="c in comboRows.duos.slice(0, comboDuoShown)" :key="c.members.join('|')">
                       <td class="combo-members">{{ c.members.map(memberName).join(' / ') }}</td>
                       <td class="st-num">{{ c.games }}</td>
                       <td class="st-num"><span :class="winRateClass(c.winRate)">{{ c.winRate.toFixed(0) }}%</span></td>
@@ -2263,6 +2755,10 @@ const comboSectionVisible = ref(false)
                     <tr v-if="!comboRows.duos.length"><td colspan="3" class="empty-table-row">暂无满足条件的双人组合</td></tr>
                   </tbody>
                 </table>
+                <div v-if="comboRows.duos.length > comboDuoShown" class="table-more-bar">
+                  <button class="toggle-sub" @click="loadMoreComboDuo">加载更多（{{ Math.min(TABLE_STEP, comboRows.duos.length - comboDuoShown) }} 组）</button>
+                  <button class="toggle-sub" @click="comboDuoShown = comboRows.duos.length">显示全部 {{ comboRows.duos.length }} 组</button>
+                </div>
               </div>
               <div class="combo-block">
                 <div class="stat-header" style="margin-bottom:8px">
@@ -2286,7 +2782,7 @@ const comboSectionVisible = ref(false)
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="c in comboRows.trios" :key="c.members.join('|')">
+                    <tr v-for="c in comboRows.trios.slice(0, comboTrioShown)" :key="c.members.join('|')">
                       <td class="combo-members">{{ c.members.map(memberName).join(' / ') }}</td>
                       <td class="st-num">{{ c.games }}</td>
                       <td class="st-num"><span :class="winRateClass(c.winRate)">{{ c.winRate.toFixed(0) }}%</span></td>
@@ -2294,6 +2790,10 @@ const comboSectionVisible = ref(false)
                     <tr v-if="!comboRows.trios.length"><td colspan="3" class="empty-table-row">暂无满足条件的三人组合</td></tr>
                   </tbody>
                 </table>
+                <div v-if="comboRows.trios.length > comboTrioShown" class="table-more-bar">
+                  <button class="toggle-sub" @click="loadMoreComboTrio">加载更多（{{ Math.min(TABLE_STEP, comboRows.trios.length - comboTrioShown) }} 组）</button>
+                  <button class="toggle-sub" @click="comboTrioShown = comboRows.trios.length">显示全部 {{ comboRows.trios.length }} 组</button>
+                </div>
               </div>
             </div>
           </div>
@@ -2303,12 +2803,12 @@ const comboSectionVisible = ref(false)
       <!-- ═══════════════ 玩家组队搭档统计 ═══════════════ -->
       <div v-if="teamPlayers.length" class="stat-module">
         <div class="stat-section">
-          <div class="stat-title-line" @click="teamSectionVisible = !teamSectionVisible">
+          <div class="stat-title-line" @click="toggleSection('team')">
             <component :is="teamSectionVisible ? ChevronDown : ChevronRight" :size="14" />
             <span class="section-title">玩家组队搭档统计</span>
             <span class="stat-subtitle">{{ targetStat?.gameName || '' }} · {{ teamMode === 'teammate' ? '搭档胜率' : '对位胜率' }}</span>
           </div>
-          <div v-show="teamSectionVisible" class="stat-section-body">
+          <div v-if="openedOnce.team" v-show="teamSectionVisible" class="stat-section-body">
             <div class="stat-header">
               <select v-model="targetPuuid" class="stat-search" style="width: 180px; cursor: pointer; padding: 5px 8px;" title="选择要分析的玩家">
                 <option v-for="p in teamPlayers" :key="p.puuid" :value="p.puuid">{{ p.gameName }}（{{ p.games }}场）</option>
@@ -2374,7 +2874,7 @@ const comboSectionVisible = ref(false)
                     <td colspan="6" class="empty-table-row">没有满足条件的{{ teamMode === 'teammate' ? '搭档' : '对手' }}记录{{ teamSampleInsufficient > 0 ? '（样本场次不足，不计入排名）' : '' }}</td>
                   </tr>
                   <template v-if="teamQualifiedRows.length">
-                    <tr v-for="(r, i) in teamSortedRows" :key="r.puuid" @click="switchTeamTarget(r.puuid)">
+                    <tr v-for="(r, i) in teamSortedRows.slice(0, teamShown)" :key="r.puuid" @click="switchTeamTarget(r.puuid)">
                       <td class="st-champ"><span class="st-champ-name">{{ r.gameName }}</span></td>
                       <td class="st-num" style="text-align:center">{{ r.games }}</td>
                       <td class="st-num" style="text-align:center">{{ r.wins }}</td>
@@ -2388,6 +2888,11 @@ const comboSectionVisible = ref(false)
                 </tbody>
               </table>
             </div>
+            <div v-if="teamSortedRows.length > teamShown" class="table-more-bar">
+              <span class="stat-subtitle">已显示 {{ teamShown }} / {{ teamSortedRows.length }}</span>
+              <button class="toggle-sub" @click="loadMoreTeam">加载更多（{{ Math.min(TABLE_STEP, teamSortedRows.length - teamShown) }} 人）</button>
+              <button class="toggle-sub" @click="teamShown = teamSortedRows.length">显示全部 {{ teamSortedRows.length }} 人</button>
+            </div>
             <div class="stat-header" style="margin-top:6px">
               <span class="stat-subtitle">点击玩家名切换目标玩家 · {{ teamMinGames > 0 ? '仅统计共同出场≥' + teamMinGames + '场' : '不限场次' }}</span>
             </div>
@@ -2398,12 +2903,12 @@ const comboSectionVisible = ref(false)
       <!-- ═══════════════ 英雄 / 海克斯统计 ═══════════════ -->
       <div v-if="statHasData" class="stat-module">
         <div class="stat-section">
-          <div class="stat-title-line" @click="championSectionVisible = !championSectionVisible">
+          <div class="stat-title-line" @click="toggleSection('champion')">
             <component :is="championSectionVisible ? ChevronDown : ChevronRight" :size="14" />
             <span class="section-title">英雄榜</span>
             <span class="stat-subtitle">{{ championStat.length }} 位英雄 · {{ championStat.reduce((s, e) => s + e.picks, 0) }} 次出场</span>
           </div>
-          <div v-show="championSectionVisible" class="stat-section-body">
+          <div v-if="openedOnce.champion" v-show="championSectionVisible" class="stat-section-body">
           <div class="stat-header">
             <input v-model="championSearch" placeholder="搜英雄" class="stat-search" />
             <div class="toggle-sub min-games-input" :class="{ active: championMinPicks > 0 }" title="只显示出现次数≥该值的英雄，留空为不限">
@@ -2491,12 +2996,12 @@ const comboSectionVisible = ref(false)
         </div>
 
         <div v-if="augmentStat.length > 0" class="stat-section">
-          <div class="stat-title-line" @click="augmentSectionVisible = !augmentSectionVisible">
+          <div class="stat-title-line" @click="toggleSection('augment')">
             <component :is="augmentSectionVisible ? ChevronDown : ChevronRight" :size="14" />
             <span class="section-title">海克斯榜</span>
             <span class="stat-subtitle">{{ augmentStat.length }} 个海克斯强化</span>
           </div>
-          <div v-show="augmentSectionVisible" class="stat-section-body">
+          <div v-if="openedOnce.augment" v-show="augmentSectionVisible" class="stat-section-body">
           <div class="stat-header">
             <input v-model="augmentSearch" placeholder="搜海克斯" class="stat-search" />
             <div class="toggle-sub min-games-input" :class="{ active: augmentMinPicks > 0 }" title="只显示次数≥该值的海克斯，留空为不限">
@@ -2552,12 +3057,12 @@ const comboSectionVisible = ref(false)
         </div>
 
         <div v-if="itemStat.length > 0" class="stat-section">
-          <div class="stat-title-line" @click="itemSectionVisible = !itemSectionVisible">
+          <div class="stat-title-line" @click="toggleSection('item')">
             <component :is="itemSectionVisible ? ChevronDown : ChevronRight" :size="14" />
             <span class="section-title">装备榜</span>
             <span class="stat-subtitle">{{ itemStat.length }} 件装备 · {{ itemStat.reduce((s, e) => s + e.picks, 0) }} 次出现</span>
           </div>
-          <div v-show="itemSectionVisible" class="stat-section-body">
+          <div v-if="openedOnce.item" v-show="itemSectionVisible" class="stat-section-body">
           <div class="stat-header">
             <input v-model="itemSearch" placeholder="搜装备" class="stat-search" />
             <div class="toggle-sub min-games-input" :class="{ active: itemMinPicks > 0 }" title="只显示次数≥该值的装备，留空为不限">
@@ -2613,6 +3118,91 @@ const comboSectionVisible = ref(false)
               </tbody>
             </table>
           </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 海克斯级别与刷新统计 -->
+      <div v-if="augmentTierStats.totalPicks > 0" class="stat-module">
+        <div class="stat-section">
+          <div class="stat-title-line" @click="toggleSection('augTier')">
+            <component :is="augmentTierSectionVisible ? ChevronDown : ChevronRight" :size="14" />
+            <span class="section-title">海克斯级别与刷新</span>
+            <span class="stat-subtitle">彩/金/银出现概率 · 组合分布 · 金色/棱彩刷新概率</span>
+          </div>
+          <div v-if="openedOnce.augTier" v-show="augmentTierSectionVisible" class="stat-section-body">
+            <div class="aug-tier-cards">
+              <div v-for="t in [['彩', '#c77dff'], ['金', '#f0b429'], ['银', '#a9b7c6']]" :key="t[0]" class="aug-tier-card">
+                <span class="aug-tier-dot" :style="{ background: t[1] }"></span>
+                <span class="aug-tier-name">{{ t[0] }}</span>
+                <b>{{ tierPctStr(augmentTierStats.tierTotals[t[0]] || 0, augmentTierStats.totalPicks) }}</b>
+                <span class="aug-tier-num">{{ augmentTierStats.tierTotals[t[0]] || 0 }} 次</span>
+              </div>
+            </div>
+
+            <div class="aug-refresh-cards">
+              <div class="aug-refresh-card aug-gold">
+                <span class="aug-refresh-label">金色刷新概率</span>
+                <b class="aug-refresh-rate" style="color:#f0b429">{{ (augmentTierStats.goldRefreshRate * 100).toFixed(1) }}%</b>
+                <span class="stat-subtitle">{{ augmentTierStats.goldRefreshCount }} / {{ augmentTierStats.silverSlotPicks }} 个银槽 · 涉及 {{ augmentTierStats.goldRefreshGames }} / {{ augmentTierStats.totalGames }} 局</span>
+              </div>
+              <div class="aug-refresh-card">
+                <span class="aug-refresh-label">棱彩刷新概率</span>
+                <b class="aug-refresh-rate">{{ (augmentTierStats.refreshRate * 100).toFixed(1) }}%</b>
+                <span class="stat-subtitle">{{ augmentTierStats.refreshCount }} / {{ augmentTierStats.goldSlotPicks }} 个金槽 · 涉及 {{ augmentTierStats.refreshGames }} / {{ augmentTierStats.totalGames }} 局</span>
+              </div>
+            </div>
+            <div class="aug-refresh-hint">口径：某位置全队多数为银时视作银槽，银槽上单人为金即计为一次金色刷新（银→金）；多数为金时视作金槽，金槽上单人为彩即计为一次棱彩刷新（金→彩）（对局提前结束时缺失的海克斯不计）</div>
+
+            <div class="stat-table-scroll" style="max-height: 260px">
+              <table class="stat-table">
+                <thead>
+                  <tr>
+                    <th class="st-champ">选择位置</th>
+                    <th class="st-num" style="text-align:center">人次</th>
+                    <th class="st-num" style="text-align:center"><span class="aug-dot-text" style="color:#c77dff">彩</span></th>
+                    <th class="st-num" style="text-align:center"><span style="color:#f0b429">金</span></th>
+                    <th class="st-num" style="text-align:center"><span style="color:#c6d4de">银</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(pos, i) in augmentTierStats.posAgg" :key="i">
+                    <td class="st-champ"><span class="st-champ-name">第 {{ i + 1 }} 个海克斯</span></td>
+                    <td class="st-num" style="text-align:center">{{ pos.total }}</td>
+                    <td class="st-num" style="text-align:center"><b style="color:#c77dff">{{ tierPctStr(pos.prismatic, pos.total) }}</b></td>
+                    <td class="st-num" style="text-align:center"><b style="color:#f0b429">{{ tierPctStr(pos.gold, pos.total) }}</b></td>
+                    <td class="st-num" style="text-align:center">{{ tierPctStr(pos.silver, pos.total) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="stat-header" style="margin-top: 10px">
+              <span class="stat-subtitle">组合分布（按选择顺序，如"彩彩金金"）· 共 {{ augmentTierStats.combos.length }} 种</span>
+            </div>
+            <div class="stat-table-scroll">
+              <table class="stat-table">
+                <thead>
+                  <tr>
+                    <th class="st-champ">组合</th>
+                    <th class="st-num sortable" style="text-align:center" @click="toggleAugComboSort">次数{{ augComboSortIcon() }}</th>
+                    <th class="st-num" style="text-align:center">概率</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="c in sortedAugCombos" :key="c.key">
+                    <td class="st-champ">
+                      <span class="aug-combo-chip" v-for="(t, ti) in c.parts" :key="ti" :class="`ac-${t}`">{{ t }}</span>
+                    </td>
+                    <td class="st-num" style="text-align:center"><b>{{ c.count }}</b></td>
+                    <td class="st-num" style="text-align:center">{{ tierPctStr(c.count, augmentTierStats.totalCombos) }}</td>
+                  </tr>
+                  <tr v-if="!augmentTierStats.combos.length">
+                    <td colspan="3" class="empty-table-row">暂无海克斯数据</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
@@ -2688,6 +3278,8 @@ const comboSectionVisible = ref(false)
 
 /* ── game section ── */
 .game-section { display: flex; flex-direction: column; gap: 8px; }
+.game-more-bar { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 10px 0 4px; flex-wrap: wrap; }
+.table-more-bar { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 8px 0 2px; flex-wrap: wrap; }
 .game-section-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 6px 0; cursor: pointer; user-select: none; }
 .game-section-header:hover { color: var(--accent, #6366f1); }
 .gsh-left { display: flex; align-items: center; gap: 8px; }
@@ -2695,6 +3287,29 @@ const comboSectionVisible = ref(false)
 .gsh-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 .game-list { display: flex; flex-direction: column; gap: 6px; }
+
+/* ── game list toolbar（时间分栏视图切换） ── */
+.game-list-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 0 4px; }
+.game-view-select { background: var(--bg-tertiary, #2a2a2a); border: 1px solid var(--border, #444); border-radius: 6px; padding: 4px 8px; color: #ffffff; font-size: 12px; font-family: inherit; outline: none; cursor: pointer; }
+.game-view-select option { color: #333; background: #fff; }
+.game-search-box { display: inline-flex; align-items: center; gap: 6px; background: #ffffff; border: 1px solid #cbd8dc; border-radius: 8px; padding: 5px 10px; min-width: 260px; }
+.game-search-box:focus-within { border-color: #1f5f56; box-shadow: 0 0 0 2px rgba(31, 95, 86, 0.15); }
+.game-search-icon { color: #6f8a90; flex-shrink: 0; }
+.game-search-input { border: none; outline: none; background: transparent; color: #1f2a2e; font-size: 13px; font-family: inherit; width: 100%; min-width: 0; }
+.game-search-input::placeholder { color: #93a4a9; }
+.game-search-clear { color: #6f8a90; cursor: pointer; flex-shrink: 0; }
+.game-search-clear:hover { color: #c53030; }
+.game-search-empty { display: flex; justify-content: center; align-items: center; padding: 28px 0; color: #7a8a8f; font-size: 13px; border: 1px dashed var(--border, #cbd8dc); border-radius: 8px; }
+
+/* ── 时间分组：月份头 / 日期头 ── */
+.game-month-header { display: flex; align-items: center; gap: 10px; padding: 9px 12px; margin-top: 6px; background: var(--bg-tertiary, #232323); border: 1px solid var(--border, #3a3a3a); border-radius: 8px; cursor: pointer; user-select: none; font-size: 15px; color: var(--text, #eee); }
+.game-month-header:hover { border-color: var(--accent, #6366f1); color: #c7d2fe; }
+.game-month-header .gm-label { font-weight: 700; font-size: 15px; }
+.game-month-header .gm-count { color: var(--text-strong, #d6d6d6); font-weight: 700; font-size: 13px; }
+.game-month-header .gm-hint { color: #aab6e6; font-size: 12px; margin-left: auto; }
+.game-date-header { display: flex; align-items: center; gap: 8px; padding: 8px 4px 2px; font-size: 13px; color: #111827; border-bottom: 1px dashed var(--border, #c8d2d8); }
+.game-date-header .gd-label { font-weight: 700; font-size: 14px; color: #000000; }
+.game-date-header .gd-count { margin-left: auto; color: #374151; font-size: 12px; font-weight: 600; }
 
 /* ── game card ── */
 .game-card-outer { position: relative; }
@@ -2773,8 +3388,9 @@ const comboSectionVisible = ref(false)
 .text-grid .augment-silver { border-color: rgba(134, 151, 166, 0.48); color: #c6d4de; background: rgba(73, 96, 111, 0.45); }
 .text-grid .augment-bronze { border-color: rgba(167, 105, 60, 0.46); color: #e8b48a; background: rgba(122, 67, 35, 0.45); }
 .kda-cell, .stat-cell, .score-cell { display: flex; min-width: 0; align-items: center; justify-content: center; }
-.kda-cell strong { color: #e8e8f0; font-size: 13px; line-height: 1; white-space: nowrap; }
-.kda-cell .carry-chip { margin-top: 2px; padding: 1px 5px; border: 1px solid rgba(251, 146, 60, 0.45); border-radius: 6px; background: rgba(251, 146, 60, 0.12); color: #fdba74; font-size: 10px; font-weight: 800; line-height: 1.2; white-space: nowrap; }
+.kda-cell { flex-direction: column; row-gap: 1px; line-height: 1.1; }
+.kda-cell strong { color: #e8e8f0; font-size: 13px; line-height: 1.15; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.kda-cell .carry-chip { padding: 0 5px; border: 1px solid rgba(251, 146, 60, 0.45); border-radius: 6px; background: rgba(251, 146, 60, 0.12); color: #fdba74; font-size: 10px; font-weight: 800; line-height: 1.5; white-space: nowrap; }
 .stat-cell strong { display: inline-flex; flex-direction: column; align-items: center; gap: 1px; color: #e8e8f0; font-size: 16.5px; line-height: 1; white-space: nowrap; }
 .stat-cell strong.leader, .stat-cell strong.leader em { color: #ff6b6b; font-weight: 900; }
 .stat-cell em { color: #8a989c; font-size: 13.5px; font-style: normal; font-weight: 700; }
@@ -2903,7 +3519,8 @@ const comboSectionVisible = ref(false)
 .stat-sorts { display: flex; gap: 4px; margin-left: 8px; }
 .stat-table-scroll { max-height: 480px; overflow-y: auto; margin-top: 8px; border: 1px solid var(--border, #333); border-radius: 8px; background: var(--bg-tertiary, #1e1e1e); }
 .stat-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.stat-table th { position: sticky; top: 0; z-index: 2; background: #17171f; padding: 6px 10px; text-align: left; font-size: 11px; font-weight: 600; color: var(--text-muted, #888); border-bottom: 1px solid var(--border, #333); white-space: nowrap; }
+.stat-table th { background: #17171f; padding: 6px 10px; text-align: left; font-size: 11px; font-weight: 600; color: var(--text-muted, #888); border-bottom: 1px solid var(--border, #333); white-space: nowrap; }
+.stat-table-scroll .stat-table th { position: sticky; top: 0; z-index: 2; }
 .stat-table th.sortable { cursor: pointer; user-select: none; }
 .stat-table th.sortable:hover { color: var(--accent, #a5b4fc); }
 .champion-table tbody tr { cursor: pointer; }
@@ -2922,6 +3539,25 @@ const comboSectionVisible = ref(false)
 .vendetta-block { background: var(--bg-tertiary, #1e1e1e); border: 1px solid var(--border, #333); border-radius: 8px; padding: 10px 12px; }
 .vendetta-block-title { font-size: 12px; font-weight: 700; color: #a5b4fc; margin-bottom: 8px; }
 .vendetta-scroll { max-height: 320px; }
+
+/* 海克斯级别与刷新 */
+.aug-tier-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 10px; }
+.aug-tier-card { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 6px; border-radius: 8px; background: var(--bg-secondary, #242730); }
+.aug-tier-dot { width: 14px; height: 14px; border-radius: 50%; }
+.aug-tier-name { font-size: 12px; color: var(--text-muted, #aaa); }
+.aug-tier-card b { font-size: 18px; color: #f2f5f4; font-variant-numeric: tabular-nums; }
+.aug-tier-num { font-size: 11px; color: var(--text-muted, #888); }
+.aug-refresh-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; margin-bottom: 6px; }
+.aug-refresh-card { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 8px; background: rgba(99, 102, 241, 0.08); border: 1px solid rgba(99, 102, 241, 0.25); flex-wrap: wrap; }
+.aug-refresh-card.aug-gold { background: rgba(240, 180, 41, 0.1); border: 1px solid rgba(240, 180, 41, 0.4); }
+.aug-refresh-label { font-size: 13px; font-weight: 700; color: #dbe7e4; }
+.aug-refresh-rate { font-size: 20px; color: #c77dff; font-variant-numeric: tabular-nums; }
+.aug-refresh-hint { font-size: 10px; color: var(--text-muted, #666); margin-bottom: 10px; }
+.aug-combo-chip { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-right: 3px; border-radius: 4px; font-size: 11px; font-weight: 800; }
+.ac-彩 { background: rgba(199, 125, 255, 0.22); color: #c77dff; border: 1px solid rgba(199, 125, 255, 0.5); }
+.ac-金 { background: rgba(240, 180, 41, 0.18); color: #f0b429; border: 1px solid rgba(240, 180, 41, 0.45); }
+.ac-银 { background: rgba(169, 183, 198, 0.16); color: #c6d4de; border: 1px solid rgba(169, 183, 198, 0.4); }
+.ac-未知 { background: rgba(255, 255, 255, 0.08); color: #888; border: 1px solid #444; }
 .st-more { color: var(--text-muted, #666); font-size: 11px; margin-left: 3px; }
 .st-name { min-width: 200px; }
 .st-aug-name { margin-left: 4px; color: var(--text-muted, #ccc); }

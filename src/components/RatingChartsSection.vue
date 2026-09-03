@@ -25,6 +25,12 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: "focus-player", puuid: string): void }>()
 
 const visible = ref(false)
+/* 首次展开才挂载内容，避免大数据量加载时立即渲染 */
+const openedOnce = ref(false)
+function toggleVisible() {
+  visible.value = !visible.value
+  if (visible.value) openedOnce.value = true
+}
 
 function clamp(v: number, min: number, max: number) {
   return Math.min(max, Math.max(min, v))
@@ -147,12 +153,12 @@ const redPct = computed(() => Math.round((props.redWins / sideTotal.value) * 100
 
 <template>
   <div class="charts-section">
-    <div class="charts-header" @click="visible = !visible">
+    <div class="charts-header" @click="toggleVisible">
       <component :is="visible ? ChevronDown : ChevronRight" :size="14" />
       <span class="section-title">数据可视化</span>
     </div>
 
-    <div v-show="visible" class="charts-body">
+    <div v-if="openedOnce" v-show="visible" class="charts-body">
       <!-- 玩家综合分 -->
       <div class="chart-card">
         <div class="chart-title">玩家综合分</div>

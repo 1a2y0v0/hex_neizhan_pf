@@ -64,6 +64,12 @@ function loadSavedSize(): SizeKey {
 }
 
 const radarVisible = ref(false)
+/* 首次展开才挂载内容，避免大数据量加载时立即渲染 */
+const radarOpenedOnce = ref(false)
+function toggleRadar() {
+  radarVisible.value = !radarVisible.value
+  if (radarVisible.value) radarOpenedOnce.value = true
+}
 const showAvgRadar = ref(true)
 const size = ref<SizeKey>(loadSavedSize())
 const singleMode = ref(false)
@@ -301,13 +307,13 @@ const statusText = computed(() => {
 
 <template>
   <div class="radar-section">
-    <div class="radar-header" @click="radarVisible = !radarVisible">
+    <div class="radar-header" @click="toggleRadar">
       <component :is="radarVisible ? ChevronDown : ChevronRight" :size="14" />
       <span class="section-title">玩家能力雷达</span>
       <span class="radar-header-count" v-if="selectedPlayers.length">已选 {{ selectedPlayers.length }} 人</span>
     </div>
 
-    <div v-show="radarVisible && !exporting" class="radar-body">
+    <div v-if="radarOpenedOnce" v-show="radarVisible && !exporting" class="radar-body">
       <div ref="canvasWrap" class="radar-canvas-wrap">
         <svg :width="W" :height="H" class="radar-svg">
           <g v-for="factor in [0.25, 0.5, 0.75, 1]" :key="factor">

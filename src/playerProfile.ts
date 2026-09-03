@@ -75,12 +75,16 @@ const DISASTER_BAND_DOMINANT_RATE = 0.3
 const DISASTER_RATE_SCORE_LIMIT = 60
 const DEFAULT_PROFILE_RATING_CONTEXT: RatingContext = {}
 
+/** 按对局对象缓存的单局评分结果，供画像多轮聚合复用（不同页面自行决定是否传）。 */
+export type RatingMemo = WeakMap<RecentGame, OutputRating>
+
 export function buildPlayerProfile(
   games: RecentGame[] = [],
   context: RatingContext = DEFAULT_PROFILE_RATING_CONTEXT,
+  memo?: RatingMemo,
 ): PlayerProfile {
   // 画像只聚合调用方已经加载好的对局，不在前端额外触发战绩请求。
-  const ratedGames = rateGames(games, context)
+  const ratedGames = rateGames(games, context, memo)
   const abilities = {
     carry: buildAbilityProfile("carry", ratedGames),
     frontline: buildAbilityProfile("frontline", ratedGames),
@@ -112,9 +116,10 @@ export function buildPlayerProfile(
 export function buildChampionProfiles(
   games: RecentGame[] = [],
   context: RatingContext = DEFAULT_PROFILE_RATING_CONTEXT,
+  memo?: RatingMemo,
 ): ChampionProfile[] {
   const byChampion = new Map<number, RatedGame[]>()
-  for (const entry of rateGames(games, context)) {
+  for (const entry of rateGames(games, context, memo)) {
     const list = byChampion.get(entry.game.championId) || []
     list.push(entry)
     byChampion.set(entry.game.championId, list)
@@ -162,9 +167,10 @@ export function profileTierClass(score: number) {
   return "profile-tier-big-pit"
 }
 
-function rateGames(games: RecentGame[], context: RatingContext) {
+function rateGames(games: RecentGame[], context: RatingContext, memo?: RatingMemo) {
   return games.map((game) => {
-    const rating = calculateOutputRating(game, context)
+    const rating = memo?.get(game) ?? calculateOutputRating(game, context)
+    if (memo) memo.set(game, rating)
     return {
       game,
       rating,

@@ -59,6 +59,12 @@ const props = defineProps<{
 }>()
 
 const visible = ref(false)
+/* 首次展开才挂载内容，避免大数据量加载时立即渲染 */
+const openedOnce = ref(false)
+function toggleVisible() {
+  visible.value = !visible.value
+  if (visible.value) openedOnce.value = true
+}
 
 /* ── 选择状态 ── */
 const selA = ref("")
@@ -273,13 +279,13 @@ function formatTime(ts: number) {
 
 <template>
   <div class="compare-section">
-    <div class="compare-title-line" @click="visible = !visible">
+    <div class="compare-title-line" @click="toggleVisible">
       <component :is="visible ? ChevronDown : ChevronRight" :size="14" />
       <span class="section-title">选手对比</span>
       <span class="stat-subtitle">A vs B</span>
     </div>
 
-    <div v-show="visible" class="compare-body">
+    <div v-if="openedOnce" v-show="visible" class="compare-body">
       <div class="stat-header">
         <select v-model="selA" class="stat-search" style="width: 180px" @change="ensureDistinct('a')">
           <option v-for="r in players" :key="r.puuid" :value="r.puuid">{{ r.gameName }}（{{ r.gamesPlayed }}场）</option>
