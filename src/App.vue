@@ -7,7 +7,6 @@ import {
   ArrowLeft,
   ChevronLeft,
   ChevronRight,
-  FileText,
   LoaderCircle,
   RefreshCw,
   Search,
@@ -350,7 +349,6 @@ const navItems: Array<{ key: PageKey; label: string; icon: typeof UserRound }> =
   { key: "current", label: "当前角色", icon: UserRound },
   { key: "live", label: "实时战绩", icon: Swords },
   { key: "search", label: "查战绩", icon: Search },
-  { key: "details", label: "详细战绩", icon: FileText },
   { key: "custom", label: "内战评分", icon: Trophy },
   { key: "tools", label: "工具", icon: Wrench },
 ]

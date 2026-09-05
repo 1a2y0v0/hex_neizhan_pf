@@ -55,7 +55,6 @@ const emit = defineEmits<{
 
 const activeTab = ref<RecordTab>("stats")
 const selectedHeroId = ref<number | null>(null)
-const selectedQueue = ref<QueueFilterKey | null>(null)
 const statsDepthInput = ref(String(props.statsDepth))
 const statsDepthPickerOpen = ref(false)
 const statsDateStart = ref("")
@@ -68,6 +67,14 @@ const rankedQueueIds = new Set([420, 440])
 const QUEUE_PREFERENCE_KEY = "lol-stats.record-stats-queue.v1"
 const QUEUE_HEXTECH_CUSTOM_KEY = "lol-stats.record-stats-hextech-custom.v1"
 const hextechIncludeCustom = ref(localStorage.getItem(QUEUE_HEXTECH_CUSTOM_KEY) !== "0")
+
+function resolveInitialQueue(): QueueFilterKey {
+  const allowed: string[] = ["ranked", "normal", "hextech", "aram"]
+  const raw = localStorage.getItem(QUEUE_PREFERENCE_KEY)
+  if (raw && allowed.includes(raw)) return raw as QueueFilterKey
+  return "hextech"
+}
+const selectedQueue = ref<QueueFilterKey | null>(resolveInitialQueue())
 const normalQueueIds = new Set([400, 430, 480, 490])
 const hexAramQueueIds = new Set([2400])
 const aramQueueIds = new Set([450])
@@ -323,11 +330,6 @@ onMounted(() => {
   if (!props.fullStats) emit("loadStats")
 })
 
-function queueCount(option: QueueOption) {
-  if (!props.fullStats) return null
-  return props.fullStats.recentGames.filter(option.matches).length
-}
-
 function clampStatsDepth(value: unknown) {
   const numberValue = Number(value)
   if (!Number.isFinite(numberValue)) return props.statsDepth
@@ -572,19 +574,6 @@ function round2(value: number) {
         />
       </div>
     <section class="stats-stage">
-      <div class="queue-picker centered" v-if="!selectedQueue">
-        <button
-          v-for="option in queueOptions"
-          :key="option.key"
-          @click="selectQueue(option.key)"
-        >
-          <strong>{{ option.label }}</strong>
-          <span v-if="queueCount(option) === null">加载后查看统计</span>
-          <span v-else>{{ queueCount(option) }} 局</span>
-        </button>
-      </div>
-
-      <template v-else>
         <div class="queue-tabs">
           <button
             v-for="option in queueOptions"
@@ -662,6 +651,11 @@ function round2(value: number) {
           </div>
         </div>
 
+      <div class="stats-pending" v-if="!filteredStats">
+        <LoaderCircle v-if="loading" class="spin" :size="16" />
+        <span>{{ loading ? "正在读取统计数据…" : "暂无统计数据，请点击上方“刷新”重试" }}</span>
+      </div>
+      <template v-else>
         <StatsPanel
           :hide-overview="true"
           :hide-champion-table="true"
@@ -765,7 +759,7 @@ function round2(value: number) {
   color: #20333a;
   font-size: 13px;
 }
-.stats-stage .queue-tabs, .stats-stage .queue-picker {
+.stats-stage .queue-tabs {
   display: none;
 }
 .match-layout {
@@ -810,8 +804,7 @@ function round2(value: number) {
 }
 
 .record-tabs button,
-.queue-tabs button,
-.queue-picker button {
+.queue-tabs button {
   border: 0;
   border-radius: 8px;
   cursor: pointer;
@@ -1135,34 +1128,18 @@ function round2(value: number) {
   gap: 14px;
 }
 
-.queue-picker.centered {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 180px));
-  justify-content: center;
-  gap: 12px;
-  min-height: 420px;
-  align-content: center;
-}
-
-.queue-picker button {
+.stats-pending {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   gap: 8px;
-  border: 1px solid #dce7e4;
-  color: #263238;
-  background: #ffffff;
-  box-shadow: 0 12px 28px rgba(32, 67, 73, 0.07);
-  padding: 20px;
-  text-align: left;
-}
-
-.queue-picker strong {
-  font-size: 18px;
-}
-
-.queue-picker span {
-  color: #728087;
-  font-size: 12px;
+  border: 1px dashed #cbdcd8;
+  border-radius: 10px;
+  color: #718087;
+  font-size: 13px;
+  font-weight: 700;
+  min-height: 120px;
+  background: rgba(255, 255, 255, 0.6);
 }
 
 .empty-filter {
@@ -1183,10 +1160,6 @@ function round2(value: number) {
 @media (max-width: 1100px) {
   .rank-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .queue-picker.centered {
-    grid-template-columns: repeat(2, minmax(0, 180px));
   }
 }
 </style>
