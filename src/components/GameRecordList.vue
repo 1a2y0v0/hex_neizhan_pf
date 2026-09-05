@@ -1,9 +1,6 @@
 <script setup lang="ts">
-import { computed, inject, ref } from "vue"
-import { ClipboardCopy } from "lucide-vue-next"
+import { computed, ref } from "vue"
 import { loadMatchDetail } from "../api"
-import { copyElementAsPng } from "../imageShare"
-import { notifyKey } from "../notifications"
 import { calculateOutputRating, outputRatingTitle } from "../scoring"
 import type {
   ChampionSummaryItem,
@@ -39,11 +36,8 @@ const emit = defineEmits<{
 const detailOpen = ref(false)
 const detailLoading = ref(false)
 const detailError = ref("")
-const detailImageCopying = ref(false)
 const selectedGame = ref<RecentGame | null>(null)
 const matchDetail = ref<MatchDetailResponse | null>(null)
-const matchDetailCaptureRef = ref<HTMLElement | null>(null)
-const notify = inject(notifyKey, () => 0)
 
 const spellMap = computed(() => indexAssets(props.gameAssets.summonerSpells))
 const itemMap = computed(() => indexAssets(props.gameAssets.items))
@@ -264,37 +258,6 @@ function detailKillPlayers(detail: MatchDetailResponse) {
   )
 }
 
-async function copyMatchAnalysisImage() {
-  const target = matchDetailCaptureRef.value
-  if (!target || !matchDetail.value || detailImageCopying.value) return
-
-  detailImageCopying.value = true
-  try {
-    await copyElementAsPng(target, {
-      backgroundColor: "#f6faf9",
-      pixelRatio: 2,
-      filter: (node) => {
-        return !(node instanceof HTMLElement && node.classList.contains("match-detail-actions"))
-      },
-    })
-
-    notify({
-      kind: "success",
-      title: "分享图片已复制",
-      message: "可以直接粘贴到聊天窗口",
-    })
-  } catch (error) {
-    notify({
-      kind: "error",
-      title: "分享图片生成失败",
-      message: errorMessage(error),
-      duration: 7000,
-    })
-  } finally {
-    detailImageCopying.value = false
-  }
-}
-
 function closeMatchDetail() {
   detailOpen.value = false
   detailLoading.value = false
@@ -312,6 +275,11 @@ async function openMatchDetail(game: RecentGame) {
       ownerPuuid: props.ownerPuuid,
       sgpServerId: props.sgpServerId,
     })
+    return
+  }
+
+  if (detailOpen.value && selectedGame.value?.gameId === game.gameId) {
+    closeMatchDetail()
     return
   }
 
@@ -486,7 +454,6 @@ function findByPuuid(players: MatchDetailPlayer[], puuid: string | undefined) {
 
       <div
         v-if="detailOpen && selectedGame?.gameId === game.gameId"
-        ref="matchDetailCaptureRef"
         class="detail-dropdown"
         @click.stop
       >
@@ -495,15 +462,6 @@ function findByPuuid(players: MatchDetailPlayer[], puuid: string | undefined) {
           <span v-if="selectedGame">
             {{ queueName(selectedGame) }} · {{ durationText(selectedGame.gameDuration) }} · 开始 {{ formatDate(selectedGame.gameCreation) }}
           </span>
-          <button
-            class="dd-share"
-            type="button"
-            :disabled="detailImageCopying || detailLoading || !matchDetail"
-            @click="copyMatchAnalysisImage"
-          >
-            <ClipboardCopy :size="14" />
-            {{ detailImageCopying ? "生成中" : "分享" }}
-          </button>
           <button class="dd-close" type="button" @click="closeMatchDetail">收起</button>
         </div>
 
