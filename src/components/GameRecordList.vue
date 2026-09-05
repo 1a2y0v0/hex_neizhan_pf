@@ -3,7 +3,6 @@ import { computed, inject, ref } from "vue"
 import { ClipboardCopy } from "lucide-vue-next"
 import { loadMatchDetail } from "../api"
 import { copyElementAsPng } from "../imageShare"
-import { matchTeamSummary } from "../matchTeamSummary"
 import { notifyKey } from "../notifications"
 import { calculateOutputRating, outputRatingTitle } from "../scoring"
 import type {
@@ -18,6 +17,8 @@ import type {
 import { fixed, formatDate, mitigationValue, teamMitigationValue } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
+import GameDetailTeams from "./GameDetailTeams.vue"
+import KillRelationsCard from "./KillRelationsCard.vue"
 
 const props = defineProps<{
   games: RecentGame[]
@@ -32,6 +33,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   openMatch: [payload: OpenMatchPayload]
+  openPlayer: [player: MatchDetailPlayer]
 }>()
 
 const detailOpen = ref(false)
@@ -74,6 +76,7 @@ function queueName(game: RecentGame) {
     1711: "斗魂竞技场",
     1712: "斗魂竞技场",
     1900: "无限火力",
+    3270: "自定义",
     2400: "海克斯大乱斗",
   }
 
@@ -104,18 +107,6 @@ function damageConversion(game: RecentGame) {
   const goldShare = ratio(game.goldEarned, game.teamGoldEarned)
   if (goldShare === 0) return "0.00"
   return fixed(ratio(game.damageToChampions, game.teamDamageToChampions) / goldShare)
-}
-
-function shareSuffix(part: number, total: number) {
-  return `(${shareText(part, total)})`
-}
-
-function augmentName(augmentId: number) {
-  return augmentAsset(augmentId)?.name || `强化 ${augmentId}`
-}
-
-function shortAugmentName(augmentId: number) {
-  return Array.from(augmentName(augmentId)).slice(0, 5).join("")
 }
 
 function augmentAsset(augmentId: number) {
@@ -152,13 +143,22 @@ function augmentRarityClass(augmentId: number) {
   }
 }
 
+function augmentName(augmentId: number) {
+  return augmentMap.value[augmentId]?.name || perkMap.value[augmentId]?.name || `强化${augmentId}`
+}
+
 function augmentTitle(augmentId: number) {
   const rarity = augmentRarityLabel(augmentId)
   return rarity ? `${augmentName(augmentId)} · ${rarity}` : augmentName(augmentId)
 }
 
+function isPerfectKda(game: RecentGame) {
+  return game.deaths === 0 && (game.kills > 0 || game.assists > 0)
+}
+
 function hasAccolade(game: RecentGame) {
   return (
+    isPerfectKda(game) ||
     game.teamDamageLeader ||
     game.gameDamageLeader ||
     game.teamMitigationLeader ||
@@ -170,6 +170,10 @@ function hasAccolade(game: RecentGame) {
 
 function accoladeTags(game: RecentGame) {
   const tags: Array<{ text: string; className: string }> = []
+
+  if (isPerfectKda(game)) {
+    tags.push({ text: "完美KDA", className: "perfect" })
+  }
 
   if (game.gameDamageLeader) {
     tags.push({ text: "伤害全场第一", className: "damage-global" })
@@ -227,15 +231,6 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
-function playerLabel(player: MatchDetailPlayer) {
-  if (player.gameName && player.tagLine) return `${player.gameName}#${player.tagLine}`
-  return player.summonerName || player.puuid || "未知玩家"
-}
-
-function teamSummary(team: MatchDetailResponse["teams"][number]) {
-  return matchTeamSummary(team)
-}
-
 function detailStatLeader(game: RecentGame, kind: "damage" | "gold" | "mitigation" | "healing" | "conversion") {
   switch (kind) {
     case "damage":
@@ -257,6 +252,16 @@ function outputRating(game: RecentGame) {
 
 function outputRatingHint(game: RecentGame) {
   return outputRatingTitle(game, ratingContext.value)
+}
+function detailKillPlayers(detail: MatchDetailResponse) {
+  return detail.teams.flatMap((team) =>
+    team.players.map((player) => ({
+      puuid: player.puuid,
+      gameName: player.gameName,
+      championId: player.championId,
+      killRelations: player.killRelations || [],
+    })),
+  )
 }
 
 async function copyMatchAnalysisImage() {
@@ -357,10 +362,8 @@ function findByPuuid(players: MatchDetailPlayer[], puuid: string | undefined) {
   </section>
 
   <div class="record-list" v-else>
-    <article
-      v-for="game in games"
-      :key="game.gameId"
-      class="record-row interactive"
+    <div v-for="game in games" :key="game.gameId" class="record-slot">
+      <article class="record-row interactive"
       :class="{ win: game.win, lose: !game.win }"
       :title="statTitle(game)"
       tabindex="0"
@@ -477,178 +480,59 @@ function findByPuuid(players: MatchDetailPlayer[], puuid: string | undefined) {
           {{ tag.text }}
         </span>
       </div>
+
+
     </article>
+
+      <div
+        v-if="detailOpen && selectedGame?.gameId === game.gameId"
+        ref="matchDetailCaptureRef"
+        class="detail-dropdown"
+        @click.stop
+      >
+        <div class="dd-toolbar">
+          <strong>对局详情</strong>
+          <span v-if="selectedGame">
+            {{ queueName(selectedGame) }} · {{ durationText(selectedGame.gameDuration) }} · 开始 {{ formatDate(selectedGame.gameCreation) }}
+          </span>
+          <button
+            class="dd-share"
+            type="button"
+            :disabled="detailImageCopying || detailLoading || !matchDetail"
+            @click="copyMatchAnalysisImage"
+          >
+            <ClipboardCopy :size="14" />
+            {{ detailImageCopying ? "生成中" : "分享" }}
+          </button>
+          <button class="dd-close" type="button" @click="closeMatchDetail">收起</button>
+        </div>
+
+        <div class="detail-dropdown-state" v-if="detailLoading">正在读取对局详情</div>
+        <div class="detail-dropdown-state error" v-else-if="detailError">{{ detailError }}</div>
+        <template v-else-if="matchDetail">
+          <GameDetailTeams
+            :teams="matchDetail.teams"
+            :champions="champions"
+            :item-map="itemMap"
+            :spell-map="spellMap"
+            :perk-map="perkMap"
+            :augment-map="augmentMap"
+            theme="light"
+            interactive
+            @open-player="emit('openPlayer', $event)"
+          />
+          <KillRelationsCard
+            :players="detailKillPlayers(matchDetail)"
+            :champions="champions"
+            theme="light"
+            title="击杀关系（谁杀了谁）"
+          />
+        </template>
+      </div>
+    </div>
   </div>
 
-  <Teleport to="body">
-    <div class="match-detail-overlay" v-if="detailOpen" @click.self="closeMatchDetail">
-      <section class="match-detail-modal" ref="matchDetailCaptureRef">
-        <header class="match-detail-toolbar">
-          <div class="match-detail-toolbar-main">
-            <button class="match-detail-tab active">总览</button>
-            <template v-if="selectedGame">
-              <span>模式 {{ queueName(selectedGame) }}</span>
-              <span>对局时间 {{ durationText(selectedGame.gameDuration) }}</span>
-              <span>开始时间 {{ formatDate(selectedGame.gameCreation) }}</span>
-            </template>
-          </div>
-          <div class="match-detail-actions">
-            <button
-              class="match-detail-analyze"
-              :disabled="detailImageCopying || detailLoading || !matchDetail"
-              @click="copyMatchAnalysisImage"
-            >
-              <ClipboardCopy :size="14" />
-              {{ detailImageCopying ? "生成中" : "分享" }}
-            </button>
-            <button class="match-detail-close" @click="closeMatchDetail">关闭</button>
-          </div>
-        </header>
-
-        <div class="match-detail-state" v-if="detailLoading">正在读取对局详情</div>
-        <div class="match-detail-state error" v-else-if="detailError">{{ detailError }}</div>
-
-        <div class="match-detail-body" v-else-if="matchDetail">
-          <section
-            v-for="team in matchDetail.teams"
-            :key="team.teamId"
-            class="match-detail-team"
-          >
-            <div class="match-detail-team-header" :class="{ win: team.win, lose: !team.win }">
-              <div class="match-detail-team-result">
-                <strong>{{ team.name }}</strong>
-                <span>{{ team.win ? "胜利" : "失败" }}</span>
-              </div>
-              <div class="match-detail-team-summary">
-                <span>队伍总经济 <b>{{ kNumber(teamSummary(team).goldEarned) }}</b></span>
-                <span>队伍总伤害 <b>{{ kNumber(teamSummary(team).damageToChampions) }}</b></span>
-                <span>队伍总推塔数 <b>{{ teamSummary(team).towerKills }}</b></span>
-              </div>
-              <strong class="match-detail-team-kda">
-                {{ teamSummary(team).kills }}/{{ teamSummary(team).deaths }}/{{ teamSummary(team).assists }}
-              </strong>
-              <span>伤害</span>
-              <span>经济</span>
-              <span>承伤</span>
-              <span>治疗/护盾</span>
-              <span>伤转</span>
-              <span>评分</span>
-            </div>
-
-            <div class="record-list detail-record-list">
-              <article
-                v-for="player in team.players"
-                :key="`${player.teamId}:${player.participantId}`"
-                class="record-row detail-row"
-                :class="{ win: player.win, lose: !player.win }"
-                :title="playerLabel(player)"
-              >
-                <div class="champion-cell">
-                  <ChampionAvatar :champion-id="player.championId" :champions="champions" :size="42" />
-                  <span class="queue-name">{{ playerLabel(player) }}</span>
-                </div>
-
-                <div class="spell-column">
-                  <AssetIcon
-                    v-if="player.spell1Id"
-                    :path="spellMap[player.spell1Id]?.iconPath"
-                    :label="spellMap[player.spell1Id]?.name"
-                    :fallback="String(player.spell1Id)"
-                    :size="18"
-                  />
-                  <AssetIcon
-                    v-if="player.spell2Id"
-                    :path="spellMap[player.spell2Id]?.iconPath"
-                    :label="spellMap[player.spell2Id]?.name"
-                    :fallback="String(player.spell2Id)"
-                    :size="18"
-                  />
-                </div>
-
-                <div class="build-cell">
-                  <div class="item-grid">
-                    <AssetIcon
-                      v-for="itemId in player.itemIds"
-                      :key="itemId"
-                      :path="itemMap[itemId]?.iconPath"
-                      :label="itemMap[itemId]?.name"
-                      :fallback="String(itemId)"
-                      :size="33"
-                    />
-                  </div>
-                </div>
-
-                <div class="rune-grid text-grid" v-if="player.augmentIds.length">
-                  <span
-                    v-for="augmentId in player.augmentIds.slice(0, 4)"
-                    :key="augmentId"
-                    :class="['augment-tag', augmentRarityClass(augmentId)]"
-                    :title="augmentTitle(augmentId)"
-                  >
-                    {{ shortAugmentName(augmentId) }}
-                  </span>
-                </div>
-                <div class="rune-grid" v-else>
-                  <AssetIcon
-                    v-for="perkId in player.perkIds.slice(0, 4)"
-                    :key="perkId"
-                    :path="perkMap[perkId]?.iconPath"
-                    :label="perkMap[perkId]?.name"
-                    :fallback="String(perkId)"
-                    :size="20"
-                  />
-                </div>
-
-                <div class="kda-cell">
-                  <strong>{{ player.kills }}/{{ player.deaths }}/{{ player.assists }}</strong>
-                </div>
-
-                <div class="stat-cell">
-                  <strong :class="{ leader: detailStatLeader(player, 'damage') }">
-                    {{ kNumber(player.damageToChampions) }}<em>{{ shareSuffix(player.damageToChampions, player.teamDamageToChampions) }}</em>
-                  </strong>
-                </div>
-
-                <div class="stat-cell">
-                  <strong :class="{ leader: detailStatLeader(player, 'gold') }">
-                    {{ kNumber(player.goldEarned) }}<em>{{ shareSuffix(player.goldEarned, player.teamGoldEarned) }}</em>
-                  </strong>
-                </div>
-
-                <div class="stat-cell">
-                  <strong :class="{ leader: detailStatLeader(player, 'mitigation') }">
-                    {{ kNumber(mitigationValue(player)) }}<em>{{ shareSuffix(mitigationValue(player), teamMitigationValue(player)) }}</em>
-                  </strong>
-                </div>
-
-                <div class="stat-cell">
-                  <strong :class="{ leader: detailStatLeader(player, 'healing') }">
-                    {{ kNumber(protectionValue(player)) }}<em>{{ shareSuffix(protectionValue(player), teamProtectionValue(player)) }}</em>
-                  </strong>
-                </div>
-
-                <div class="stat-cell">
-                  <strong :class="{ leader: detailStatLeader(player, 'conversion') }">
-                    {{ damageConversion(player) }}
-                  </strong>
-                </div>
-
-                <div
-                  :class="['score-cell detail-score-cell', `score-${outputRating(player).level}`]"
-                  :title="outputRatingHint(player)"
-                >
-                  <strong>{{ outputRating(player).score }}分</strong>
-                  <span>{{ outputRating(player).role.label }} · {{ outputRating(player).label }}</span>
-                </div>
-              </article>
-            </div>
-          </section>
-        </div>
-      </section>
-    </div>
-  </Teleport>
 </template>
-
 <style scoped>
 .empty-records {
   display: grid;
@@ -673,6 +557,70 @@ function findByPuuid(players: MatchDetailPlayer[], puuid: string | undefined) {
   padding-bottom: 2px;
 }
 
+.detail-dropdown {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #d0e0dc;
+  border-radius: 8px;
+  background: #f8fbfa;
+  margin-top: 2px;
+}
+.dd-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.dd-toolbar strong {
+  color: #263238;
+  font-size: 13px;
+}
+.dd-toolbar span {
+  color: #718087;
+  font-size: 12px;
+}
+.dd-toolbar button {
+  margin-left: auto;
+  padding: 5px 10px;
+  border: 1px solid #c8d8d4;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  background: #fff;
+  color: #315f58;
+}
+.dd-toolbar button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.dd-toolbar button.dd-close {
+  background: #edf5f3;
+}
+.detail-dropdown-state {
+  padding: 14px 0;
+  color: #718087;
+  font-size: 13px;
+}
+.detail-dropdown-state.error {
+  color: #c94040;
+}
+.record-slot {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  flex-direction: column;
+  gap: 8px;
+}
+.detail-dropdown {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
 .record-row {
   display: grid;
   grid-template-columns: 58px 64px 26px 112px 176px 86px repeat(5, 68px) 138px;
@@ -820,6 +768,10 @@ function findByPuuid(players: MatchDetailPlayer[], puuid: string | undefined) {
   background: #c93d4d;
 }
 
+.accolade-tag.perfect {
+  color: #0b5138;
+  background: linear-gradient(135deg, #b8f0d2, #6fe3aa);
+}
 .accolade-tag.gold {
   color: #422900;
   background: #f1b739;

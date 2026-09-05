@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  当前版本：<strong>v1.0.2</strong> ·
+  当前版本：<strong>v1.0.3</strong> ·
   <a href="https://github.com/cridyy/lol-stats/releases">GitHub Releases</a> ·
   <a href="https://gitee.com/Crescenre/lol-stats/releases">Gitee Releases</a> ·
   <a href="https://crescendum.lanzout.com/b00rp145sh">蓝奏云下载</a>（密码：<code>djvm</code>）

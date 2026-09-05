@@ -504,6 +504,7 @@ pub async fn load_self_stats(
         normalize_depth(depth),
         force_refresh.unwrap_or(false),
         persist_cache.unwrap_or(true),
+        true,
         |_, _| true,
     )
     .await
@@ -533,6 +534,7 @@ pub async fn load_self_stats_with_progress(
         depth,
         force_refresh.unwrap_or(false),
         persist_cache.unwrap_or(true),
+        true,
         move |loaded, total| {
             emit_stats_progress(&progress_app, &progress_request_id, loaded, total);
             !is_cancelled_request(&progress_request_id)
@@ -757,6 +759,7 @@ pub async fn search_player(
         normalize_depth(depth),
         force_refresh.unwrap_or(false),
         persist_cache.unwrap_or(true),
+        false,
         |_, _| true,
     )
     .await
@@ -790,6 +793,7 @@ pub async fn search_player_with_progress(
         depth,
         force_refresh.unwrap_or(false),
         persist_cache.unwrap_or(true),
+        false,
         move |loaded, total| {
             emit_stats_progress(&progress_app, &progress_request_id, loaded, total);
             !is_cancelled_request(&progress_request_id)

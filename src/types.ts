@@ -173,10 +173,16 @@ export interface RecentGame {
   cs: number
   goldEarned: number
   damageToChampions: number
+  physicalDamageDealtToChampions?: number
+  magicDamageDealtToChampions?: number
+  trueDamageDealtToChampions?: number
   teamDamageToChampions: number
   gameDamageToChampions?: number
   damageSelfMitigated: number
   totalDamageTaken: number
+  physicalDamageTaken?: number
+  magicDamageTaken?: number
+  trueDamageTaken?: number
   teamDamageSelfMitigated: number
   teamTotalDamageTaken: number
   totalHeal: number

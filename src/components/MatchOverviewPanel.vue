@@ -5,8 +5,6 @@ import { searchPlayer } from "../api"
 import { copyElementAsPng } from "../imageShare"
 import { notifyKey } from "../notifications"
 import { buildPlayerProfile, profileTierClass, profileTierLabel, type PlayerProfile } from "../playerProfile"
-import { calculateOutputRating, outputRatingTitle } from "../scoring"
-import { matchTeamSummary } from "../matchTeamSummary"
 import type {
   ChampionSummaryItem,
   GameAssetBundle,
@@ -15,9 +13,9 @@ import type {
   MatchDetailResponse,
   RecentGame,
 } from "../types"
-import { fixed, formatDate, mitigationValue, teamMitigationValue } from "../utils"
-import AssetIcon from "./AssetIcon.vue"
-import ChampionAvatar from "./ChampionAvatar.vue"
+import { formatDate } from "../utils"
+import GameDetailTeams from "./GameDetailTeams.vue"
+import KillRelationsCard from "./KillRelationsCard.vue"
 
 const PLAYER_ABILITY_SCAN_DEPTH = 150
 const PLAYER_ABILITY_DISPLAY_DEPTH = 100
@@ -97,92 +95,20 @@ function queueName(game: RecentGame | MatchDetailResponse) {
   return map[game.queueId] || game.gameMode || `队列 ${game.queueId}`
 }
 
-function ratio(part: number, total: number) {
-  return total > 0 ? part / total : 0
-}
-
-function shareText(part: number, total: number) {
-  return `${Math.round(ratio(part, total) * 100)}%`
-}
-
-function shareSuffix(part: number, total: number) {
-  return `(${shareText(part, total)})`
-}
-
-function kNumber(value: number) {
-  return `${(value / 1000).toFixed(1)}k`
-}
-
-function protectionValue(game: RecentGame) {
-  return (game.totalHeal || 0) + (game.totalDamageShieldedOnTeammates || 0)
-}
-
-function teamProtectionValue(game: RecentGame) {
-  return (game.teamTotalHeal || 0) + (game.teamTotalDamageShieldedOnTeammates || 0)
-}
-
-function damageConversion(game: RecentGame) {
-  const goldShare = ratio(game.goldEarned, game.teamGoldEarned)
-  if (goldShare === 0) return "0.00"
-  return fixed(ratio(game.damageToChampions, game.teamDamageToChampions) / goldShare)
-}
-
 function playerLabel(player: MatchDetailPlayer) {
   if (player.gameName && player.tagLine) return `${player.gameName}#${player.tagLine}`
   return player.summonerName || player.puuid || "未知玩家"
 }
 
-function teamSummary(team: MatchDetailResponse["teams"][number]) {
-  return matchTeamSummary(team)
-}
+/** 本局所有玩家（击杀关系卡复用组件用） */
+const detailAllPlayers = computed(() => {
+  if (!props.matchDetail) return []
+  return props.matchDetail.teams.flatMap((team) => team.players)
+})
 
-function augmentName(augmentId: number) {
-  return augmentMap.value[augmentId]?.name || perkMap.value[augmentId]?.name || `强化 ${augmentId}`
-}
-
-function shortAugmentName(augmentId: number) {
-  return Array.from(augmentName(augmentId)).slice(0, 5).join("")
-}
-
-function augmentRarityClass(augmentId: number) {
-  switch (augmentMap.value[augmentId]?.rarity || perkMap.value[augmentId]?.rarity) {
-    case "kPrismatic":
-      return "augment-prismatic"
-    case "kGold":
-      return "augment-gold"
-    case "kSilver":
-      return "augment-silver"
-    case "kBronze":
-      return "augment-bronze"
-    default:
-      return ""
-  }
-}
-
-function detailStatLeader(
-  game: RecentGame,
-  kind: "damage" | "gold" | "mitigation" | "healing" | "conversion",
-) {
-  switch (kind) {
-    case "damage":
-      return game.gameDamageLeader || game.teamDamageLeader
-    case "gold":
-      return game.teamGoldLeader
-    case "mitigation":
-      return game.teamMitigationLeader
-    case "healing":
-      return game.teamHealingLeader
-    case "conversion":
-      return game.teamDamageConversionLeader
-  }
-}
-
-function outputRating(game: RecentGame) {
-  return calculateOutputRating(game, ratingContext.value)
-}
-
-function outputRatingHint(game: RecentGame) {
-  return outputRatingTitle(game, ratingContext.value)
+/** 行 title：普通模式显示玩家名，查看玩家能力模式显示历史能力说明 */
+function playerTitleFor(player: MatchDetailPlayer) {
+  return showPlayerAbility.value ? playerAbilityTitle(player) : playerLabel(player)
 }
 
 function playerAbilityLabel(player: MatchDetailPlayer) {
@@ -404,144 +330,40 @@ async function copyImage() {
     <div class="overview-state error" v-else-if="error">{{ error }}</div>
 
     <div class="overview-body" v-else-if="matchDetail">
-      <section v-for="team in matchDetail.teams" :key="team.teamId" class="team-block">
-        <div class="team-header" :class="{ win: team.win, lose: !team.win }">
-          <div class="team-result">
-            <strong>{{ team.name }}</strong>
-            <span>{{ team.win ? "胜利" : "失败" }}</span>
-          </div>
-          <div class="team-summary">
-            <span>队伍总经济 <b>{{ kNumber(teamSummary(team).goldEarned) }}</b></span>
-            <span>队伍总伤害 <b>{{ kNumber(teamSummary(team).damageToChampions) }}</b></span>
-            <span>队伍总推塔数 <b>{{ teamSummary(team).towerKills }}</b></span>
-          </div>
-          <strong class="team-kda-summary">
-            {{ teamSummary(team).kills }}/{{ teamSummary(team).deaths }}/{{ teamSummary(team).assists }}
-          </strong>
-          <span>伤害</span>
-          <span>经济</span>
-          <span>承伤</span>
-          <span>治疗/护盾</span>
-          <span>伤转</span>
-          <span>评分</span>
-        </div>
-
-        <div class="detail-list">
-          <article
-            v-for="player in team.players"
-            :key="`${player.teamId}:${player.participantId}`"
-            class="detail-row"
-            :class="{ win: player.win, lose: !player.win }"
-            :title="showPlayerAbility ? playerAbilityTitle(player) : playerLabel(player)"
-            tabindex="0"
-            @click="emit('openPlayer', player)"
-            @keydown.enter="emit('openPlayer', player)"
-            @keydown.space.prevent="emit('openPlayer', player)"
+      <!-- 每队 header + 十人明细行：与内战评分展开详情共用同一组件，此处用浅色主题 -->
+      <GameDetailTeams
+        :teams="matchDetail.teams"
+        :champions="champions"
+        :item-map="itemMap"
+        :spell-map="spellMap"
+        :perk-map="perkMap"
+        :augment-map="augmentMap"
+        theme="light"
+        :interactive="true"
+        :title-for="playerTitleFor"
+        @open-player="emit('openPlayer', $event)"
+      >
+        <template #name="{ player }">
+          <span
+            v-if="!showPlayerAbility"
+            class="player-name-cell"
+            :title="playerLabel(player)"
           >
-            <div class="champion-cell">
-              <ChampionAvatar :champion-id="player.championId" :champions="champions" :size="42" />
-              <span
-                v-if="!showPlayerAbility"
-              >
-                {{ playerLabel(player) }}
-              </span>
-              <span v-else :class="['player-ability-cell', playerAbilityTone(player)]">
-                {{ playerAbilityLabel(player) }}
-              </span>
-            </div>
+            {{ playerLabel(player) }}
+          </span>
+          <span v-else :class="['player-ability-cell', playerAbilityTone(player)]">
+            {{ playerAbilityLabel(player) }}
+          </span>
+        </template>
+      </GameDetailTeams>
 
-            <div class="spell-column">
-              <AssetIcon
-                v-if="player.spell1Id"
-                :path="spellMap[player.spell1Id]?.iconPath"
-                :label="spellMap[player.spell1Id]?.name"
-                :fallback="String(player.spell1Id)"
-                :size="18"
-              />
-              <AssetIcon
-                v-if="player.spell2Id"
-                :path="spellMap[player.spell2Id]?.iconPath"
-                :label="spellMap[player.spell2Id]?.name"
-                :fallback="String(player.spell2Id)"
-                :size="18"
-              />
-            </div>
-
-            <div class="item-grid">
-              <AssetIcon
-                v-for="itemId in player.itemIds"
-                :key="itemId"
-                :path="itemMap[itemId]?.iconPath"
-                :label="itemMap[itemId]?.name"
-                :fallback="String(itemId)"
-                :size="33"
-              />
-            </div>
-
-            <div class="rune-grid text-grid" v-if="player.augmentIds.length">
-              <span
-                v-for="augmentId in player.augmentIds.slice(0, 4)"
-                :key="augmentId"
-                :class="['augment-tag', augmentRarityClass(augmentId)]"
-              >
-                {{ shortAugmentName(augmentId) }}
-              </span>
-            </div>
-            <div class="rune-grid" v-else>
-              <AssetIcon
-                v-for="perkId in player.perkIds.slice(0, 4)"
-                :key="perkId"
-                :path="perkMap[perkId]?.iconPath"
-                :label="perkMap[perkId]?.name"
-                :fallback="String(perkId)"
-                :size="20"
-              />
-            </div>
-
-            <div class="kda-cell">
-              <strong>{{ player.kills }}/{{ player.deaths }}/{{ player.assists }}</strong>
-            </div>
-
-            <div class="stat-cell">
-              <strong :class="{ leader: detailStatLeader(player, 'damage') }">
-                {{ kNumber(player.damageToChampions) }}<em>{{ shareSuffix(player.damageToChampions, player.teamDamageToChampions) }}</em>
-              </strong>
-            </div>
-
-            <div class="stat-cell">
-              <strong :class="{ leader: detailStatLeader(player, 'gold') }">
-                {{ kNumber(player.goldEarned) }}<em>{{ shareSuffix(player.goldEarned, player.teamGoldEarned) }}</em>
-              </strong>
-            </div>
-
-            <div class="stat-cell">
-              <strong :class="{ leader: detailStatLeader(player, 'mitigation') }">
-                {{ kNumber(mitigationValue(player)) }}<em>{{ shareSuffix(mitigationValue(player), teamMitigationValue(player)) }}</em>
-              </strong>
-            </div>
-
-            <div class="stat-cell">
-              <strong :class="{ leader: detailStatLeader(player, 'healing') }">
-                {{ kNumber(protectionValue(player)) }}<em>{{ shareSuffix(protectionValue(player), teamProtectionValue(player)) }}</em>
-              </strong>
-            </div>
-
-            <div class="stat-cell">
-              <strong :class="{ leader: detailStatLeader(player, 'conversion') }">
-                {{ damageConversion(player) }}
-              </strong>
-            </div>
-
-            <div
-              :class="['score-cell', `score-${outputRating(player).level}`]"
-            :title="outputRatingHint(player)"
-          >
-              <strong>{{ outputRating(player).score }}分</strong>
-              <span>{{ outputRating(player).role.label }} · {{ outputRating(player).label }}</span>
-            </div>
-          </article>
-        </div>
-      </section>
+      <KillRelationsCard
+        v-if="detailAllPlayers.length"
+        :players="detailAllPlayers"
+        :champions="champions"
+        theme="light"
+        title="击杀关系（谁杀了谁）"
+      />
     </div>
   </section>
 </template>
@@ -628,140 +450,14 @@ async function copyImage() {
   color: #a94745;
 }
 
-.overview-body,
-.detail-list {
+.overview-body {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.team-block {
-  overflow-x: auto;
-  border: 1px solid #dce7e4;
-  border-radius: 8px;
-  background: #ffffff;
-  padding: 8px;
-}
-
-.team-header,
-.detail-row {
-  display: grid;
-  grid-template-columns: 160px 22px 252px 160px 59px repeat(5, 62px) 128px;
-  min-width: 1131px;
-  align-items: center;
-  gap: 4px;
-}
-
-.team-header {
-  border-radius: 6px;
-  margin-bottom: 6px;
-  padding: 6px 7px;
-}
-
-.team-header.win {
-  color: #1f5f9f;
-  background: #e7f2ff;
-}
-
-.team-header.lose {
-  color: #a23d3d;
-  background: #ffe9e9;
-}
-
-.team-result {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-}
-
-.team-result strong {
-  font-size: 15.6px;
-  line-height: 1;
-}
-
-.team-result span,
-.team-header > span {
-  font-size: 12px;
-  font-weight: 900;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.team-summary {
-  display: grid;
-  min-width: 0;
-  grid-column: span 3;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  align-items: center;
-  gap: 4px;
-}
-
-.team-summary span {
-  overflow: hidden;
-  font-size: 11px;
-  font-weight: 800;
-  line-height: 1;
-  text-align: center;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.team-summary b,
-.team-kda-summary {
-  font-size: 12px;
-  font-weight: 950;
-  white-space: nowrap;
-}
-
-.team-kda-summary {
-  text-align: center;
-}
-
-.team-header > span {
-  text-align: center;
-}
-
-.detail-list {
-  gap: 4px;
-}
-
-.detail-row {
-  height: 48px;
-  min-height: 48px;
-  max-height: 48px;
-  overflow: hidden;
-  border: 1px solid #dce7e4;
-  border-left-width: 5px;
-  border-radius: 8px;
-  cursor: pointer;
-  padding: 2px 7px;
-}
-
-.detail-row:hover {
-  filter: saturate(1.04) brightness(0.99);
-}
-
-.detail-row.win {
-  border-color: #c9ddf8;
-  border-left-color: #2f78d6;
-  background: #eef6ff;
-}
-
-.detail-row.lose {
-  border-color: #f1cdcd;
-  border-left-color: #ca4b4b;
-  background: #fff1f1;
-}
-
-.champion-cell {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-}
-
-.champion-cell span {
+/* 名字区由 GameDetailTeams 的 #name 插槽渲染（父作用域样式直接作用于插槽内容） */
+.player-name-cell {
   min-width: 0;
   overflow: hidden;
   color: #53666c;
@@ -770,7 +466,7 @@ async function copyImage() {
   white-space: nowrap;
 }
 
-.champion-cell .player-ability-cell {
+.player-ability-cell {
   display: inline-flex;
   max-width: 106px;
   align-items: center;
@@ -781,202 +477,6 @@ async function copyImage() {
   font-weight: 950;
   line-height: 1;
   padding: 6px 7px;
-}
-
-.spell-column {
-  display: flex;
-  height: 42px;
-  flex-direction: column;
-  justify-content: center;
-  gap: 2px;
-}
-
-.item-grid {
-  display: flex;
-  min-width: 0;
-  flex-wrap: nowrap;
-  gap: 3px;
-}
-
-.rune-grid {
-  display: grid;
-  grid-template-columns: repeat(2, max-content);
-  grid-auto-rows: 20px;
-  align-content: center;
-  justify-content: center;
-  gap: 2px 4px;
-  overflow: hidden;
-}
-
-.text-grid .augment-tag {
-  display: inline-flex;
-  box-sizing: border-box;
-  width: calc(5em + 8px);
-  height: 19px;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  border: 1px solid rgba(31, 55, 59, 0.08);
-  border-radius: 5px;
-  color: #34534d;
-  background: rgba(255, 255, 255, 0.62);
-  font-size: 13.5px;
-  font-weight: 700;
-  line-height: 1;
-  padding: 0 3px;
-  text-align: center;
-  white-space: nowrap;
-}
-
-.text-grid .augment-prismatic {
-  border-color: rgba(170, 72, 215, 0.42);
-  color: #6d2c91;
-  background: linear-gradient(135deg, rgba(249, 226, 255, 0.9), rgba(218, 183, 255, 0.9));
-}
-
-.text-grid .augment-gold {
-  border-color: rgba(199, 144, 36, 0.48);
-  color: #7b4d02;
-  background: rgba(255, 230, 161, 0.92);
-}
-
-.text-grid .augment-silver {
-  border-color: rgba(134, 151, 166, 0.48);
-  color: #49606f;
-  background: rgba(229, 237, 243, 0.92);
-}
-
-.text-grid .augment-bronze {
-  border-color: rgba(167, 105, 60, 0.46);
-  color: #7a4323;
-  background: rgba(236, 201, 174, 0.92);
-}
-
-.kda-cell,
-.stat-cell,
-.score-cell {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: center;
-}
-
-.kda-cell strong {
-  color: #20333a;
-  font-size: 13px;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.stat-cell strong {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1px;
-  color: #20333a;
-  font-size: 16.5px;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.stat-cell strong.leader,
-.stat-cell strong.leader em {
-  color: #d22f2f;
-  font-weight: 900;
-}
-
-.stat-cell em {
-  color: #8a989c;
-  font-size: 13.5px;
-  font-style: normal;
-  font-weight: 700;
-}
-
-.score-cell {
-  height: 42px;
-  flex-direction: column;
-  gap: 2px;
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.58);
-  padding: 3px;
-  text-align: center;
-}
-
-.score-cell strong {
-  position: relative;
-  z-index: 1;
-  color: inherit;
-  font-size: 18px;
-  font-weight: 950;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.score-cell span {
-  position: relative;
-  z-index: 1;
-  max-width: 100%;
-  color: inherit;
-  font-size: 10.5px;
-  font-weight: 900;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.score-excellent {
-  position: relative;
-  overflow: hidden;
-  color: #5d3300;
-  border: 1px solid rgba(245, 185, 52, 0.72);
-  background:
-    linear-gradient(135deg, rgba(255, 244, 184, 0.96), rgba(255, 195, 64, 0.9) 45%, rgba(255, 236, 150, 0.96)),
-    #ffd36a;
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.36),
-    0 0 16px rgba(255, 191, 58, 0.34);
-}
-
-.score-excellent::after {
-  position: absolute;
-  inset: -60% auto -60% -80%;
-  width: 58%;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    rgba(255, 255, 255, 0.18),
-    rgba(255, 255, 255, 0.74),
-    rgba(255, 255, 255, 0.18),
-    transparent
-  );
-  content: "";
-  transform: rotate(18deg);
-  animation: score-shine 2.8s ease-in-out infinite;
-}
-
-@keyframes score-shine {
-  0% {
-    left: -90%;
-  }
-
-  52%,
-  100% {
-    left: 132%;
-  }
-}
-
-.score-good {
-  color: #145b3e;
-  background: rgba(204, 239, 218, 0.88);
-}
-
-.score-average {
-  color: #174d83;
-  background: rgba(205, 229, 255, 0.92);
-}
-
-.score-poor {
-  color: #8f3434;
-  background: rgba(248, 214, 213, 0.92);
 }
 
 .profile-tier-apex {

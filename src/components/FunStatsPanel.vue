@@ -3,7 +3,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { RefreshCw, Search, X } from "lucide-vue-next"
 import {
   FUN_EQUIPMENT_ROLE_OPTIONS,
+  calculateAugmentComboStats,
+  calculateAugmentRanking,
+  type FunAugmentComboEntry,
   type FunAugmentFilter,
+  type FunAugmentRankEntry,
   type FunEquipmentFilter,
   type FunEquipmentRole,
   type FunGoldRange,
@@ -12,6 +16,7 @@ import {
   normalizeAugmentRarity,
 } from "../funStats"
 import type { ChampionSummaryItem, GameAssetEntry, RecentGame } from "../types"
+import type { RatingContext } from "../roleClassifier"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
 import GoldRangeSlider from "./GoldRangeSlider.vue"
@@ -53,6 +58,22 @@ const pickerSearchRef = ref<HTMLInputElement | null>(null)
 
 const itemMap = computed(() => new Map(props.items.map((item) => [item.id, item])))
 const augmentMap = computed(() => new Map(props.augments.map((augment) => [augment.id, augment])))
+
+const itemsById = computed<Record<number, GameAssetEntry>>(() => {
+  const record: Record<number, GameAssetEntry> = {}
+  for (const item of props.items) record[item.id] = item
+  return record
+})
+const augmentsById = computed<Record<number, GameAssetEntry>>(() => {
+  const record: Record<number, GameAssetEntry> = {}
+  for (const augment of props.augments) record[augment.id] = augment
+  return record
+})
+const ratingContext = computed<RatingContext>(() => ({
+  items: itemsById.value,
+  augments: augmentsById.value,
+  champions: props.champions,
+}))
 const itemOptions = computed(() => {
   // 客户端总装备表混有其他地图、历史和测试装备。统计选择器只保留当前模式
   // 样本中真实出现在结算装备栏里的条目，避免依赖不准确的全局商店标记。
@@ -110,6 +131,84 @@ const selectedAugment = computed(() => augmentMap.value.get(selectedAugmentId.va
 const selectedAugmentRarity = computed(() =>
   normalizeAugmentRarity(selectedAugment.value?.rarity),
 )
+
+const augmentScopeLabel = computed(() =>
+  selectedAugmentChampion.value ? `${selectedAugmentChampion.value.name} × 海克斯推荐` : "全英雄 × 海克斯推荐",
+)
+
+const rankMinGames = ref(2)
+const rankMinGamesText = ref("2")
+const comboMinGames = ref(2)
+const comboMinGamesText = ref("2")
+const rankSort = ref<"appearances" | "pickRate" | "winRate">("winRate")
+const rankSortDir = ref<"asc" | "desc">("desc")
+const comboSort = ref<"appearances" | "winRate">("winRate")
+const comboSortDir = ref<"asc" | "desc">("desc")
+const AUGMENT_LIST_LIMIT = 50
+
+function parseMinGamesValue(text: string) {
+  const value = Number.parseInt(text, 10)
+  return Number.isFinite(value) && value > 0 ? value : 0
+}
+function applyRankMinGames() { rankMinGames.value = parseMinGamesValue(rankMinGamesText.value) }
+function applyComboMinGames() { comboMinGames.value = parseMinGamesValue(comboMinGamesText.value) }
+function augmentRarityLabelOf(rarity: FunAugmentRankEntry["rarity"] | FunAugmentComboEntry["rarityA"] | undefined) {
+  switch (rarity) {
+    case "prismatic": return "棱彩"
+    case "gold": return "黄金"
+    case "silver": return "白银"
+    case "bronze": return "青铜"
+    default: return ""
+  }
+}
+
+const currentAugmentContext = computed<FunAugmentFilter>(() => ({
+  augmentId: selectedAugmentId.value || null,
+  championId: selectedAugmentChampionId.value || null,
+  role: selectedAugmentRole.value || null,
+}))
+const augmentRankingRows = computed<FunAugmentRankEntry[]>(() =>
+  calculateAugmentRanking(props.games, ratingContext.value, currentAugmentContext.value, rankMinGames.value),
+)
+const augmentComboRows = computed<FunAugmentComboEntry[]>(() =>
+  calculateAugmentComboStats(props.games, ratingContext.value, currentAugmentContext.value, comboMinGames.value),
+)
+const sortedAugmentRanking = computed(() => {
+  const rows = [...augmentRankingRows.value]
+  const dir = rankSortDir.value === "asc" ? 1 : -1
+  rows.sort((a, b) => {
+    const av = rankSort.value === "appearances" ? a.appearances : rankSort.value === "pickRate" ? a.pickRate : a.winRate
+    const bv = rankSort.value === "appearances" ? b.appearances : rankSort.value === "pickRate" ? b.pickRate : b.winRate
+    return (av - bv) * dir || b.appearances - a.appearances
+  })
+  return rows.slice(0, AUGMENT_LIST_LIMIT)
+})
+const sortedAugmentCombo = computed(() => {
+  const rows = [...augmentComboRows.value]
+  const dir = comboSortDir.value === "asc" ? 1 : -1
+  rows.sort((a, b) => {
+    const av = comboSort.value === "appearances" ? a.appearances : a.winRate
+    const bv = comboSort.value === "appearances" ? b.appearances : b.winRate
+    return (av - bv) * dir || b.appearances - a.appearances
+  })
+  return rows.slice(0, AUGMENT_LIST_LIMIT)
+})
+function toggleRankSort(col: "appearances" | "pickRate" | "winRate") {
+  if (rankSort.value === col) rankSortDir.value = rankSortDir.value === "asc" ? "desc" : "asc"
+  else { rankSort.value = col; rankSortDir.value = "desc" }
+}
+function rankSortIcon(col: "appearances" | "pickRate" | "winRate") {
+  if (rankSort.value !== col) return ""
+  return rankSortDir.value === "asc" ? " ▲" : " ▼"
+}
+function toggleComboSort(col: "appearances" | "winRate") {
+  if (comboSort.value === col) comboSortDir.value = comboSortDir.value === "asc" ? "desc" : "asc"
+  else { comboSort.value = col; comboSortDir.value = "desc" }
+}
+function comboSortIcon(col: "appearances" | "winRate") {
+  if (comboSort.value !== col) return ""
+  return comboSortDir.value === "asc" ? " ▲" : " ▼"
+}
 
 watch(
   () => props.result.equipment.filter,
@@ -687,6 +786,100 @@ function augmentRarityLabel() {
               </div>
             </dl>
           </div>
+
+          <!-- 英雄 x 海克斯推荐榜 -->
+          <div class="aug-sub-panel">
+            <div class="aug-sub-head">
+              <div class="aug-sub-title">
+                <strong>{{ augmentScopeLabel }}</strong>
+                <span v-if="!selectedAugmentChampion" class="aug-scope-hint">未选英雄，为全英雄统计</span>
+              </div>
+              <label class="aug-min-label">样本≥
+                <input
+                  v-model="rankMinGamesText"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="不限"
+                  @change="applyRankMinGames"
+                  @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+                />
+              </label>
+            </div>
+            <template v-if="augmentRankingRows.length">
+              <div class="aug-list-table aug-rank-grid">
+                <div class="aug-tr aug-tr-head">
+                  <span class="aug-main-col">海克斯</span>
+                  <button class="aug-num-col aug-sort" type="button" @click="toggleRankSort('appearances')">场次{{ rankSortIcon('appearances') }}</button>
+                  <button class="aug-num-col aug-sort" type="button" @click="toggleRankSort('pickRate')">登场率{{ rankSortIcon('pickRate') }}</button>
+                  <button class="aug-num-col aug-sort" type="button" @click="toggleRankSort('winRate')">胜率{{ rankSortIcon('winRate') }}</button>
+                </div>
+                <div
+                  v-for="row in sortedAugmentRanking"
+                  :key="row.augmentId"
+                  class="aug-tr"
+                  :title="`${augmentMap.get(row.augmentId)?.name || row.augmentId} · 同色有效机会 ${row.opportunities} 次`"
+                >
+                  <span class="aug-main-col aug-name">
+                    <AssetIcon :path="augmentMap.get(row.augmentId)?.iconPath" :label="augmentMap.get(row.augmentId)?.name" :fallback="String(row.augmentId)" :size="26" />
+                    <span class="aug-name-text">{{ augmentMap.get(row.augmentId)?.name || row.augmentId }}<em :class="`aug-r-${row.rarity}`">{{ augmentRarityLabelOf(row.rarity) }}</em></span>
+                  </span>
+                  <span class="aug-num-col">{{ row.appearances }}</span>
+                  <span class="aug-num-col">{{ row.opportunities > 0 ? percent(row.pickRate) : "-" }}</span>
+                  <span class="aug-num-col aug-wr" :class="row.winRate >= 0.6 ? 'wr-high' : row.winRate <= 0.4 ? 'wr-low' : ''">{{ percent(row.winRate) }}</span>
+                </div>
+              </div>
+              <div v-if="augmentRankingRows.length > AUGMENT_LIST_LIMIT" class="aug-list-note">仅显示前 {{ AUGMENT_LIST_LIMIT }} / {{ augmentRankingRows.length }} 条，可调高「样本≥」缩小范围</div>
+            </template>
+            <div v-else class="aug-empty-small">当前筛选条件下暂无达到样本数的海克斯</div>
+          </div>
+
+          <!-- 海克斯组合胜率 -->
+          <div class="aug-sub-panel">
+            <div class="aug-sub-head">
+              <strong>海克斯组合胜率</strong>
+              <label class="aug-min-label">样本≥
+                <input
+                  v-model="comboMinGamesText"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="不限"
+                  @change="applyComboMinGames"
+                  @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
+                />
+              </label>
+            </div>
+            <template v-if="augmentComboRows.length">
+              <div class="aug-list-table aug-combo-grid">
+                <div class="aug-tr aug-tr-head">
+                  <span class="aug-main-col">组合</span>
+                  <button class="aug-num-col aug-sort" type="button" @click="toggleComboSort('appearances')">场次{{ comboSortIcon('appearances') }}</button>
+                  <button class="aug-num-col aug-sort" type="button" @click="toggleComboSort('winRate')">胜率{{ comboSortIcon('winRate') }}</button>
+                </div>
+                <div
+                  v-for="row in sortedAugmentCombo"
+                  :key="`${row.augAId}|${row.augBId}`"
+                  class="aug-tr"
+                  :title="`${augmentMap.get(row.augAId)?.name || row.augAId} + ${augmentMap.get(row.augBId)?.name || row.augBId}`"
+                >
+                  <span class="aug-main-col aug-name aug-combo-name">
+                    <AssetIcon :path="augmentMap.get(row.augAId)?.iconPath" :label="augmentMap.get(row.augAId)?.name" :fallback="String(row.augAId)" :size="22" />
+                    <span class="aug-plus">+</span>
+                    <AssetIcon :path="augmentMap.get(row.augBId)?.iconPath" :label="augmentMap.get(row.augBId)?.name" :fallback="String(row.augBId)" :size="22" />
+                    <span class="aug-name-text">
+                      {{ augmentMap.get(row.augAId)?.name || row.augAId }}<em :class="`aug-r-${row.rarityA}`">{{ augmentRarityLabelOf(row.rarityA) }}</em>
+                      + {{ augmentMap.get(row.augBId)?.name || row.augBId }}<em :class="`aug-r-${row.rarityB}`">{{ augmentRarityLabelOf(row.rarityB) }}</em>
+                    </span>
+                  </span>
+                  <span class="aug-num-col">{{ row.appearances }}</span>
+                  <span class="aug-num-col aug-wr" :class="row.winRate >= 0.6 ? 'wr-high' : row.winRate <= 0.4 ? 'wr-low' : ''">{{ percent(row.winRate) }}</span>
+                </div>
+              </div>
+              <div v-if="augmentComboRows.length > AUGMENT_LIST_LIMIT" class="aug-list-note">仅显示前 {{ AUGMENT_LIST_LIMIT }} / {{ augmentComboRows.length }} 条，可调高「样本≥」缩小范围</div>
+            </template>
+            <div v-else class="aug-empty-small">当前筛选条件下暂无达到样本数的组合</div>
+          </div>
         </div>
 
         <div v-else class="augment-empty">
@@ -1127,6 +1320,185 @@ function augmentRarityLabel() {
   padding: 18px 0 8px;
   color: #7a8698;
   font-size: 13px;
+}
+.aug-sub-panel {
+  grid-column: 1 / -1;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 10px 12px;
+  border: 1px solid #dde3ec;
+  border-radius: 8px;
+  background: #fff;
+}
+.aug-sub-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.aug-sub-title {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.aug-scope-hint {
+  color: #9aa6b8;
+  font-size: 11px;
+}
+.aug-sub-head strong {
+  color: #172033;
+  font-size: 13px;
+}
+.aug-min-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #7a8698;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.aug-min-label input {
+  width: 46px;
+  padding: 3px 6px;
+  border: 1px solid #ccd5e2;
+  border-radius: 5px;
+  background: #f7f9fc;
+  color: #223149;
+  font-size: 12px;
+  outline: none;
+}
+.aug-min-label input:focus {
+  border-color: #6f8fff;
+}
+.aug-list-table {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.aug-tr {
+  display: grid;
+  align-items: center;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+.aug-rank-grid .aug-tr {
+  grid-template-columns: minmax(0, 1fr) 44px 62px 54px;
+}
+.aug-combo-grid .aug-tr {
+  grid-template-columns: minmax(0, 1fr) 52px 54px;
+}
+.aug-tr:nth-child(even):not(.aug-tr-head) {
+  background: #f8fafc;
+}
+.aug-tr-head {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  background: #eef2f6;
+  color: #6f7b90;
+  font-size: 11px;
+  font-weight: 700;
+}
+.aug-main-col {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aug-num-col {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  color: #3a465c;
+  font-variant-numeric: tabular-nums;
+}
+.aug-sort {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  text-align: right;
+  cursor: pointer;
+}
+.aug-sort:hover {
+  color: #5a77d8;
+}
+.aug-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #223149;
+  font-weight: 700;
+}
+.aug-name-text {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aug-name-text em {
+  flex: none;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+}
+.aug-r-silver {
+  background: #dbe3ea;
+  color: #55647a;
+}
+.aug-r-gold {
+  background: #f6e3a1;
+  color: #8a6410;
+}
+.aug-r-prismatic {
+  background: #e7d2fa;
+  color: #6f3fa8;
+}
+.aug-r-bronze {
+  background: #f3d8c2;
+  color: #8a4f2b;
+}
+.aug-combo-name {
+  gap: 4px;
+}
+.aug-plus {
+  flex: none;
+  color: #9aa6b8;
+  font-weight: 900;
+}
+.aug-wr {
+  font-weight: 800;
+}
+.wr-high {
+  color: #1d9a62;
+}
+.wr-low {
+  color: #d24b4b;
+}
+.aug-list-note {
+  color: #94a0b2;
+  font-size: 11px;
+}
+.aug-empty-small {
+  padding: 6px 0;
+  color: #9aa6b8;
+  font-size: 12px;
 }
 
 .filter-control {

@@ -27,7 +27,7 @@ const MAX_DEPTH: usize = 1000;
 const MIN_VALID_GAME_DURATION_SECONDS: i64 = 8 * 60;
 const STATS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DATABASE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const CACHE_SCHEMA_VERSION: i64 = 15;
+const CACHE_SCHEMA_VERSION: i64 = 16;
 const DATABASE_FILE_NAME: &str = "lol-stats.sqlite3";
 
 static STATS_CACHE: LazyLock<Mutex<HashMap<StatsCacheKey, StatsCacheEntry>>> =
@@ -129,6 +129,7 @@ pub async fn load_player_stats(
         depth,
         false,
         true,
+        false,
         |_, _| true,
     )
     .await
@@ -151,16 +152,8 @@ pub async fn load_match_detail(
     if let Some(mut cached_game) = game {
         // 曾经 attach 过但击杀矩阵为空的（时间线当时拉取失败），每会话补拉一次
         if !needs_carry_attach && !game_has_kill_data(&cached_game) {
-            let retried = CARRY_RETRIED
-                .lock()
-                .map(|set| set.contains(&game_id))
-                .unwrap_or(false);
-            if !retried {
-                if let Ok(mut set) = CARRY_RETRIED.lock() {
-                    set.insert(game_id);
-                }
-                needs_carry_attach = true;
-            }
+            // 击杀矩阵为空（此前时间线拉取失败）时，每次打开详情都允许重试，直到成功补上。
+            needs_carry_attach = true;
         }
         if needs_carry_attach {
             attach_carry_stats(&mut cached_game, lcu, auth, sgp_server_id).await;
@@ -743,6 +736,7 @@ pub async fn load_player_stats_with_progress<F>(
     depth: usize,
     force_refresh: bool,
     persist_cache: bool,
+    stale_ok: bool,
     mut progress: F,
 ) -> AppResult<PlayerStatsResponse>
 where
@@ -777,7 +771,7 @@ where
             return Ok(merge_carry_from_game_cache(cached));
         }
 
-        if let Some(cached) = read_db_cached_stats(&cache_key, false) {
+        if let Some(cached) = read_db_cached_stats(&cache_key, stale_ok) {
             store_cached_stats(cache_key.clone(), &cached);
             if let Some(mut games) = read_db_cached_games(&cache_key, depth) {
                 attach_carry_stats_batch(&mut games, lcu, auth, sgp_server_id).await;
@@ -1929,10 +1923,16 @@ fn participant_to_recent_game(game: &Game, participant: &Participant) -> RecentG
         cs,
         gold_earned: participant.stats.gold_earned,
         damage_to_champions: participant.stats.total_damage_dealt_to_champions,
+        physical_damage_dealt_to_champions: participant.stats.physical_damage_dealt_to_champions,
+        magic_damage_dealt_to_champions: participant.stats.magic_damage_dealt_to_champions,
+        true_damage_dealt_to_champions: participant.stats.true_damage_dealt_to_champions,
         team_damage_to_champions: team_totals.damage_to_champions,
         game_damage_to_champions: game_totals.damage_to_champions,
         damage_self_mitigated: participant.stats.damage_self_mitigated,
         total_damage_taken: participant.stats.total_damage_taken,
+        physical_damage_taken: participant.stats.physical_damage_taken,
+        magic_damage_taken: participant.stats.magic_damage_taken,
+        true_damage_taken: participant.stats.true_damage_taken,
         team_damage_self_mitigated: team_totals.damage_self_mitigated,
         team_total_damage_taken: team_totals.total_damage_taken,
         total_heal: participant.stats.total_heal,

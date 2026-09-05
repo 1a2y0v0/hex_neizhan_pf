@@ -309,9 +309,21 @@ pub struct ParticipantStats {
     #[serde(default)]
     pub total_damage_dealt_to_champions: u32,
     #[serde(default)]
+    pub physical_damage_dealt_to_champions: u32,
+    #[serde(default)]
+    pub magic_damage_dealt_to_champions: u32,
+    #[serde(default)]
+    pub true_damage_dealt_to_champions: u32,
+    #[serde(default)]
     pub damage_self_mitigated: u32,
     #[serde(default)]
     pub total_damage_taken: u32,
+    #[serde(default)]
+    pub physical_damage_taken: u32,
+    #[serde(default)]
+    pub magic_damage_taken: u32,
+    #[serde(default)]
+    pub true_damage_taken: u32,
     #[serde(default)]
     pub total_heal: u32,
     #[serde(default)]
@@ -535,6 +547,12 @@ pub struct RecentGame {
     pub gold_earned: u32,
     pub damage_to_champions: u32,
     #[serde(default)]
+    pub physical_damage_dealt_to_champions: u32,
+    #[serde(default)]
+    pub magic_damage_dealt_to_champions: u32,
+    #[serde(default)]
+    pub true_damage_dealt_to_champions: u32,
+    #[serde(default)]
     pub team_damage_to_champions: u32,
     #[serde(default)]
     pub game_damage_to_champions: u32,
@@ -542,6 +560,12 @@ pub struct RecentGame {
     pub damage_self_mitigated: u32,
     #[serde(default)]
     pub total_damage_taken: u32,
+    #[serde(default)]
+    pub physical_damage_taken: u32,
+    #[serde(default)]
+    pub magic_damage_taken: u32,
+    #[serde(default)]
+    pub true_damage_taken: u32,
     #[serde(default)]
     pub team_damage_self_mitigated: u32,
     #[serde(default)]

@@ -492,9 +492,21 @@ struct SgpParticipant {
     #[serde(default)]
     total_damage_dealt_to_champions: u32,
     #[serde(default)]
+    physical_damage_dealt_to_champions: u32,
+    #[serde(default)]
+    magic_damage_dealt_to_champions: u32,
+    #[serde(default)]
+    true_damage_dealt_to_champions: u32,
+    #[serde(default)]
     damage_self_mitigated: u32,
     #[serde(default)]
     total_damage_taken: u32,
+    #[serde(default)]
+    physical_damage_taken: u32,
+    #[serde(default)]
+    magic_damage_taken: u32,
+    #[serde(default)]
+    true_damage_taken: u32,
     #[serde(default)]
     total_heal: u32,
     #[serde(default)]
@@ -657,8 +669,15 @@ fn sgp_game_json_to_lcu_game(game: SgpGameJson) -> Game {
                     total_minions_killed: participant.total_minions_killed,
                     neutral_minions_killed: participant.neutral_minions_killed,
                     total_damage_dealt_to_champions: participant.total_damage_dealt_to_champions,
+                    physical_damage_dealt_to_champions: participant
+                        .physical_damage_dealt_to_champions,
+                    magic_damage_dealt_to_champions: participant.magic_damage_dealt_to_champions,
+                    true_damage_dealt_to_champions: participant.true_damage_dealt_to_champions,
                     damage_self_mitigated: participant.damage_self_mitigated,
                     total_damage_taken: participant.total_damage_taken,
+                    physical_damage_taken: participant.physical_damage_taken,
+                    magic_damage_taken: participant.magic_damage_taken,
+                    true_damage_taken: participant.true_damage_taken,
                     total_heal: participant.total_heal,
                     total_damage_shielded_on_teammates,
                     enemy_champion_immobilizations,

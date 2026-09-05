@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref, watch } from "vue"
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue"
 import { LoaderCircle } from "lucide-vue-next"
 import type {
   ChampionSummaryItem,
   GameAssetBundle,
+  MatchDetailPlayer,
   OpenMatchPayload,
   PlayerStatsResponse,
 } from "../types"
@@ -21,9 +22,21 @@ const props = defineProps<{
   ownerPuuid?: string
 }>()
 
+type RecordResultFilter = "all" | "win" | "loss"
+const resultFilter = ref<RecordResultFilter>("all")
+const filteredGames = computed(() => {
+  const games = props.stats?.recentGames || []
+  return games.filter((game) => {
+    if (resultFilter.value === "win" && !game.win) return false
+    if (resultFilter.value === "loss" && game.win) return false
+    return true
+  })
+})
+
 const emit = defineEmits<{
   loadMore: []
   openMatch: [payload: OpenMatchPayload]
+  openPlayer: [player: MatchDetailPlayer]
 }>()
 
 const loadMoreSentinel = ref<HTMLElement | null>(null)
@@ -105,16 +118,45 @@ watch(
       </div>
     </div>
 
+    <div class="history-filters">
+      <button
+        type="button"
+        :class="{ active: resultFilter === 'all' }"
+        @click="resultFilter = 'all'"
+      >
+        全部
+      </button>
+      <button
+        type="button"
+        :class="{ active: resultFilter === 'win' }"
+        @click="resultFilter = 'win'"
+      >
+        只看胜
+      </button>
+      <button
+        type="button"
+        :class="{ active: resultFilter === 'loss' }"
+        @click="resultFilter = 'loss'"
+      >
+        只看负
+      </button>
+
+      <span v-if="filteredGames.length !== (stats.recentGames?.length || 0)" class="filter-count">
+        当前 {{ filteredGames.length }} 局
+      </span>
+    </div>
+
     <GameRecordList
-      :games="stats.recentGames"
+      :games="filteredGames"
       :champions="champions"
       :game-assets="gameAssets"
       :sgp-server-id="sgpServerId"
       :owner-label="ownerLabel"
       :owner-puuid="ownerPuuid"
-      external-detail
       @open-match="emit('openMatch', $event)"
+      @open-player="emit('openPlayer', $event)"
     />
+
 
     <div class="load-more-sentinel" ref="loadMoreSentinel">
       <template v-if="loadingMore">
@@ -179,6 +221,37 @@ watch(
   font-size: 12px;
 }
 
+.history-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.history-filters button {
+  padding: 5px 10px;
+  border: 1px solid #c8d8d4;
+  border-radius: 999px;
+  color: #53666c;
+  background: #ffffff;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.history-filters button:hover {
+  border-color: #315f58;
+  color: #315f58;
+}
+.history-filters button.active {
+  color: #ffffff;
+  background: #315f58;
+  border-color: #315f58;
+}
+.history-filters .filter-count {
+  color: #718087;
+  font-size: 12px;
+  font-weight: 700;
+}
 .match-summary strong {
   color: #20333a;
   font-size: 24px;

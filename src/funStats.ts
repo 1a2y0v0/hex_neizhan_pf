@@ -53,6 +53,27 @@ export interface FunAugmentStats extends FunAugmentFilter {
   winRate: number
 }
 
+export interface FunAugmentRankEntry {
+  augmentId: number
+  rarity: FunAugmentRarity
+  eligibleGames: number
+  appearances: number
+  wins: number
+  opportunities: number
+  pickRate: number
+  winRate: number
+}
+
+export interface FunAugmentComboEntry {
+  augAId: number
+  augBId: number
+  rarityA: FunAugmentRarity
+  rarityB: FunAugmentRarity
+  appearances: number
+  wins: number
+  winRate: number
+}
+
 export interface FunStatsResult {
   generatedAt: number
   sampleGames: number
@@ -286,6 +307,94 @@ export function calculateAugmentStats(
     pickRate: ratio(appearances, opportunities),
     winRate: ratio(wins, appearances),
   }
+}
+
+function filterAugmentGamesByChampionRole(games: RecentGame[], context: RatingContext, filter: FunAugmentFilter) {
+  const championId = filter.championId ? Math.trunc(filter.championId) : null
+  const role = filter.role || null
+  return games.filter((game) => {
+    if (championId && game.championId !== championId) return false
+    if (role && !matchesEquipmentRole(analyzePlayerRole(game, context).role, role)) return false
+    return true
+  })
+}
+
+export function calculateAugmentRanking(
+  games: RecentGame[],
+  context: RatingContext,
+  filter: FunAugmentFilter = DEFAULT_FUN_AUGMENT_FILTER,
+  minAppearances = 2,
+): FunAugmentRankEntry[] {
+  const eligible = filterAugmentGamesByChampionRole(games, context, filter)
+  const map = new Map<number, FunAugmentRankEntry>()
+  for (const game of eligible) {
+    const seen = new Set<number>()
+    const rarityCount = new Map<FunAugmentRarity, number>()
+    for (const augmentId of game.augmentIds) {
+      if (seen.has(augmentId)) continue
+      const rarity = normalizeAugmentRarity(context.augments?.[augmentId]?.rarity)
+      if (!rarity) continue
+      seen.add(augmentId)
+      rarityCount.set(rarity, (rarityCount.get(rarity) || 0) + 1)
+    }
+    const counted = new Set<number>()
+    for (const augmentId of game.augmentIds) {
+      if (!seen.has(augmentId) || counted.has(augmentId)) continue
+      counted.add(augmentId)
+      const rarity = normalizeAugmentRarity(context.augments?.[augmentId]?.rarity)
+      if (!rarity) continue
+      let entry = map.get(augmentId)
+      if (!entry) {
+        entry = { augmentId, rarity, eligibleGames: eligible.length, appearances: 0, wins: 0, opportunities: 0, pickRate: 0, winRate: 0 }
+        map.set(augmentId, entry)
+      }
+      entry.appearances += 1
+      if (game.win) entry.wins += 1
+      entry.opportunities += rarityCount.get(rarity) || 0
+    }
+  }
+  return [...map.values()]
+    .filter((entry) => entry.appearances >= Math.max(1, minAppearances))
+    .map((entry) => ({ ...entry, pickRate: ratio(entry.appearances, entry.opportunities), winRate: ratio(entry.wins, entry.appearances) }))
+    .sort((a, b) => b.winRate - a.winRate || b.appearances - a.appearances || a.augmentId - b.augmentId)
+}
+
+export function calculateAugmentComboStats(
+  games: RecentGame[],
+  context: RatingContext,
+  filter: FunAugmentFilter = DEFAULT_FUN_AUGMENT_FILTER,
+  minAppearances = 2,
+): FunAugmentComboEntry[] {
+  const eligible = filterAugmentGamesByChampionRole(games, context, filter)
+  const map = new Map<string, FunAugmentComboEntry>()
+  for (const game of eligible) {
+    const validIds = game.augmentIds.filter((augmentId, index) => {
+      if (game.augmentIds.indexOf(augmentId) !== index) return false
+      return Boolean(normalizeAugmentRarity(context.augments?.[augmentId]?.rarity))
+    })
+    for (let i = 0; i < validIds.length; i += 1) {
+      for (let j = i + 1; j < validIds.length; j += 1) {
+        const augA = validIds[i]
+        const augB = validIds[j]
+        const [leftId, rightId] = augA < augB ? [augA, augB] : [augB, augA]
+        const rarityA = normalizeAugmentRarity(context.augments?.[leftId]?.rarity)
+        const rarityB = normalizeAugmentRarity(context.augments?.[rightId]?.rarity)
+        if (!rarityA || !rarityB) continue
+        const key = `${leftId}|${rightId}`
+        let entry = map.get(key)
+        if (!entry) {
+          entry = { augAId: leftId, augBId: rightId, rarityA, rarityB, appearances: 0, wins: 0, winRate: 0 }
+          map.set(key, entry)
+        }
+        entry.appearances += 1
+        if (game.win) entry.wins += 1
+      }
+    }
+  }
+  return [...map.values()]
+    .filter((entry) => entry.appearances >= Math.max(1, minAppearances))
+    .map((entry) => ({ ...entry, winRate: ratio(entry.wins, entry.appearances) }))
+    .sort((a, b) => b.winRate - a.winRate || b.appearances - a.appearances || a.augAId - b.augAId)
 }
 
 export function funStatsCacheKey(

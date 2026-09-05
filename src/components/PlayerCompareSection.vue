@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue"
 import { ChevronDown, ChevronRight } from "lucide-vue-next"
-import type { ChampionSummaryItem } from "../types"
+import type { ChampionSummaryItem, GameAssetEntry, MatchDetailResponse } from "../types"
 import ChampionAvatar from "./ChampionAvatar.vue"
+import GameDetailPopup from "./GameDetailPopup.vue"
 
 interface CompareChampProfile { games: number; averageDamageShare: number; averageMitigationShare: number }
 interface ComparePlayer {
@@ -56,6 +57,12 @@ const props = defineProps<{
   players: ComparePlayer[]
   champions: Record<number, ChampionSummaryItem>
   games: CompareGame[]
+  /** 完整对局按 gameId 查询（用于点击战绩弹出详细战绩弹层） */
+  matchById?: Map<number, MatchDetailResponse>
+  itemMap: Record<number, GameAssetEntry>
+  spellMap: Record<number, GameAssetEntry>
+  augmentMap: Record<number, GameAssetEntry>
+  perkMap: Record<number, GameAssetEntry>
 }>()
 
 const visible = ref(false)
@@ -272,6 +279,27 @@ const h2hFiltered = computed(() => {
   return h.recent
 })
 
+/* ── 点击交手记录某局 → 弹出本局详细战绩（复用 GameDetailPopup，A/B 高亮） ── */
+const detailGameId = ref<number | null>(null)
+const detailRow = ref<H2HRow | null>(null)
+function openH2hDetail(r: H2HRow) {
+  detailRow.value = r
+  detailGameId.value = r.gameId
+}
+const detailGame = computed(() =>
+  detailGameId.value != null && props.matchById ? props.matchById.get(detailGameId.value) || null : null,
+)
+const detailHighlightPlayers = computed(() => {
+  const row = detailRow.value
+  if (!row) return []
+  const a = playerA.value
+  const b = playerB.value
+  const out: { puuid: string; label: string }[] = []
+  if (a) out.push({ puuid: a.puuid, label: "A" })
+  if (b) out.push({ puuid: b.puuid, label: "B" })
+  return out
+})
+
 function formatTime(ts: number) {
   return new Date(ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
 }
@@ -396,7 +424,14 @@ function formatTime(ts: number) {
           </div>
 
           <div v-if="h2hFiltered.length" class="h2h-list">
-            <div v-for="r in h2hFiltered" :key="r.gameId" class="h2h-row">
+            <div
+              v-for="r in h2hFiltered"
+              :key="r.gameId"
+              class="h2h-row"
+              :class="{ clickable: !!matchById?.get(r.gameId) }"
+              :title="matchById?.get(r.gameId) ? '点击查看本局详细战绩' : undefined"
+              @click="matchById?.get(r.gameId) && openH2hDetail(r)"
+            >
               <span class="h2h-date">{{ formatTime(r.gameCreation) }}</span>
               <span class="h2h-rel" :class="r.sameTeam ? 'mate' : 'opp'">{{ r.sameTeam ? '同队' : '对位' }}</span>
               <ChampionAvatar :champion-id="r.a.championId" :champions="champions" :size="20" />
@@ -409,16 +444,29 @@ function formatTime(ts: number) {
               <span class="h2h-result" :class="r.aWin ? 'win' : 'loss'">{{ r.aWin ? '胜' : '负' }}</span>
               <span v-if="!r.sameTeam" class="h2h-kills" :title="`${playerA.gameName} 击杀 ${playerB.gameName} ${r.aKillsB} 次 / ${playerB.gameName} 击杀 ${playerA.gameName} ${r.bKillsA} 次`">杀 {{ r.aKillsB }}/{{ r.bKillsA }}</span>
               <span class="h2h-dur">{{ Math.round(r.gameDuration / 60) }}min</span>
+              <ChevronRight v-if="matchById?.get(r.gameId)" :size="12" class="h2h-chev" />
             </div>
           </div>
           <div v-else-if="headToHead && headToHead.total > 0" class="dim h2h-empty">该筛选下无对局</div>
-          <div v-if="headToHead && headToHead.total > 0" class="panel-note">共 {{ headToHead.total }} 局 · 结果为 {{ playerA.gameName }} 视角</div>
+          <div v-if="headToHead && headToHead.total > 0" class="panel-note">共 {{ headToHead.total }} 局 · 结果为 {{ playerA.gameName }} 视角{{ matchById ? ' · 点击单局可查看本局详细战绩与击杀关系' : '' }}</div>
         </div>
       </template>
 
       <div v-else class="dim compare-empty">玩家不足，无法对比</div>
     </div>
   </div>
+
+  <GameDetailPopup
+    v-if="detailGame"
+    :game="detailGame"
+    :champions="champions"
+    :item-map="itemMap"
+    :spell-map="spellMap"
+    :augment-map="augmentMap"
+    :perk-map="perkMap"
+    :highlight-players="detailHighlightPlayers"
+    @close="detailGameId = null"
+  />
 </template>
 
 <style scoped>
@@ -489,6 +537,9 @@ function formatTime(ts: number) {
 .h2h-list::-webkit-scrollbar { width: 8px; }
 .h2h-list::-webkit-scrollbar-thumb { background: #2e3742; border-radius: 4px; }
 .h2h-row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; font-size: 12px; flex-wrap: wrap; }
+.h2h-row.clickable { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.h2h-row.clickable:hover { border-color: var(--accent, #6366f1); background: rgba(99, 102, 241, 0.08); }
+.h2h-chev { margin-left: auto; color: var(--text-muted, #777); flex-shrink: 0; }
 .h2h-date { color: var(--text-muted, #888); font-size: 11px; min-width: 86px; }
 .h2h-rel { padding: 0 6px; border-radius: 3px; font-size: 10px; font-weight: 700; }
 .h2h-rel.mate { background: rgba(99, 102, 241, 0.15); color: #a5b4fc; }

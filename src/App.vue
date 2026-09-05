@@ -289,6 +289,9 @@ let searchServerInitializedFromClient = false
 let searchRankedRequestKey = ""
 let nextToastId = 0
 let drillCachePruneTimer: number | null = null
+let currentAutoSyncScheduled = false
+let currentAutoSyncRunning = false
+let currentAutoSyncDone = false
 let applyingNavigationHistory = false
 let lastDetailsSnapshot: NavigationSnapshot | null = null
 const hiddenDrillTabCache = new Map<string, HiddenDrillCacheEntry>()
@@ -1351,6 +1354,7 @@ async function loadCurrentRecent(forceRefresh = false, previousLoaded?: number) 
     } else if (stats.depthLoaded > previousLoaded! || forceRefresh) {
       currentRecentHasMore.value = currentRecentDepth.value < MAX_RECENT_DEPTH
     }
+    if (!forceRefresh) scheduleCurrentAutoSync()
     return true
   } catch (error) {
     currentError.value = errorMessage(error)
@@ -1392,28 +1396,70 @@ async function loadCurrentRanked() {
   }
 }
 
-async function loadCurrentStats(forceRefresh = false) {
+async function loadCurrentStats(forceRefresh = false, silent = false) {
   if (currentFullStats.value && !forceRefresh) return
   if (currentStatsLoading.value) return
   const requestId = createRequestId("current-stats")
   const startedAt = Date.now()
   currentStatsLoading.value = true
   currentError.value = ""
-  beginProgress(requestId, currentStatsDepth.value)
+  if (!silent) beginProgress(requestId, currentStatsDepth.value)
   try {
     await ensureClientReady()
     void loadCurrentRanked()
     const stats = await loadSelfStatsWithProgress(currentStatsDepth.value, requestId, forceRefresh)
-    if (!progressOverlay.value.cancelled) currentFullStats.value = stats
+    if (silent || !progressOverlay.value.cancelled) currentFullStats.value = stats
+    if (!forceRefresh) scheduleCurrentAutoSync()
   } catch (error) {
-    if (!progressOverlay.value.cancelled) {
+    if (silent || !progressOverlay.value.cancelled) {
       currentError.value = errorMessage(error)
-      notifyError("数据统计读取失败", error)
+      if (!silent) notifyError("数据统计读取失败", error)
     }
   } finally {
-    if (!progressOverlay.value.cancelled) await keepProgressVisible(startedAt)
-    endProgress(requestId)
+    if (!silent) {
+      if (!progressOverlay.value.cancelled) await keepProgressVisible(startedAt)
+      endProgress(requestId)
+    }
     currentStatsLoading.value = false
+  }
+}
+
+function scheduleCurrentAutoSync() {
+  if (currentAutoSyncDone || currentAutoSyncScheduled || currentAutoSyncRunning) return
+  currentAutoSyncScheduled = true
+  window.setTimeout(() => {
+    void runCurrentAutoSync()
+  }, 800)
+}
+
+async function runCurrentAutoSync() {
+  if (currentAutoSyncDone || currentAutoSyncRunning) return
+  currentAutoSyncRunning = true
+  try {
+    if (currentRecentLoading.value || currentStatsLoading.value) {
+      currentAutoSyncScheduled = false
+      return
+    }
+    try {
+      await ensureClientReady()
+      const recent = await loadSelfStats(currentRecentDepth.value, true)
+      currentRecentStats.value = recent
+      currentRecentHasMore.value = currentRecentDepth.value < MAX_RECENT_DEPTH
+    } catch {
+      currentAutoSyncScheduled = false
+      return
+    }
+    try {
+      const requestId = createRequestId("current-auto-sync")
+      const full = await loadSelfStatsWithProgress(currentStatsDepth.value, requestId, true)
+      currentFullStats.value = full
+    } catch {
+      currentAutoSyncScheduled = false
+      return
+    }
+    currentAutoSyncDone = true
+  } finally {
+    currentAutoSyncRunning = false
   }
 }
 
@@ -1919,6 +1965,7 @@ onUnmounted(() => {
             :game-assets="gameAssets"
             :share-settings="shareSettings"
             @open-match="openOverviewTab"
+        @open-player="openPlayerDrillTab($event)"
           />
         </KeepAlive>
       </section>
@@ -1938,12 +1985,13 @@ onUnmounted(() => {
         :stats-depth="currentStatsDepth"
         :error="currentError"
         @load-recent="loadCurrentRecent"
-        @load-stats="loadCurrentStats"
+        @load-stats="() => loadCurrentStats(false, true)"
         @refresh-recent="loadCurrentRecent(true)"
         @refresh-stats="loadCurrentStats(true)"
         @load-recent-more="loadCurrentRecentMore"
         @change-stats-depth="changeCurrentStatsDepth"
         @open-match="openOverviewTab"
+        @open-player="openPlayerDrillTab($event)"
       />
 
       <section class="live-page" v-show="activePage === 'live'">
@@ -2078,6 +2126,7 @@ onUnmounted(() => {
           @load-recent-more="loadSearchRecentMore"
           @change-stats-depth="changeSearchStatsDepth"
           @open-match="openOverviewTab"
+        @open-player="openPlayerDrillTab($event)"
         >
           <template #toolbar>
             <div class="search-toolbar">

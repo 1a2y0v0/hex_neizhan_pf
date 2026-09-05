@@ -4,16 +4,17 @@ import { Calendar, Check, ChevronDown, ChevronRight, ChevronUp, Crown, Download,
 import { loadTodayCustomGames, saveExportFile } from "../api"
 import { save } from "@tauri-apps/plugin-dialog"
 import { toBlob } from "html-to-image"
-import { matchTeamSummary } from "../matchTeamSummary"
 import { buildChampionProfiles, buildPlayerProfile, profileScoreLevel, type ChampionProfile, type PlayerProfile } from "../playerProfile"
-import { calculateOutputRating, outputRatingTitle, scoreEvaluationLabel, type OutputRating } from "../scoring"
+import { calculateOutputRating, scoreEvaluationLabel, type OutputRating } from "../scoring"
 import { buildStoreZip, type ZipFileEntry } from "../zipStore"
 import { buildWhiteExportRoot, ensureExportExtension, EXPORT_PRESETS, sanitizeFilename, waitForImages, type ExportPreset } from "../exportUtil"
 import type { ChampionSummaryItem, GameAssetBundle, GameAssetEntry, KillRelationEntry, MatchDetailPlayer, MatchDetailResponse, RecentGame, TodayCustomGamesResponse } from "../types"
-import { championName, fixed, mitigationValue, teamMitigationValue } from "../utils"
+import { championName } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
 import ChampionDetailDrawer from "./ChampionDetailDrawer.vue"
+import GameDetailTeams from "./GameDetailTeams.vue"
+import KillRelationsCard from "./KillRelationsCard.vue"
 import PlayerCompareSection from "./PlayerCompareSection.vue"
 import PlayerDetailCards from "./PlayerDetailCards.vue"
 import PlayerDetailDrawer from "./PlayerDetailDrawer.vue"
@@ -152,46 +153,9 @@ function kdaScore(k: number, d: number, a: number) { return Math.round((k + a) /
 function winRate(r: { wins: number; gamesPlayed: number }) { return r.wins / r.gamesPlayed * 100 }
 function avgValues(values: number[]) { const v = values.filter((x) => Number.isFinite(x)); return v.length ? v.reduce((s, x) => s + x, 0) / v.length : 0 }
 
-/* ── detail view helpers ── */
-function kNumber(value: number) { return `${(value / 1000).toFixed(1)}k` }
-function shareSuffix(part: number, total: number) { return `(${total > 0 ? Math.round(part / total * 100) : 0}%)` }
-function protectionValue(game: RecentGame) {
-  return (game.totalHeal || 0) + (game.totalDamageShieldedOnTeammates || 0)
-}
-function teamProtectionValue(game: RecentGame) {
-  return (game.teamTotalHeal || 0) + (game.teamTotalDamageShieldedOnTeammates || 0)
-}
-function detailTeamSummary(team: { players: MatchDetailPlayer[]; towerKills?: number }) {
-  return matchTeamSummary(team as Parameters<typeof matchTeamSummary>[0])
-}
-function damageConversion(game: RecentGame) {
-  const goldShare = game.teamGoldEarned > 0 ? game.goldEarned / game.teamGoldEarned : 0
-  if (goldShare === 0) return "0.00"
-  return fixed((game.damageToChampions / Math.max(game.teamDamageToChampions, 1)) / goldShare)
-}
-function detailStatLeader(game: RecentGame, kind: "damage" | "gold" | "mitigation" | "healing" | "conversion") {
-  switch (kind) {
-    case "damage": return game.gameDamageLeader || game.teamDamageLeader
-    case "gold": return game.teamGoldLeader
-    case "mitigation": return game.teamMitigationLeader
-    case "healing": return game.teamHealingLeader
-    case "conversion": return game.teamDamageConversionLeader
-  }
-}
-function outputRating(game: RecentGame) {
-  return rateGame(game)
-}
-function outputRatingHint(game: RecentGame) {
-  return outputRatingTitle(game, ratingContext.value)
-}
-function detailScoreClass(player: MatchDetailPlayer) {
-  return `score-${outputRating(player).level}`
-}
+/* ── 单局明细行已抽成 GameDetailTeams 复用组件，此处的字段 helpers 随之下沉 ── */
 function augmentName(augmentId: number) {
   return augmentMap.value[augmentId]?.name || perkMap.value[augmentId]?.name || `强化 ${augmentId}`
-}
-function shortAugmentName(augmentId: number) {
-  return Array.from(augmentName(augmentId)).slice(0, 5).join("")
 }
 function augmentRarityClass(augmentId: number) {
   switch (augmentMap.value[augmentId]?.rarity || perkMap.value[augmentId]?.rarity) {
@@ -573,7 +537,7 @@ const enrichedGames = computed<GameEnriched[]>(() => {
 
 /* ── 对局列表 关键字搜索：只过滤对局列表本身（玩家/海克斯/日期/装备/英雄等），不影响评分等统计 ── */
 const gameSearchQuery = ref("")
-/** 该局的可搜索文本：玩家名+副名、英雄、海克斯、符文、装备、日期多种写法、MVP、标签 */
+/** 该局的可搜索文本：日期/玩家/英雄/海克斯/装备/胜负/时长/击杀对象等 */
 function buildGameSearchText(g: GameEnriched): string {
   const parts: string[] = []
   const ts = g.gameCreation
@@ -588,15 +552,41 @@ function buildGameSearchText(g: GameEnriched): string {
     `${m}月${day}日`, `${pad(m)}-${pad(day)}`, `${y}-${pad(m)}`, `${y}年${m}月`,
     `周${"日一二三四五六"[d.getDay()]}`,
   )
+  // 时长（秒 → 分钟）：搜 “28min / 28分钟” 找特定时长对局
+  const mins = Math.round(g.gameDuration / 60)
+  parts.push(`${mins}min`, `${mins}分钟`)
+
   const raw = rawGame(g.gameId)
   if (raw) {
+    // 本局 puuid → 游戏名（击杀关系只存受害者 puuid，反查名字生成“X杀Y”词对）
+    const nameByPuuid = new Map<string, string>()
     for (const team of raw.teams) {
+      for (const p of team.players) nameByPuuid.set(p.puuid, p.gameName)
+    }
+    for (const team of raw.teams) {
+      // 胜负：蓝方胜利 / 蓝方失败 / 红方胜利 / 红方失败（也可只搜“蓝方”“红方”）
+      const side = team.teamId === 100 ? "蓝方" : team.teamId === 200 ? "红方" : team.name || ""
+      parts.push(`${side}${team.win ? "胜利" : "失败"}`)
       for (const p of team.players) {
         parts.push(p.gameName, p.tagLine || "", p.summonerName || "")
         parts.push(championName(props.champions, p.championId))
-        for (const id of p.augmentIds || []) parts.push(augmentName(id))
+        // 海克斯按槽位存于 augmentIds；补上其级别词，便于搜“彩/金/银”
+        for (const id of p.augmentIds || []) {
+          parts.push(augmentName(id))
+          const rarity = augmentMap.value[id]?.rarity || perkMap.value[id]?.rarity
+          if (rarity === "kPrismatic") parts.push("彩")
+          else if (rarity === "kGold") parts.push("金")
+          else if (rarity === "kSilver") parts.push("银")
+        }
         for (const id of p.perkIds || []) parts.push(augmentName(id))
         for (const id of p.itemIds || []) parts.push(itemMap.value[id]?.name || `装备${id}`)
+        // 击杀关系成对词：搜“李四杀张三”或“张三被李四杀”可精确到杀过谁
+        for (const kr of p.killRelations || []) {
+          const victim = nameByPuuid.get(kr.victimPuuid)
+          if (victim && victim !== p.gameName) {
+            parts.push(`${p.gameName}杀${victim}`, `${victim}被${p.gameName}杀`)
+          }
+        }
       }
     }
   }
@@ -2144,8 +2134,8 @@ function loadMoreComboTrio() {
                 v-model="gameSearchQuery"
                 type="text"
                 class="game-search-input"
-                placeholder="搜玩家 / 海克斯 / 日期 / 装备 / 英雄…"
-                title="关键字过滤对局列表：可搜玩家名、海克斯/装备名、日期（如 2026-09-03、9月3日）、英雄等；多个词用空格分隔（全部命中才显示）"
+                placeholder="搜玩家 / 英雄 / 海克斯(彩金银) / 装备 / 日期 / 胜负 / 分钟 / 杀过谁…"
+                title="关键字过滤对局列表：可搜玩家名、英雄、海克斯(或彩/金/银)、装备、日期（2026-09-03、9月3日）、蓝方胜利/红方失败、28min/28分钟、杀过/被杀的玩家名；多个词用空格分隔（全部命中才显示）"
               />
               <X v-if="gameSearchQuery" :size="13" class="game-search-clear" @click="gameSearchQuery = ''" />
             </div>
@@ -2247,129 +2237,23 @@ function loadMoreComboTrio() {
 
             <!-- expanded per-game detail -->
             <div v-if="expandedGames.has(game.gameId) && rawGame(game.gameId)" class="game-expanded-table">
-              <section v-for="team in rawGame(game.gameId)!.teams" :key="team.teamId" class="detail-team-block">
-                <div class="detail-team-header" :class="team.win ? 'win' : 'lose'">
-                  <div class="detail-team-result">
-                    <strong>{{ team.name || (team.teamId === 100 ? '蓝方' : '红方') }}</strong>
-                    <span>{{ team.win ? '胜利' : '失败' }}</span>
-                  </div>
-                  <div class="detail-team-summary">
-                    <span>队伍总经济 <b>{{ kNumber(detailTeamSummary(team).goldEarned) }}</b></span>
-                    <span>队伍总伤害 <b>{{ kNumber(detailTeamSummary(team).damageToChampions) }}</b></span>
-                    <span>队伍总推塔数 <b>{{ detailTeamSummary(team).towerKills }}</b></span>
-                  </div>
-                  <strong class="detail-team-kda">
-                    {{ detailTeamSummary(team).kills }}/{{ detailTeamSummary(team).deaths }}/{{ detailTeamSummary(team).assists }}
-                  </strong>
-                  <span>伤害</span>
-                  <span>经济</span>
-                  <span>承伤</span>
-                  <span>治疗/护盾</span>
-                  <span>伤转</span>
-                  <span>评分</span>
-                </div>
-
-                <div class="detail-list">
-                  <article
-                    v-for="p in team.players"
-                    :key="`${team.teamId}:${p.puuid}`"
-                    class="detail-row"
-                    :class="{ win: p.win, lose: !p.win }"
-                    :title="outputRatingHint(p)"
-                  >
-                    <div class="champion-cell">
-                      <ChampionAvatar :champion-id="p.championId" :champions="props.champions" :size="40" />
-                      <span>{{ p.gameName }}</span>
-                    </div>
-
-                    <div class="spell-column">
-                      <AssetIcon
-                        v-if="p.spell1Id"
-                        :path="spellMap[p.spell1Id]?.iconPath"
-                        :label="spellMap[p.spell1Id]?.name"
-                        :fallback="String(p.spell1Id)"
-                        :size="16"
-                      />
-                      <AssetIcon
-                        v-if="p.spell2Id"
-                        :path="spellMap[p.spell2Id]?.iconPath"
-                        :label="spellMap[p.spell2Id]?.name"
-                        :fallback="String(p.spell2Id)"
-                        :size="16"
-                      />
-                    </div>
-
-                    <div class="item-grid">
-                      <AssetIcon
-                        v-for="itemId in p.itemIds"
-                        :key="itemId"
-                        :path="itemMap[itemId]?.iconPath"
-                        :label="itemMap[itemId]?.name"
-                        :fallback="String(itemId)"
-                        :size="30"
-                      />
-                    </div>
-
-                    <div class="rune-grid text-grid" v-if="p.augmentIds.length">
-                      <span v-for="augmentId in p.augmentIds.slice(0, 4)" :key="augmentId" :class="['augment-tag', augmentRarityClass(augmentId)]">
-                        {{ shortAugmentName(augmentId) }}
-                      </span>
-                    </div>
-                    <div class="rune-grid" v-else>
-                      <AssetIcon
-                        v-for="perkId in p.perkIds.slice(0, 4)"
-                        :key="perkId"
-                        :path="perkMap[perkId]?.iconPath"
-                        :label="perkMap[perkId]?.name"
-                        :fallback="String(perkId)"
-                        :size="18"
-                      />
-                    </div>
-
-                    <div class="kda-cell">
-                      <strong>{{ p.kills }}/{{ p.deaths }}/{{ p.assists }}</strong>
-                      <span v-if="p.carryKills > 0 || p.carryAssists > 0" class="carry-chip" :title="`切C：击杀敌方C位 ${p.carryKills} 次，参与 ${p.carryAssists} 次助攻（本队对C位总击杀 ${p.teamCarryKills}）`">
-                        切C {{ p.carryKills }}/{{ p.carryAssists }}
-                      </span>
-                    </div>
-
-                    <div class="stat-cell">
-                      <strong :class="{ leader: detailStatLeader(p, 'damage') }">
-                        {{ kNumber(p.damageToChampions) }}<em>{{ shareSuffix(p.damageToChampions, p.teamDamageToChampions) }}</em>
-                      </strong>
-                    </div>
-
-                    <div class="stat-cell">
-                      <strong :class="{ leader: detailStatLeader(p, 'gold') }">
-                        {{ kNumber(p.goldEarned) }}<em>{{ shareSuffix(p.goldEarned, p.teamGoldEarned) }}</em>
-                      </strong>
-                    </div>
-
-                    <div class="stat-cell">
-                      <strong :class="{ leader: detailStatLeader(p, 'mitigation') }">
-                        {{ kNumber(mitigationValue(p)) }}<em>{{ shareSuffix(mitigationValue(p), teamMitigationValue(p)) }}</em>
-                      </strong>
-                    </div>
-
-                    <div class="stat-cell">
-                      <strong :class="{ leader: detailStatLeader(p, 'healing') }">
-                        {{ kNumber(protectionValue(p)) }}<em>{{ shareSuffix(protectionValue(p), teamProtectionValue(p)) }}</em>
-                      </strong>
-                    </div>
-
-                    <div class="stat-cell">
-                      <strong :class="{ leader: detailStatLeader(p, 'conversion') }">
-                        {{ damageConversion(p) }}
-                      </strong>
-                    </div>
-
-                    <div :class="['score-cell', detailScoreClass(p)]" :title="outputRatingHint(p)">
-                      <strong>{{ outputRating(p).score }}分</strong>
-                      <span>{{ outputRating(p).role.label }} · {{ outputRating(p).label }}</span>
-                    </div>
-                  </article>
-                </div>
-              </section>
+              <GameDetailTeams
+                :teams="rawGame(game.gameId)!.teams"
+                :champions="props.champions"
+                :item-map="itemMap"
+                :spell-map="spellMap"
+                :perk-map="perkMap"
+                :augment-map="augmentMap"
+                theme="dark"
+                :rate="rateGame"
+              />
+              <KillRelationsCard
+                :players="rawGame(game.gameId)!.teams.flatMap((t) => t.players)"
+                :champions="props.champions"
+                theme="dark"
+                :collapsible="true"
+                :collapsed-by-default="true"
+              />
             </div>
 
             <!-- hover tooltip -->
@@ -2678,6 +2562,11 @@ function loadMoreComboTrio() {
         :players="playerRatings"
         :champions="props.champions"
         :games="enrichedGames"
+        :match-by-id="rawGameById"
+        :item-map="itemMap"
+        :spell-map="spellMap"
+        :augment-map="augmentMap"
+        :perk-map="perkMap"
       />
 
       <!-- 阵容与搭档 -->
@@ -2950,6 +2839,7 @@ function loadMoreComboTrio() {
                 @keydown.enter="(e) => (e.target as HTMLInputElement).blur()"
               />
             </div>
+            <span class="stat-subtitle" style="margin-left:auto">点击英雄行可查看该英雄的详细战绩与使用玩家</span>
           </div>
           <div class="stat-table-scroll">
             <table class="stat-table champion-table">
@@ -3355,52 +3245,8 @@ function loadMoreComboTrio() {
 .game-card:hover .game-delete-btn { opacity: 1; }
 .game-delete-btn:hover { color: #f87171; }
 
-/* expanded mini table */
+/* expanded mini table：明细行样式已抽成 GameDetailTeams 复用组件 */
 .game-expanded-table { background: var(--bg-secondary, #1a1a2e); border: 1px solid var(--border, #333); border-top: none; border-radius: 0 0 8px 8px; padding: 8px 12px; overflow-x: auto; display: flex; flex-direction: column; gap: 10px; }
-
-.detail-team-block { overflow-x: auto; border: 1px solid var(--border, #444); border-radius: 8px; background: #16161d; padding: 8px; }
-.detail-team-header,
-.detail-row { display: grid; grid-template-columns: 160px 22px 252px 160px 59px repeat(5, 62px) 128px; min-width: 1131px; align-items: center; gap: 4px; }
-.detail-team-header { border-radius: 6px; margin-bottom: 6px; padding: 6px 7px; }
-.detail-team-header.win { color: #7db8f0; background: rgba(31, 95, 159, 0.22); }
-.detail-team-header.lose { color: #f0a0a0; background: rgba(162, 61, 61, 0.22); }
-.detail-team-result { display: flex; min-width: 0; align-items: center; gap: 6px; }
-.detail-team-result strong { font-size: 15.6px; line-height: 1; }
-.detail-team-result span, .detail-team-header > span { font-size: 12px; font-weight: 900; line-height: 1; white-space: nowrap; }
-.detail-team-summary { display: grid; min-width: 0; grid-column: span 3; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: center; gap: 4px; }
-.detail-team-summary span { overflow: hidden; font-size: 11px; font-weight: 800; line-height: 1; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
-.detail-team-summary b, .detail-team-kda { font-size: 12px; font-weight: 950; white-space: nowrap; }
-.detail-team-kda { text-align: center; }
-.detail-team-header > span { text-align: center; }
-.detail-list { display: flex; flex-direction: column; gap: 4px; }
-.detail-row { height: 48px; min-height: 48px; max-height: 48px; overflow: hidden; border: 1px solid var(--border, #444); border-left-width: 5px; border-radius: 8px; padding: 2px 7px; }
-.detail-row:hover { filter: brightness(1.12); }
-.detail-row.win { border-color: rgba(47, 120, 214, 0.35); border-left-color: #2f78d6; background: rgba(47, 120, 214, 0.13); }
-.detail-row.lose { border-color: rgba(202, 75, 75, 0.35); border-left-color: #ca4b4b; background: rgba(202, 75, 75, 0.13); }
-.champion-cell { display: flex; min-width: 0; align-items: center; gap: 6px; }
-.champion-cell span { min-width: 0; overflow: hidden; color: #d8d8e0; font-size: 13.5px; text-overflow: ellipsis; white-space: nowrap; }
-.spell-column { display: flex; height: 42px; flex-direction: column; justify-content: center; gap: 2px; }
-.item-grid { display: flex; min-width: 0; flex-wrap: nowrap; gap: 3px; }
-.rune-grid { display: grid; grid-template-columns: repeat(2, max-content); grid-auto-rows: 20px; align-content: center; justify-content: center; gap: 2px 4px; overflow: hidden; }
-.text-grid .augment-tag { display: inline-flex; box-sizing: border-box; width: calc(5em + 8px); height: 19px; align-items: center; justify-content: center; overflow: hidden; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 5px; color: #d8d8e0; font-size: 13.5px; font-weight: 700; line-height: 1; padding: 0 3px; text-align: center; white-space: nowrap; }
-.text-grid .augment-prismatic { border-color: rgba(170, 72, 215, 0.42); color: #e2b8ff; background: linear-gradient(135deg, rgba(109, 44, 145, 0.5), rgba(141, 70, 170, 0.5)); }
-.text-grid .augment-gold { border-color: rgba(199, 144, 36, 0.48); color: #ffd36a; background: rgba(123, 77, 2, 0.45); }
-.text-grid .augment-silver { border-color: rgba(134, 151, 166, 0.48); color: #c6d4de; background: rgba(73, 96, 111, 0.45); }
-.text-grid .augment-bronze { border-color: rgba(167, 105, 60, 0.46); color: #e8b48a; background: rgba(122, 67, 35, 0.45); }
-.kda-cell, .stat-cell, .score-cell { display: flex; min-width: 0; align-items: center; justify-content: center; }
-.kda-cell { flex-direction: column; row-gap: 1px; line-height: 1.1; }
-.kda-cell strong { color: #e8e8f0; font-size: 13px; line-height: 1.15; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.kda-cell .carry-chip { padding: 0 5px; border: 1px solid rgba(251, 146, 60, 0.45); border-radius: 6px; background: rgba(251, 146, 60, 0.12); color: #fdba74; font-size: 10px; font-weight: 800; line-height: 1.5; white-space: nowrap; }
-.stat-cell strong { display: inline-flex; flex-direction: column; align-items: center; gap: 1px; color: #e8e8f0; font-size: 16.5px; line-height: 1; white-space: nowrap; }
-.stat-cell strong.leader, .stat-cell strong.leader em { color: #ff6b6b; font-weight: 900; }
-.stat-cell em { color: #8a989c; font-size: 13.5px; font-style: normal; font-weight: 700; }
-.score-cell { height: 42px; flex-direction: column; gap: 2px; border-radius: 7px; background: rgba(255, 255, 255, 0.06); padding: 3px; text-align: center; }
-.score-cell strong { position: relative; z-index: 1; color: inherit; font-size: 18px; font-weight: 950; line-height: 1; white-space: nowrap; }
-.score-cell span { position: relative; z-index: 1; max-width: 100%; color: inherit; font-size: 10.5px; font-weight: 900; line-height: 1; white-space: nowrap; }
-.score-excellent { position: relative; overflow: hidden; color: #5d3300; border: 1px solid rgba(245, 185, 52, 0.72); background: linear-gradient(135deg, rgba(255, 244, 184, 0.96), rgba(255, 195, 64, 0.9) 45%, rgba(255, 236, 150, 0.96)), #ffd36a; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.36), 0 0 16px rgba(255, 191, 58, 0.34); }
-.score-good { color: #145b3e; background: rgba(204, 239, 218, 0.88); }
-.score-average { color: #174d83; background: rgba(205, 229, 255, 0.92); }
-.score-poor { color: #8f3434; background: rgba(248, 214, 213, 0.92); }
 
 /* hover tooltip */
 .game-hover-tooltip { position: absolute; top: 100%; left: 0; right: 0; z-index: 100; background: #1a1a2e; border: 1px solid #444; border-radius: 8px; padding: 10px 14px; display: flex; gap: 16px; margin-top: 4px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }

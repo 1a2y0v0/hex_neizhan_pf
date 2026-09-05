@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, ref, watch } from "vue"
-import { ClipboardCopy, Sparkles } from "lucide-vue-next"
+import { ChevronDown, ChevronUp, ClipboardCopy, Sparkles } from "lucide-vue-next"
 import {
   calculateAugmentStats,
   calculateEquipmentStats,
@@ -45,6 +45,8 @@ const props = defineProps<{
   shareSettings: ShareSettings
   sgpServerId?: string
   ownerLabel?: string
+  hideOverview?: boolean
+  hideChampionTable?: boolean
   ownerPuuid?: string
 }>()
 
@@ -82,6 +84,66 @@ const filteredChampionStats = computed(() => {
   if (!keyword) return champions
 
   return champions.filter((champ) => championSearchText(champ.championId).includes(keyword))
+})
+const recentGames = computed(() => props.stats?.recentGames || [])
+const averageMetrics = computed(() => {
+  const games = recentGames.value
+  if (!games.length) return null
+  const count = games.length
+  let dpm = 0
+  let gpm = 0
+  let kp = 0
+  let cspm = 0
+  let takenShare = 0
+  for (const game of games) {
+    const minutes = Math.max(game.gameDuration || 0, 1) / 60
+    dpm += (game.damageToChampions || 0) / minutes
+    gpm += (game.goldEarned || 0) / minutes
+    kp += (game.kills + game.assists) / Math.max(game.teamKills || 0, 1)
+    cspm += (game.cs || 0) / minutes
+    takenShare += (game.totalDamageTaken || 0) / Math.max(game.teamTotalDamageTaken || 0, 1)
+  }
+  return {
+    dpm: dpm / count,
+    gpm: gpm / count,
+    kp: kp / count,
+    cspm: cspm / count,
+    takenShare: takenShare / count,
+  }
+})
+
+type ChampionSortColumn =
+  | "games"
+  | "winRate"
+  | "averageKda"
+  | "damageShare"
+  | "damageConversionRate"
+  | "mitigationShare"
+  | "healingShare"
+const championAdvancedVisible = ref(false)
+const championSortColumn = ref<ChampionSortColumn>("games")
+const championSortDir = ref<"asc" | "desc">("desc")
+function toggleChampionSort(column: ChampionSortColumn) {
+  if (championSortColumn.value === column) {
+    championSortDir.value = championSortDir.value === "asc" ? "desc" : "asc"
+  } else {
+    championSortColumn.value = column
+    championSortDir.value = "desc"
+  }
+}
+function championSortIcon(column: ChampionSortColumn) {
+  if (championSortColumn.value !== column) return ""
+  return championSortDir.value === "asc" ? " ▲" : " ▼"
+}
+const sortedChampionStats = computed(() => {
+  const rows = [...filteredChampionStats.value]
+  const direction = championSortDir.value === "asc" ? 1 : -1
+  rows.sort((a, b) => {
+    const aValue = a[championSortColumn.value]
+    const bValue = b[championSortColumn.value]
+    return (aValue - bValue) * direction || b.games - a.games
+  })
+  return rows
 })
 const shareChampionStats = computed(
   () => filteredChampionStats.value.slice(0, props.shareSettings.championAnalysisLimit),
@@ -351,6 +413,7 @@ function queueName(game: RecentGame) {
     1711: "斗魂竞技场",
     1712: "斗魂竞技场",
     1900: "无限火力",
+    3270: "自定义",
     2400: "海克斯大乱斗",
   }
 
@@ -587,7 +650,21 @@ function errorMessage(error: unknown) {
   </section>
 
   <section class="stats" v-else ref="statsRootRef">
-    <div class="stats-overview">
+    <div class="stats-toolbar" v-if="!selectedChampionId">
+      <div class="fun-stats-entry">
+        <button
+          class="data-filter-button"
+          type="button"
+          :disabled="funStatsLoading || stats.recentGames.length === 0"
+          @click="toggleFunStats"
+        >
+          <span v-if="dataFilterHintVisible" class="data-filter-hint" aria-hidden="true"></span>
+          <Sparkles :size="16" />
+          {{ funStatsLoading ? "统计中" : funStatsVisible ? "收起数据筛选" : "数据筛选" }}
+        </button>
+      </div>
+    </div>
+    <div class="stats-overview" v-if="!hideOverview">
       <div class="overview-main">
         <div class="metric-grid">
           <div class="metric">
@@ -619,6 +696,14 @@ function errorMessage(error: unknown) {
               />
             </small>
           </div>
+        </div>
+
+        <div v-if="averageMetrics" class="avg-metrics">
+          <div class="avg-metric"><span>分均伤害</span><strong>{{ Math.round(averageMetrics.dpm) }}</strong></div>
+          <div class="avg-metric"><span>分均经济</span><strong>{{ Math.round(averageMetrics.gpm) }}</strong></div>
+          <div class="avg-metric"><span>参团率</span><strong>{{ percent(averageMetrics.kp) }}</strong></div>
+          <div class="avg-metric"><span>分均补刀</span><strong>{{ averageMetrics.cspm.toFixed(1) }}</strong></div>
+          <div class="avg-metric"><span>承伤占比</span><strong>{{ percent(averageMetrics.takenShare) }}</strong></div>
         </div>
 
         <section class="panel profile-panel">
@@ -698,18 +783,7 @@ function errorMessage(error: unknown) {
       </aside>
     </div>
 
-    <div class="fun-stats-entry" v-if="!selectedChampionId">
-      <button
-        class="data-filter-button"
-        type="button"
-        :disabled="funStatsLoading || stats.recentGames.length === 0"
-        @click="toggleFunStats"
-      >
-        <span v-if="dataFilterHintVisible" class="data-filter-hint" aria-hidden="true"></span>
-        <Sparkles :size="16" />
-        {{ funStatsLoading ? "统计中" : funStatsVisible ? "收起数据筛选" : "数据筛选" }}
-      </button>
-    </div>
+
 
     <FunStatsPanel
       v-if="!selectedChampionId && funStatsVisible && funStatsResult"
@@ -725,7 +799,7 @@ function errorMessage(error: unknown) {
       @augment-change="updateFunAugment"
     />
 
-    <div class="content-grid">
+    <div class="content-grid" v-if="!hideChampionTable">
       <section class="panel table-panel" v-if="!selectedChampionId">
         <div class="panel-heading">
           <div class="section-title">单英雄战绩</div>
@@ -740,6 +814,15 @@ function errorMessage(error: unknown) {
               />
             </label>
             <button
+              class="toggle-advanced"
+              type="button"
+              @click="championAdvancedVisible = !championAdvancedVisible"
+              :disabled="selectedChampionId !== null"
+            >
+              <ChevronUp v-if="championAdvancedVisible" :size="14" />
+              <ChevronDown v-else :size="14" />
+              {{ championAdvancedVisible ? "收起" : "展开" }}进阶列
+            </button>            <button
               class="share-action"
               :disabled="shareBusy !== null || shareChampionStats.length === 0"
               @click="copyChampionStatsImage"
@@ -754,21 +837,21 @@ function errorMessage(error: unknown) {
             <thead>
               <tr>
                 <th>英雄</th>
-                <th>场次</th>
-                <th>胜率</th>
+                <th class="th-sort" @click="toggleChampionSort('games')">场次{{ championSortIcon('games') }}</th>
+                <th class="th-sort" @click="toggleChampionSort('winRate')">胜率{{ championSortIcon('winRate') }}</th>
                 <th>评分</th>
                 <th>评价</th>
                 <th>标签</th>
-                <th>K / D / A</th>
-                <th>伤害占比</th>
-                <th>伤害转化率</th>
-                <th>承担占比</th>
-                <th>治疗占比</th>
+                <th class="th-sort" @click="toggleChampionSort('averageKda')">K / D / A{{ championSortIcon('averageKda') }}</th>
+                <th v-if="championAdvancedVisible" class="th-sort" @click="toggleChampionSort('damageShare')">伤害占比{{ championSortIcon('damageShare') }}</th>
+                <th v-if="championAdvancedVisible" class="th-sort" @click="toggleChampionSort('damageConversionRate')">伤害转化率{{ championSortIcon('damageConversionRate') }}</th>
+                <th v-if="championAdvancedVisible" class="th-sort" @click="toggleChampionSort('mitigationShare')">承担占比{{ championSortIcon('mitigationShare') }}</th>
+                <th v-if="championAdvancedVisible" class="th-sort" @click="toggleChampionSort('healingShare')">治疗占比{{ championSortIcon('healingShare') }}</th>
               </tr>
             </thead>
             <tbody>
               <tr
-                v-for="champ in filteredChampionStats"
+                v-for="champ in sortedChampionStats"
                 :key="champ.championId"
                 class="champion-row"
                 tabindex="0"
@@ -842,10 +925,10 @@ function errorMessage(error: unknown) {
                     KDA {{ fixed(champ.averageKda) }}
                   </small>
                 </td>
-                <td>{{ percent(champ.damageShare) }}</td>
-                <td>{{ fixed(champ.damageConversionRate) }}</td>
-                <td>{{ percent(champ.mitigationShare) }}</td>
-                <td>{{ percent(champ.healingShare) }}</td>
+                <td v-if="championAdvancedVisible">{{ percent(champ.damageShare) }}</td>
+                <td v-if="championAdvancedVisible">{{ fixed(champ.damageConversionRate) }}</td>
+                <td v-if="championAdvancedVisible">{{ percent(champ.mitigationShare) }}</td>
+                <td v-if="championAdvancedVisible">{{ percent(champ.healingShare) }}</td>
               </tr>
             </tbody>
           </table>
@@ -881,13 +964,13 @@ function errorMessage(error: unknown) {
           :sgp-server-id="sgpServerId"
           :owner-label="ownerLabel"
           :owner-puuid="ownerPuuid"
-          external-detail
-          @open-match="emit('openMatch', $event)"
+              @open-match="emit('openMatch', $event)"
         />
       </section>
     </div>
 
     <div
+      v-if="!hideChampionTable"
       class="share-capture-root"
       :class="{ mobile: shareSettings.mobileShareLayout }"
       aria-hidden="true"
@@ -1186,6 +1269,68 @@ function errorMessage(error: unknown) {
   display: flex;
   flex-direction: column;
   gap: 18px;
+}
+
+.stats-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: -12px;
+}
+.avg-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+.avg-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #dce7e4;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 8px 20px rgba(32, 67, 73, 0.05);
+}
+.avg-metric span {
+  color: #718087;
+  font-size: 11px;
+}
+.avg-metric strong {
+  color: #20333a;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.toggle-advanced {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid #b9c9d9;
+  border-radius: 7px;
+  color: #253d5a;
+  background: #f3f7fb;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.toggle-advanced:hover:not(:disabled) {
+  border-color: #7693b3;
+  color: #17395e;
+  background: #e2edf8;
+}
+.toggle-advanced:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+th.th-sort {
+  cursor: pointer;
+  user-select: none;
+}
+th.th-sort:hover {
+  color: #1f5f56;
 }
 
 .stats-overview {

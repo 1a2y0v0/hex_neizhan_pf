@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { LoaderCircle, RefreshCw } from "lucide-vue-next"
 import type {
   ChampionStat,
   ChampionSummaryItem,
   GameAssetBundle,
+  MatchDetailPlayer,
   OpenMatchPayload,
   PlayerStatsResponse,
   RankedQueueEntry,
@@ -12,13 +13,13 @@ import type {
   RecentGame,
   ShareSettings,
 } from "../types"
-import { rankIconLarge } from "../rankIcons"
 import { mitigationValue, riotId, teamMitigationValue } from "../utils"
 import MatchHistoryPanel from "./MatchHistoryPanel.vue"
+import PlayerMatchSummary from "./PlayerMatchSummary.vue"
 import StatsPanel from "./StatsPanel.vue"
 
 type RecordTab = "recent" | "stats"
-type QueueFilterKey = "ranked" | "normal" | "arena" | "aram"
+type QueueFilterKey = "ranked" | "normal" | "hextech" | "aram"
 type QueueOption = {
   key: QueueFilterKey
   label: string
@@ -49,9 +50,11 @@ const emit = defineEmits<{
   loadRecentMore: []
   changeStatsDepth: [depth: number]
   openMatch: [payload: OpenMatchPayload]
+  openPlayer: [player: MatchDetailPlayer]
 }>()
 
-const activeTab = ref<RecordTab>("recent")
+const activeTab = ref<RecordTab>("stats")
+const selectedHeroId = ref<number | null>(null)
 const selectedQueue = ref<QueueFilterKey | null>(null)
 const statsDepthInput = ref(String(props.statsDepth))
 const statsDepthPickerOpen = ref(false)
@@ -62,6 +65,9 @@ let statsDepthCloseTimer = 0
 let statsDateCloseTimer = 0
 
 const rankedQueueIds = new Set([420, 440])
+const QUEUE_PREFERENCE_KEY = "lol-stats.record-stats-queue.v1"
+const QUEUE_HEXTECH_CUSTOM_KEY = "lol-stats.record-stats-hextech-custom.v1"
+const hextechIncludeCustom = ref(localStorage.getItem(QUEUE_HEXTECH_CUSTOM_KEY) !== "0")
 const normalQueueIds = new Set([400, 430, 480, 490])
 const hexAramQueueIds = new Set([2400])
 const aramQueueIds = new Set([450])
@@ -94,17 +100,17 @@ const queueOptions: QueueOption[] = [
       (game.gameMode === "CLASSIC" && !rankedQueueIds.has(game.queueId)),
   },
   {
-    key: "arena",
+    key: "hextech",
     label: "海克斯大乱斗",
-    matches: (game) =>
-      hexAramQueueIds.has(game.queueId) ||
-      ["CHERRY", "STRAWBERRY", "KIWI"].includes(game.gameMode?.toUpperCase() || ""),
+    matches: (game) => hexAramQueueIds.has(game.queueId),
   },
+
   {
     key: "aram",
     label: "大乱斗",
     matches: (game) => aramQueueIds.has(game.queueId) || game.gameMode === "ARAM",
   },
+
 ]
 
 const currentSummoner = computed(
@@ -117,13 +123,36 @@ const activeQueueOption = computed(() =>
   queueOptions.find((option) => option.key === selectedQueue.value),
 )
 
+function toggleHextechIncludeCustom() {
+  hextechIncludeCustom.value = !hextechIncludeCustom.value
+  try { localStorage.setItem(QUEUE_HEXTECH_CUSTOM_KEY, hextechIncludeCustom.value ? "1" : "0") } catch { /* ignore */ }
+}
+function queueMatches(game: RecentGame) {
+  const option = activeQueueOption.value
+  if (!option) return false
+  if (option.key === "hextech") {
+    return (
+      option.matches(game) ||
+      (hextechIncludeCustom.value &&
+        (game.queueId === 3270 || game.gameMode?.toUpperCase() === "CUSTOM_GAME"))
+    )
+  }
+  return option.matches(game)
+}
+
+
+const displayRecentStats = computed(() => {
+  if (!props.recentStats) return null
+  const games = props.recentStats.recentGames.filter((game) =>
+    (!selectedQueue.value || queueMatches(game)) &&
+    (!selectedHeroId.value || game.championId === selectedHeroId.value),
+  )
+  if (games.length === props.recentStats.recentGames.length) return props.recentStats
+  return buildFilteredStats(props.recentStats, (game) => games.includes(game))
+})
 const filteredStats = computed(() => {
   if (!props.fullStats || !activeQueueOption.value) return null
-  const queueOption = activeQueueOption.value
-  return buildFilteredStats(
-    props.fullStats,
-    (game) => queueOption.matches(game) && dateFilterMatches(game),
-  )
+  return buildFilteredStats(props.fullStats, (game) => queueMatches(game) && dateFilterMatches(game))
 })
 
 const statsDateLabel = computed(() => {
@@ -165,17 +194,30 @@ watch(
   },
 )
 
+watch(
+  () => props.fullStats,
+  (fullStats) => {
+    if (!fullStats || selectedQueue.value) return
+    const raw = localStorage.getItem(QUEUE_PREFERENCE_KEY)
+    const saved = raw && queueOptions.some((option) => option.key === raw) ? (raw as QueueFilterKey) : null
+    if (saved) {
+      selectQueue(saved)
+    } else if (fullStats.recentGames.some((game) => hexAramQueueIds.has(game.queueId))) {
+      selectQueue("hextech")
+    }
+  },
+)
+function rememberQueue(key: QueueFilterKey) {
+  try { localStorage.setItem(QUEUE_PREFERENCE_KEY, key) } catch { /* ignore */ }
+}
+
 function selectQueue(key: QueueFilterKey) {
   selectedQueue.value = key
+  rememberQueue(key)
   activeTab.value = "stats"
   requestStatsIfNeeded()
 }
 
-function openStatsTab() {
-  const wasStatsTab = activeTab.value === "stats"
-  activeTab.value = "stats"
-  if (wasStatsTab) requestStatsIfNeeded()
-}
 
 function requestStatsIfNeeded() {
   if (!props.fullStats) emit("loadStats")
@@ -272,12 +314,14 @@ function formatDateInputLabel(value: string) {
 }
 
 function refreshActiveTab() {
-  if (activeTab.value === "recent") {
-    emit("refreshRecent")
-  } else {
-    emit("refreshStats")
-  }
+  emit("refreshRecent")
+  emit("refreshStats")
 }
+
+onMounted(() => {
+  if (!props.recentStats) emit("loadRecent")
+  if (!props.fullStats) emit("loadStats")
+})
 
 function queueCount(option: QueueOption) {
   if (!props.fullStats) return null
@@ -330,11 +374,6 @@ function normalizeDivision(division: string) {
   const normalized = division.trim().toUpperCase()
   if (!normalized || normalized === "NA" || normalized === "NONE") return ""
   return normalized
-}
-
-function rankTierClass(tier: string) {
-  const normalized = tier.trim().toLowerCase()
-  return normalized ? `tier-${normalized}` : "tier-unranked"
 }
 
 function buildFilteredStats(
@@ -449,63 +488,90 @@ function round2(value: number) {
 <template>
   <section class="record-view">
     <header class="record-topbar">
-      <nav class="record-tabs">
-        <button :class="{ active: activeTab === 'recent' }" @click="activeTab = 'recent'">
-          当前战绩
-        </button>
-        <button :class="{ active: activeTab === 'stats' }" @click="openStatsTab">
-          数据统计
-        </button>
-      </nav>
-
-      <div class="topbar-meta">
+      <div class="record-heading">
+        <strong>战绩与统计</strong>
+      </div>
+            <div class="topbar-meta">
         <slot name="toolbar" />
         <button class="refresh-tab" :disabled="loading" @click="refreshActiveTab">
           <LoaderCircle v-if="loading" class="spin" :size="15" />
           <RefreshCw v-else :size="15" />
           刷新
         </button>
-        <div class="player-chip" v-if="activeTab === 'recent' && currentSummoner">
+        <div class="player-chip" v-if="currentSummoner">
           {{ riotId(currentSummoner) }}
         </div>
       </div>
     </header>
 
-    <section class="rank-strip" v-if="activeTab === 'recent' && (rankedLoading || rankCards.length)">
-      <div class="rank-card loading" v-if="rankedLoading && !rankCards.length">
-        <span>段位</span>
-        <strong>读取中</strong>
-      </div>
-      <article
-        v-for="card in rankCards"
-        :key="card.label"
-        :class="['rank-card', rankTierClass(card.tier)]"
-      >
-        <img class="rank-card-icon" :src="rankIconLarge(card.tier)" :alt="card.value" />
-        <div class="rank-card-text">
-          <span>{{ card.label }}</span>
-          <strong>{{ card.value }}</strong>
-        </div>
-      </article>
-    </section>
 
     <div class="loading-pill" v-if="loading">正在读取数据</div>
 
-    <MatchHistoryPanel
-      v-if="activeTab === 'recent'"
-      :stats="recentStats"
-      :champions="champions"
-      :game-assets="gameAssets"
-      :sgp-server-id="sgpServerId"
-      :loading-more="recentLoading"
-      :has-more="recentHasMore"
-      :owner-label="ownerLabel"
-      :owner-puuid="ownerPuuid"
-      @load-more="emit('loadRecentMore')"
-      @open-match="emit('openMatch', $event)"
-    />
 
-    <section class="stats-stage" v-else>
+    <div class="mode-bar">
+      <div class="mode-buttons">
+        <button
+          v-for="option in queueOptions"
+          :key="option.key"
+          type="button"
+          :class="{ active: selectedQueue === option.key }"
+          @click="selectQueue(option.key)"
+        >
+          {{ option.label }}
+        </button>
+        <button
+          v-if="selectedQueue === 'hextech'"
+          type="button"
+          :class="{ active: hextechIncludeCustom }"
+          @click="toggleHextechIncludeCustom"
+        >
+          {{ hextechIncludeCustom ? '含自定义' : '仅匹配' }}
+        </button>
+      </div>
+      <div class="mode-tools">
+        <button
+          v-if="selectedHeroId"
+          type="button"
+          class="clear-hero"
+          @click="selectedHeroId = null"
+        >
+          {{ champions[selectedHeroId]?.name || '英雄' }} × 清除
+        </button>
+        <label class="depth-tool">
+          <span>获取数量</span>
+          <select v-model="statsDepthInput" @change="commitStatsDepth">
+            <option v-for="depth in statsDepthOptions" :key="depth" :value="String(depth)">{{ depth }} 局</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+          <div class="match-layout">
+
+        <PlayerMatchSummary
+          :recent-stats="recentStats"
+          :champions="champions"
+          :game-assets="gameAssets"
+          :rank-cards="rankCards"
+          :ranked-loading="rankedLoading"
+          :selected-hero-id="selectedHeroId"
+          @select-champion="selectedHeroId = $event"
+        />
+        <MatchHistoryPanel
+          :stats="displayRecentStats"
+          :champions="champions"
+          :game-assets="gameAssets"
+          :sgp-server-id="sgpServerId"
+          :loading-more="recentLoading"
+          :has-more="recentHasMore"
+          :owner-label="ownerLabel"
+          :owner-puuid="ownerPuuid"
+          @load-more="emit('loadRecentMore')"
+          @open-match="emit('openMatch', $event)"
+          @open-player="emit('openPlayer', $event)"
+        />
+      </div>
+    <section class="stats-stage">
       <div class="queue-picker centered" v-if="!selectedQueue">
         <button
           v-for="option in queueOptions"
@@ -528,6 +594,17 @@ function round2(value: number) {
           >
             {{ option.label }}
           </button>
+          <button
+            v-if="selectedQueue === 'hextech'"
+            type="button"
+            class="queue-custom-toggle"
+            :class="{ active: hextechIncludeCustom }"
+            @click="toggleHextechIncludeCustom"
+            title="开启后同时统计自定义对局（队列 3270 / CUSTOM_GAME）"
+          >
+            {{ hextechIncludeCustom ? "含自定义" : "仅匹配" }}
+          </button>
+
           <div class="queue-tools">
             <div
               class="stats-date-control"
@@ -586,6 +663,8 @@ function round2(value: number) {
         </div>
 
         <StatsPanel
+          :hide-overview="true"
+          :hide-champion-table="true"
           :stats="filteredStats"
           :champions="champions"
           :game-assets="gameAssets"
@@ -612,6 +691,100 @@ function round2(value: number) {
   gap: 18px;
 }
 
+.record-heading {
+  display: flex;
+  align-items: center;
+}
+.view-tabs {
+  display: flex;
+  gap: 6px;
+}
+.view-tabs button {
+  padding: 7px 14px;
+  border: 1px solid #c8d8d4;
+  border-radius: 999px;
+  color: #53656b;
+  background: #ffffff;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.view-tabs button:hover {
+  border-color: #315f58;
+  color: #315f58;
+}
+.view-tabs button.active {
+  color: #ffffff;
+  background: #315f58;
+  border-color: #315f58;
+}
+.mode-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #dce7e4;
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 8px 22px rgba(32, 67, 73, 0.05);
+}
+.mode-buttons, .mode-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.mode-buttons button, .clear-hero {
+  padding: 6px 12px;
+  border: 1px solid #c8d8d4;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #53656b;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.mode-buttons button.active, .clear-hero {
+  color: #ffffff;
+  background: #315f58;
+  border-color: #315f58;
+}
+.depth-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #718087;
+  font-size: 12px;
+}
+.depth-tool select {
+  padding: 5px 8px;
+  border: 1px solid #c8d8d4;
+  border-radius: 6px;
+  color: #20333a;
+  font-size: 13px;
+}
+.stats-stage .queue-tabs, .stats-stage .queue-picker {
+  display: none;
+}
+.match-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+@media (max-width: 760px) {
+  .match-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.record-heading strong {
+  color: #20333a;
+  font-size: 18px;
+  font-weight: 800;
+}
 .record-topbar {
   display: flex;
   align-items: center;

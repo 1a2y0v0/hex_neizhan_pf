@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue"
+import { computed, ref, watch } from "vue"
 import { ChevronRight, X } from "lucide-vue-next"
 import type { ChampionSummaryItem, GameAssetEntry, MatchDetailResponse } from "../types"
 import { calculateOutputRating } from "../scoring"
@@ -39,6 +39,7 @@ interface DrawerRow {
   spell1Id: number
   spell2Id: number
   itemIds: number[]
+  augmentIds: number[]
   gameName: string
   score: number
 }
@@ -64,6 +65,7 @@ const rows = computed<DrawerRow[]>(() => {
           spell1Id: p.spell1Id,
           spell2Id: p.spell2Id,
           itemIds: p.itemIds || [],
+          augmentIds: p.augmentIds || [],
           gameName: p.gameName,
           score: calculateOutputRating(p, ratingContext.value).score,
         })
@@ -129,10 +131,21 @@ const dateGroups = computed(() => {
   return { arr, max }
 })
 
+/** 非战斗装备关键词：极地大乱斗喂魄罗的“魄罗佳肴”等装饰性消耗品不应计入核心装备 */
+const ITEM_FILTER_KEYWORDS = ["魄罗佳肴"]
+function isIgnoredItem(itemId: number) {
+  const name = props.itemMap[itemId]?.name || ""
+  return ITEM_FILTER_KEYWORDS.some((k) => name.includes(k))
+}
+
+/** 核心装备：默认展示前 N 件，可展开为全部；均按出现次数降序 */
+const ITEM_PREVIEW_COUNT = 12
+const itemShowAll = ref(false)
 const itemAgg = computed(() => {
   const map = new Map<number, { count: number; wins: number }>()
   for (const r of rows.value) {
     for (const itemId of r.itemIds) {
+      if (isIgnoredItem(itemId)) continue
       let e = map.get(itemId)
       if (!e) {
         e = { count: 0, wins: 0 }
@@ -149,9 +162,85 @@ const itemAgg = computed(() => {
       winRate: e.count ? (e.wins / e.count) * 100 : 0,
     }))
     .sort((a, b) => b.count - a.count)
-    .slice(0, 12)
-    .sort((a, b) => a.id - b.id)
 })
+const shownItems = computed(() => (itemShowAll.value ? itemAgg.value : itemAgg.value.slice(0, ITEM_PREVIEW_COUNT)))
+function toggleItemShowAll() {
+  itemShowAll.value = !itemShowAll.value
+}
+
+/** 海克斯稀有度：取增强名（Riot 原始 rarity 带 k 前缀，如 kPrismatic）归一化为档位关键词 */
+function augmentRarityKey(augmentId: number): string {
+  const rarity = (props.augmentMap[augmentId]?.rarity || "").toLowerCase()
+  if (rarity.includes("prismatic")) return "prismatic"
+  if (rarity.includes("gold")) return "gold"
+  if (rarity.includes("silver")) return "silver"
+  if (rarity.includes("bronze")) return "bronze"
+  return ""
+}
+function augmentRarityLabel(augmentId: number): string {
+  switch (augmentRarityKey(augmentId)) {
+    case "prismatic":
+      return "棱彩"
+    case "gold":
+      return "黄金"
+    case "silver":
+      return "白银"
+    case "bronze":
+      return "青铜"
+    default:
+      return ""
+  }
+}
+function augmentRarityClass(augmentId: number): string {
+  switch (augmentRarityKey(augmentId)) {
+    case "prismatic":
+      return "cdd-aug-prismatic"
+    case "gold":
+      return "cdd-aug-gold"
+    case "silver":
+      return "cdd-aug-silver"
+    case "bronze":
+      return "cdd-aug-bronze"
+    default:
+      return ""
+  }
+}
+
+/** 海克斯强化统计：默认展示前 N 个，可展开为全部；按出现次数降序 */
+const AUGMENT_PREVIEW_COUNT = 12
+const augmentShowAll = ref(false)
+const augmentAgg = computed(() => {
+  const map = new Map<number, { count: number; wins: number }>()
+  for (const r of rows.value) {
+    for (const augmentId of r.augmentIds) {
+      let e = map.get(augmentId)
+      if (!e) {
+        e = { count: 0, wins: 0 }
+        map.set(augmentId, e)
+      }
+      e.count++
+      if (r.win) e.wins++
+    }
+  }
+  return [...map.entries()]
+    .map(([id, e]) => ({
+      id,
+      count: e.count,
+      winRate: e.count ? (e.wins / e.count) * 100 : 0,
+    }))
+    .sort((a, b) => b.count - a.count)
+})
+const shownAugments = computed(() =>
+  augmentShowAll.value ? augmentAgg.value : augmentAgg.value.slice(0, AUGMENT_PREVIEW_COUNT),
+)
+function toggleAugmentShowAll() {
+  augmentShowAll.value = !augmentShowAll.value
+}
+function augmentTitleOf(a: { id: number; count: number; winRate: number }): string {
+  const name = props.augmentMap[a.id]?.name || String(a.id)
+  const rarity = augmentRarityLabel(a.id)
+  return `${name}${rarity ? ` · ${rarity}` : ""} · 出现 ${a.count} 场 · 胜率 ${a.winRate.toFixed(0)}%`
+}
 
 const spellAgg = computed(() => {
   const map = new Map<string, { count: number; wins: number; a: number; b: number }>()
@@ -182,6 +271,19 @@ const playerAgg = computed(() => {
   }
   return [...map.values()].sort((a, b) => b.count - a.count)
 })
+
+/* ── 对局明细：玩家筛选（默认全部，选中后只展示该玩家的战绩条目） ── */
+const playerFilter = ref<string>("")
+const filteredRows = computed(() =>
+  playerFilter.value ? rows.value.filter((r) => r.gameName === playerFilter.value) : rows.value,
+)
+// 切换到另一英雄（抽屉可能复用同一实例）时重置筛选
+watch(
+  () => props.championId,
+  () => {
+    playerFilter.value = ""
+  },
+)
 
 function winRateClass(v: number) { return v >= 60 ? "sc-high" : v >= 50 ? "sc-mid" : "sc-low" }
 function scoreClass(s: number) { return s >= 80 ? "sc-high" : s >= 60 ? "sc-mid" : "sc-low" }
@@ -272,21 +374,64 @@ function dateDisplayLabel(dateKey: string) {
           </section>
 
           <section class="cdd-card" v-if="itemAgg.length">
-            <div class="cdd-sec-title">核心装备</div>
-            <div class="cdd-item-grid">
-              <div v-for="it in itemAgg" :key="it.id" class="cdd-item" :title="`${itemMap[it.id]?.name || it.id} · ${it.count}次 · 胜率${it.winRate.toFixed(0)}%`">
-                <AssetIcon :path="itemMap[it.id]?.iconPath" :label="itemMap[it.id]?.name" :fallback="String(it.id)" :size="30" />
-                <span class="cdd-item-num">{{ it.count }}</span>
+            <div class="cdd-sec-title">
+              核心装备
+              <button v-if="itemAgg.length > ITEM_PREVIEW_COUNT" class="cdd-more-btn" @click="toggleItemShowAll" title="按出现次数从高到低展示全部装备">
+                <ChevronRight :size="12" class="cdd-more-chev" :class="{ open: itemShowAll }" />
+                {{ itemShowAll ? "收起" : `展开全部 ${itemAgg.length} 件` }}
+              </button>
+            </div>
+            <div class="cdd-stat-list">
+              <div v-for="it in shownItems" :key="it.id" class="cdd-stat-row" :title="`${itemMap[it.id]?.name || it.id} · 出现 ${it.count} 场 · 胜率 ${it.winRate.toFixed(0)}%`">
+                <span class="cdd-stat-lead">
+                  <AssetIcon :path="itemMap[it.id]?.iconPath" :label="itemMap[it.id]?.name" :fallback="String(it.id)" :size="24" />
+                  <span class="cdd-stat-name">{{ itemMap[it.id]?.name || it.id }}</span>
+                </span>
+                <span class="cdd-stat-count">×{{ it.count }}</span>
+                <span class="cdd-stat-wr" :class="winRateClass(it.winRate)">{{ it.winRate.toFixed(0) }}%</span>
+                <span class="cdd-stat-bar"><i class="cdd-stat-fill" :class="winRateClass(it.winRate)" :style="{ width: Math.min(it.winRate, 100) + '%' }"></i></span>
+              </div>
+            </div>
+          </section>
+
+          <section class="cdd-card" v-if="augmentAgg.length">
+            <div class="cdd-sec-title">
+              常用海克斯
+              <button v-if="augmentAgg.length > AUGMENT_PREVIEW_COUNT" class="cdd-more-btn" @click="toggleAugmentShowAll" title="按出现次数从高到低展示全部海克斯强化">
+                <ChevronRight :size="12" class="cdd-more-chev" :class="{ open: augmentShowAll }" />
+                {{ augmentShowAll ? "收起" : `展开全部 ${augmentAgg.length} 个` }}
+              </button>
+            </div>
+            <div class="cdd-stat-list">
+              <div v-for="ag in shownAugments" :key="ag.id" class="cdd-stat-row" :title="augmentTitleOf(ag)">
+                <span class="cdd-stat-lead">
+                  <span class="cdd-aug-pill" :class="augmentRarityClass(ag.id)">
+                    <i class="cdd-aug-dot" :class="augmentRarityClass(ag.id)"></i>
+                    <span class="cdd-aug-tag-text">{{ augmentMap[ag.id]?.name || ag.id }}</span>
+                  </span>
+                </span>
+                <span class="cdd-stat-count">×{{ ag.count }}</span>
+                <span class="cdd-stat-wr" :class="winRateClass(ag.winRate)">{{ ag.winRate.toFixed(0) }}%</span>
+                <span class="cdd-stat-bar"><i class="cdd-stat-fill" :class="winRateClass(ag.winRate)" :style="{ width: Math.min(ag.winRate, 100) + '%' }"></i></span>
               </div>
             </div>
           </section>
 
           <section class="cdd-card">
-            <div class="cdd-sec-title">对局明细 <span class="cdd-sec-hint">点击对局查看本局十人详情</span></div>
-            <div v-if="!rows.length" class="cdd-empty">该英雄当前没有对局记录</div>
+            <div class="cdd-sec-title">
+              对局明细
+              <select v-model="playerFilter" class="cdd-player-filter" title="按玩家筛选本英雄对局明细">
+                <option value="">全部玩家（{{ rows.length }}局）</option>
+                <option v-for="p in playerAgg" :key="p.gameName" :value="p.gameName">
+                  {{ p.gameName }}（{{ p.count }}局）
+                </option>
+              </select>
+              <span class="cdd-sec-hint">点击对局查看本局十人详情</span>
+            </div>
+            <div v-if="!filteredRows.length" class="cdd-empty">{{ playerFilter ? `没有「${playerFilter}」使用该英雄的对局` : "该英雄当前没有对局记录" }}</div>
             <div v-else class="cdd-game-list">
               <div
-                v-for="(r, idx) in rows"
+                v-for="(r, idx) in filteredRows"
                 :key="`${r.gameId}-${idx}`"
                 class="cdd-game clickable"
                 :class="[r.win ? 'win' : 'lose', selectedGameId === r.gameId ? 'selected' : '']"
@@ -394,6 +539,38 @@ function dateDisplayLabel(dateKey: string) {
 
 .cdd-sec-title { font-size: 13px; font-weight: 800; color: #dbe7e4; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; }
 .cdd-sec-hint { margin-left: auto; font-size: 10px; font-weight: 400; color: var(--text-muted, #666); }
+.cdd-more-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  background: var(--bg-secondary, #272730);
+  color: #9fb3ae;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cdd-more-btn:hover { color: var(--accent, #a5b4fc); border-color: var(--accent, #a5b4fc); }
+.cdd-more-chev { flex-shrink: 0; transition: transform 0.15s, color 0.15s; }
+.cdd-more-chev.open { transform: rotate(90deg); color: var(--accent, #a5b4fc); }
+.cdd-player-filter {
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #444);
+  background: var(--bg-secondary, #272730);
+  color: #dbe7e4;
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+  cursor: pointer;
+  max-width: 170px;
+}
+.cdd-player-filter option { color: #333; background: #fff; }
 
 .cdd-date-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .cdd-date-label { width: 68px; font-size: 11px; color: #9fb3ae; flex-shrink: 0; }
@@ -413,9 +590,47 @@ function dateDisplayLabel(dateKey: string) {
 .cdd-spell-icons { display: flex; gap: 4px; }
 .cdd-spell-meta { font-size: 12px; color: #9fb3ae; }
 
-.cdd-item-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(56px, 1fr)); gap: 8px; }
-.cdd-item { position: relative; display: grid; place-items: center; }
-.cdd-item-num { position: absolute; right: -4px; bottom: -4px; min-width: 18px; height: 18px; padding: 0 3px; display: grid; place-items: center; border-radius: 8px; background: #6366f1; color: #fff; font-size: 10px; font-weight: 800; }
+/* 核心装备 / 常用海克斯：行式统计（名称 | 次数 | 胜率 | 进度条） */
+.cdd-stat-list { display: flex; flex-direction: column; gap: 6px; }
+.cdd-stat-row { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.cdd-stat-lead { display: flex; flex: 1; min-width: 0; align-items: center; gap: 6px; overflow: hidden; }
+.cdd-stat-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 800; color: #d6e2df; }
+.cdd-stat-count { flex: none; width: 44px; text-align: right; font-size: 11.5px; font-weight: 800; color: #9fb3ae; font-variant-numeric: tabular-nums; }
+.cdd-stat-wr { flex: none; width: 44px; text-align: right; font-size: 12px; font-weight: 900; font-variant-numeric: tabular-nums; }
+.cdd-stat-bar { position: relative; flex: none; width: 56px; height: 5px; border-radius: 3px; overflow: hidden; background: #2a2f3a; }
+.cdd-stat-fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; background: #6366f1; }
+.cdd-stat-fill.sc-high { background: #4ade80; }
+.cdd-stat-fill.sc-mid { background: #facc15; }
+.cdd-stat-fill.sc-low { background: #f87171; }
+
+/* 海克斯行内标签：稀有度配色胶囊 + 圆点 */
+.cdd-aug-pill {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 8px 2px 6px;
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  color: #d8e2df;
+  background: var(--bg-secondary, #242730);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.cdd-aug-pill .cdd-aug-tag-text { overflow: hidden; text-overflow: ellipsis; }
+.cdd-aug-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #8a989c; }
+.cdd-aug-pill.cdd-aug-prismatic { border-color: rgba(170, 72, 215, 0.5); color: #e2b8ff; background: rgba(109, 44, 145, 0.35); }
+.cdd-aug-pill.cdd-aug-prismatic .cdd-aug-dot { background: #c77dff; box-shadow: 0 0 5px rgba(199, 125, 255, 0.8); }
+.cdd-aug-pill.cdd-aug-gold { border-color: rgba(199, 144, 36, 0.55); color: #ffd36a; background: rgba(123, 77, 2, 0.32); }
+.cdd-aug-pill.cdd-aug-gold .cdd-aug-dot { background: #f0b429; box-shadow: 0 0 5px rgba(240, 180, 41, 0.7); }
+.cdd-aug-pill.cdd-aug-silver { border-color: rgba(134, 151, 166, 0.55); color: #c6d4de; background: rgba(73, 96, 111, 0.32); }
+.cdd-aug-pill.cdd-aug-silver .cdd-aug-dot { background: #a9b7c6; box-shadow: 0 0 5px rgba(169, 183, 198, 0.6); }
+.cdd-aug-pill.cdd-aug-bronze { border-color: rgba(167, 105, 60, 0.55); color: #e8b48a; background: rgba(122, 67, 35, 0.32); }
+.cdd-aug-pill.cdd-aug-bronze .cdd-aug-dot { background: #c68a4e; box-shadow: 0 0 5px rgba(198, 138, 78, 0.6); }
 
 .cdd-game-list { display: flex; flex-direction: column; gap: 5px; }
 .cdd-game { display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 8px; }
